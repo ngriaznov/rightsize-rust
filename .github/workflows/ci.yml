@@ -62,29 +62,10 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
 
-  msb-macos:
-    runs-on: macos-latest # Apple Silicon
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.85"
-      # Image-cache warming is incremental: registries rate-limit the runners'
-      # shared IPs, so each run restores the newest prior cache, pulls what the
-      # quota allows, and saves its grown copy even on failure — after a few
-      # runs the cache is warm and pulls stop entirely.
-      - uses: actions/cache/restore@v4
-        with:
-          path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: msb-images-${{ runner.os }}-
-      - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
-      - uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
-
+  # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
+  # without nested virtualization, so Hypervisor.framework VM creation fails
+  # (msb: build_microvm VmSetup(VmCreate)). macOS support is verified on real
+  # Apple Silicon hardware; a self-hosted mac runner could restore CI coverage.
   docker-fallback:
     runs-on: ubuntu-latest
     steps:
@@ -140,8 +121,10 @@ jobs:
       - name: cargo llvm-cov (core, line floor 80%)
         run: |
           cargo llvm-cov --package rightsize --lib --fail-under-lines 80 \
-            --html --output-dir target/llvm-cov-html \
             --lcov --output-path target/llvm-cov.lcov
+          # Same profdata, second report format (--html and --lcov are mutually
+          # exclusive in one invocation on current cargo-llvm-cov).
+          cargo llvm-cov report --html --output-dir target/llvm-cov-html
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-report

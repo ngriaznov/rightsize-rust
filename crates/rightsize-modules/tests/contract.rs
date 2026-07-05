@@ -64,7 +64,11 @@ async fn container_publishes_tcp_port_to_host_loopback() {
     let c = Container::new("python:3.12-alpine")
         .with_command(&["python", "-m", "http.server", "8000"])
         .with_exposed_ports(&[8000])
-        .waiting_for(Wait::for_http("/").for_port(8000));
+        .waiting_for(
+            // 120s: shared CI runners boot a microVM + python noticeably slower
+            // than dev hardware; the default 60s flakes there.
+            Wait::for_http("/").for_port(8000).with_startup_timeout(Duration::from_secs(120)),
+        );
     let guard = c.start().await.expect("container must start");
 
     let url = format!("http://127.0.0.1:{}/", guard.get_mapped_port(8000).unwrap());
@@ -152,7 +156,11 @@ async fn stop_terminates_and_frees_the_container() {
             "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok' | nc -l -p 8000; done",
         ])
         .with_exposed_ports(&[8000])
-        .waiting_for(Wait::for_http("/").for_port(8000));
+        .waiting_for(
+            // 120s: shared CI runners boot a microVM + python noticeably slower
+            // than dev hardware; the default 60s flakes there.
+            Wait::for_http("/").for_port(8000).with_startup_timeout(Duration::from_secs(120)),
+        );
     let guard = c.start().await.expect("container must start");
     assert!(guard.is_running());
     let host_port = guard.get_mapped_port(8000).unwrap();
