@@ -103,6 +103,20 @@ pub fn ls() -> Vec<String> {
     vec!["ls".to_string(), "--format".to_string(), "json".to_string()]
 }
 
+/// Builds the argv for `msb image remove <reference>` — deletes one cached image's
+/// entry (manifest + layer bookkeeping) so the next `run`/`pull` re-fetches it from
+/// scratch. Scoped to a single image reference; never touches sandbox state or any
+/// other cached image, including ones sharing layers with this one (confirmed
+/// empirically: removing one floci variant and re-pulling it left a sibling variant's
+/// already-materialized shared base layer untouched and bootable).
+pub fn image_remove(reference: &str) -> Vec<String> {
+    vec![
+        "image".to_string(),
+        "remove".to_string(),
+        reference.to_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +216,10 @@ mod tests {
         assert_eq!(rm("rz-abc-1"), vec!["rm", "rz-abc-1"]);
         // Confirmed empirically against the real msb binary: no `--json` flag on `ls`.
         assert_eq!(ls(), vec!["ls", "--format", "json"]);
+        assert_eq!(
+            image_remove("floci/floci-az:0.8.0"),
+            vec!["image", "remove", "floci/floci-az:0.8.0"]
+        );
     }
 
     #[test]

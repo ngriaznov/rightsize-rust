@@ -228,6 +228,32 @@ fn is_port_bind_conflict(output: &str) -> bool {
         || (m.contains("already in use") && m.contains("port"))
 }
 
+/// True if `output` (a `msb run` child's combined stdout/stderr) names msb's image
+/// cache error: a manifest/layer index entry pointing at a cache file that isn't on
+/// disk. Observed verbatim against a real msb 0.6.3 binary:
+///
+/// ```text
+/// error: image error: cache error at /path/to/.microsandbox/cache/layers/sha256_<64hex>.tar.gz: No such file or directory (os error 2)
+/// ```
+///
+/// Root cause, reproduced locally by racing concurrent `msb run`/`msb pull` of images
+/// that share a base layer against one fresh cache: two pulls converting the same
+/// shared blob race, and the loser's read of the shared `.tar.gz` finds it already
+/// deleted by the winner's post-conversion cleanup. On a fresh CI cache the three
+/// floci images (`floci/floci:1.5.30`, `floci/floci-az:0.8.0`, `floci/floci-gcp:0.4.0`)
+/// share a base layer, and rightsize's own `sandbox-it` suite boots all three
+/// concurrently (separate `#[tokio::test]` functions), so this is a real race this
+/// backend's own usage pattern triggers, not just an artificial stress case. Confirmed
+/// order-independent: across ten local trials, seven reproduced the error, naming each
+/// of the three images as the victim at least once.
+///
+/// This is deliberately a substring match on the stable parts of msb's wording
+/// ("cache error at", "No such file") rather than the full sentence — the path and
+/// digest vary per host/image, and msb has no structured/typed error for this.
+fn is_image_cache_corruption(output: &str) -> bool {
+    output.contains("cache error at") && output.contains("No such file")
+}
+
 /// Extracts every `rz-<8 hex>-<seq>`-shaped name appearing anywhere in `ls` output —
 /// used by the orphan reaper, which doesn't need the full tolerant JSON parse (any
 /// status counts, not just `Running`) but does need to recognize this backend's own
@@ -477,15 +503,67 @@ impl SandboxBackend for MsbCliBackend {
     }
 }
 
+/// A single `msb run` attempt's outcome when the child exits before reaching
+/// `Running`: either a classified error ready to surface, or a cache-corruption
+/// signature (see [`is_image_cache_corruption`]) that [`spawn_and_await_running`]
+/// gets one chance to heal and retry before giving up.
+enum PreRunningFailure {
+    CacheCorruption { output: String },
+    Other(RightsizeError),
+}
+
 /// Runs on a blocking thread: spawns `msb run <spec's argv>` attached (no `-d`),
 /// polls `msb ls --format json` until the sandbox reaches `Running`, and returns the
-/// live child for `start()` to keep around. Classifies a bind-conflict from the
-/// child's own combined output if it exits before reaching `Running`.
+/// live child for `start()` to keep around.
+///
+/// On a first attempt that exits before `Running` with msb's image-cache-corruption
+/// signature (see [`is_image_cache_corruption`]), this heals the affected image's
+/// cache entry (see [`heal_image_cache`]) and retries the boot exactly once — the
+/// failed first attempt never reached `Running`, so it never touched `handles` or
+/// `started_names` (both are populated by `start()` only after this function
+/// returns `Ok`), and its child has already exited, so there is no live process or
+/// registered cleanup state left over to double-register on the retry. A second
+/// failure (whether cache corruption again or anything else) surfaces an actionable
+/// error naming what was attempted instead of retrying further.
+fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
+    match try_spawn_and_await_running(msb, spec) {
+        Ok(child) => Ok(child),
+        Err(PreRunningFailure::Other(e)) => Err(e),
+        Err(PreRunningFailure::CacheCorruption { output }) => {
+            let heal_result = heal_image_cache(msb, &spec.image);
+            match try_spawn_and_await_running(msb, spec) {
+                Ok(child) => Ok(child),
+                Err(PreRunningFailure::Other(e)) => Err(e),
+                Err(PreRunningFailure::CacheCorruption {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb run for sandbox {} hit its image cache error twice in a row for \
+                         image '{}', even after removing that image's cache entry ({}) and \
+                         retrying — this is likely a deeper cache corruption than this backend's \
+                         one-shot heal covers; try clearing the msb image cache by hand \
+                         (`msb image prune` or removing the cache directory under MSB_HOME).\n\
+                         first attempt:\n{output}\nafter heal + retry:\n{retry_output}",
+                    spec.name,
+                    spec.image,
+                    describe_heal_result(&heal_result),
+                ))),
+            }
+        }
+    }
+}
+
+/// One `msb run` attempt: spawns the child, polls until `Running`, and returns either
+/// the live child or a classified [`PreRunningFailure`]. Never retries by itself —
+/// [`spawn_and_await_running`] is the only caller and owns the one-shot heal+retry
+/// policy.
 ///
 /// The tail drained here carries msb's own boot output only — registry/pull errors,
 /// a crash before the sandbox exists — never the workload's. `logs()` never reads
 /// from it; workload output always comes from a `msb logs` invocation.
-fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
+fn try_spawn_and_await_running(
+    msb: &Path,
+    spec: &ContainerSpec,
+) -> std::result::Result<Child, PreRunningFailure> {
     let argv = commands::run(spec);
     let mut child = Command::new(msb)
         .args(&argv)
@@ -494,7 +572,10 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
-            RightsizeError::Backend(format!("failed to spawn msb {}: {e}", argv.join(" ")))
+            PreRunningFailure::Other(RightsizeError::Backend(format!(
+                "failed to spawn msb {}: {e}",
+                argv.join(" ")
+            )))
         })?;
 
     let stdout_pipe = child.stdout.take().expect("piped stdout");
@@ -505,7 +586,10 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
 
     let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
     loop {
-        if let Some(status) = child.try_wait().map_err(RightsizeError::from)? {
+        let status = child
+            .try_wait()
+            .map_err(|e| PreRunningFailure::Other(RightsizeError::from(e)))?;
+        if let Some(status) = status {
             let _ = t_out.join();
             let _ = t_err.join();
             let output = tail
@@ -515,8 +599,10 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
-            return if is_port_bind_conflict(&output) {
-                Err(RightsizeError::PortBindConflict {
+            return Err(if is_image_cache_corruption(&output) {
+                PreRunningFailure::CacheCorruption { output }
+            } else if is_port_bind_conflict(&output) {
+                PreRunningFailure::Other(RightsizeError::PortBindConflict {
                     message: format!(
                         "msb run for sandbox {} could not bind a host port: {output}",
                         spec.name
@@ -524,13 +610,13 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
                     source: None,
                 })
             } else {
-                Err(RightsizeError::Backend(format!(
+                PreRunningFailure::Other(RightsizeError::Backend(format!(
                     "msb run for sandbox {} exited (code {}) before reaching Running — check the \
                      image entrypoint and `msb run` output below:\n{output}",
                     spec.name,
                     status.code().unwrap_or(-1)
                 )))
-            };
+            });
         }
         match running_names_via(msb) {
             Ok(names) if names.contains(&spec.name) => return Ok(child),
@@ -548,14 +634,58 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(RightsizeError::Backend(format!(
+            return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
                 "Sandbox {} did not reach Running within {}s — this can mean a slow image pull, \
                  a crash-looping entrypoint, or msb itself being unresponsive; last output:\n{output}",
                 spec.name,
                 FIRST_RUN_TIMEOUT.as_secs()
-            )));
+            ))));
         }
         std::thread::sleep(READINESS_POLL);
+    }
+}
+
+/// Heals msb's image-cache-corruption signature by removing the affected image's
+/// cache entry (`msb image remove <image>`), scoped to that one image reference —
+/// never the whole cache directory, and never any sandbox state (sandboxes live in
+/// msb's own `db/msb.db` `sandbox`/`sandbox_rootfs` tables, untouched by `image
+/// remove`).
+///
+/// Two corruption shapes were found empirically and this heals both with the same
+/// one command:
+///
+/// - The failing image's own manifest was never committed to msb's cache database (a
+///   concurrent pull lost the race for a shared base layer before its own manifest
+///   write landed) — here `image remove` reports "image not found" (nothing to
+///   remove) and the retry succeeds anyway, because by the time it runs the
+///   concurrent winner has finished materializing the shared layer. This is the
+///   common case reproduced locally: racing `msb run`/`msb pull` of the three floci
+///   images against one fresh cache hit this in 7 of 10 trials, naming each of the
+///   three images as the victim at least once.
+/// - The failing image's manifest IS committed but the cache file backing one of its
+///   layers is gone (e.g. a CI cache restore that dropped some blobs but kept the
+///   database) — here `image remove` actually clears the stale entry, and the retry's
+///   `msb run` re-pulls the image from scratch.
+///
+/// Errors from the `image remove` invocation itself (including "image not found") are
+/// intentionally swallowed here — this is a best-effort heal, and the real signal is
+/// whether the retried `msb run` succeeds, not whether removal reported success.
+fn heal_image_cache(msb: &Path, image: &str) -> Result<ExecResult> {
+    invoke_standalone(msb, &commands::image_remove(image), STOP_TIMEOUT)
+}
+
+/// Renders a heal attempt's outcome for the second-failure error message — never
+/// panics on the heal's own failure (e.g. "image not found"), since that outcome is
+/// itself informative to whoever reads the surfaced error.
+fn describe_heal_result(result: &Result<ExecResult>) -> String {
+    match result {
+        Ok(r) if r.exit_code == 0 => "removed".to_string(),
+        Ok(r) => format!(
+            "`msb image remove` exited {}: {}",
+            r.exit_code,
+            r.stderr.trim()
+        ),
+        Err(e) => format!("`msb image remove` itself failed to run: {e}"),
     }
 }
 
@@ -628,6 +758,17 @@ pub(crate) fn running_names_via(msb: &Path) -> Result<HashSet<String>> {
 #[cfg(feature = "sandbox-it")]
 pub fn running_sandbox_names(msb: &Path) -> Result<HashSet<String>> {
     running_names_via(msb)
+}
+
+/// Test-only public seam onto [`is_image_cache_corruption`], for the `sandbox-it`
+/// corrupted-cache integration test's setup helper, which needs to recognize the
+/// corruption signature in raw `msb run` output it captures itself (deliberately
+/// bypassing this backend, to drive the concurrent pull race that produces the
+/// corruption) — an external `tests/*.rs` integration test has no access to this
+/// private module function otherwise.
+#[cfg(feature = "sandbox-it")]
+pub fn is_image_cache_corruption_for_test(output: &str) -> bool {
+    is_image_cache_corruption(output)
 }
 
 /// A standalone one-shot logs fetch, for the `follow_logs` watchdog's authoritative
@@ -785,6 +926,46 @@ mod tests {
         assert!(!is_port_bind_conflict("panic: index out of bounds"));
         assert!(!is_port_bind_conflict(""));
         assert!(!is_port_bind_conflict("connection refused"));
+    }
+
+    #[test]
+    fn is_image_cache_corruption_matches_the_captured_msb_error_verbatim() {
+        // Captured verbatim from a real msb 0.6.3 binary, reproduced locally by racing
+        // concurrent `msb run` of images sharing a base layer against one fresh cache
+        // (see this function's doc comment for the full repro).
+        let output = "   ✗ Pulling      floci/floci-gcp:0.4.0\nerror: image error: cache error at /home/runner/.microsandbox/cache/layers/sha256_2a9a84f53fe64d76a54296ab37a4664aacef9f848d4aa6ad7efd84b135a351c6.tar.gz: No such file or directory (os error 2)\n";
+        assert!(is_image_cache_corruption(output));
+    }
+
+    #[test]
+    fn is_image_cache_corruption_matches_regardless_of_which_image_or_digest() {
+        // Path, digest, and image name all vary per host/run — the classifier must
+        // match on the stable parts of msb's wording only.
+        assert!(is_image_cache_corruption(
+            "error: image error: cache error at /tmp/msb-repro/cache/layers/sha256_c01d7b7a3f78972c12a4244ffb10257694b9d989c40172ab6184de42b967ab85.tar.gz: No such file or directory (os error 2)"
+        ));
+        assert!(is_image_cache_corruption(
+            "error: cache error at C:\\Users\\runner\\.microsandbox\\cache\\layers\\sha256_deadbeef.tar.gz: No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn is_image_cache_corruption_negative_cases_do_not_match() {
+        assert!(!is_image_cache_corruption("panic: index out of bounds"));
+        assert!(!is_image_cache_corruption(""));
+        assert!(!is_image_cache_corruption(
+            "error: image not found: floci/floci-az:0.8.0"
+        ));
+        // A generic "No such file" with no cache-error framing must not false-positive
+        // (e.g. a workload's own stderr complaining about a missing file it expected).
+        assert!(!is_image_cache_corruption(
+            "sh: /app/config.yaml: No such file or directory"
+        ));
+        // A cache error about something other than a missing file (e.g. a permissions
+        // problem) must not be classified as this specific corruption signature.
+        assert!(!is_image_cache_corruption(
+            "error: cache error at /tmp/x/layers/sha256_abc.tar.gz: Permission denied (os error 13)"
+        ));
     }
 
     #[test]
