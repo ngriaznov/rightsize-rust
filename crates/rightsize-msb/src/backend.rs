@@ -389,6 +389,15 @@ impl SandboxBackend for MsbCliBackend {
             .map_err(|e| RightsizeError::Backend(format!("exec task panicked: {e}")))?
     }
 
+    /// A fresh `msb logs <name> --tail 1000` invocation, same on every platform. This
+    /// is the workload's own output, as distinct from the attached `msb run` child's
+    /// pipe (drained in [`spawn_and_await_running`] into a tail kept only for
+    /// pre-`Running` crash diagnostics): on Windows the attached process does not relay
+    /// guest stdout at all, while `msb logs` does everywhere, so this is the only
+    /// channel this method can source from. Never errors on a missing/removed sandbox —
+    /// [`invoke_standalone`] only enforces spawn success and the timeout, not the exit
+    /// code, so a failing `msb logs` call yields whatever (possibly empty) stdout it
+    /// produced rather than an `Err`.
     async fn logs(&self, handle: &dyn SandboxHandle) -> Result<String> {
         let argv = commands::logs(handle.id());
         let msb = self.msb.clone();
@@ -472,6 +481,10 @@ impl SandboxBackend for MsbCliBackend {
 /// polls `msb ls --format json` until the sandbox reaches `Running`, and returns the
 /// live child for `start()` to keep around. Classifies a bind-conflict from the
 /// child's own combined output if it exits before reaching `Running`.
+///
+/// The tail drained here carries msb's own boot output only — registry/pull errors,
+/// a crash before the sandbox exists — never the workload's. `logs()` never reads
+/// from it; workload output always comes from a `msb logs` invocation.
 fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
     let argv = commands::run(spec);
     let mut child = Command::new(msb)
