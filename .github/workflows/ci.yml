@@ -62,6 +62,63 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
 
+  # msb-windows: native msb on Windows Hypervisor Platform (WHP). Confirmed working on
+  # both windows-2022 and windows-2025 hosted runners by the windows-spike workflow
+  # (see this repo's `windows-spike` branch and the family design doc's "Windows spike
+  # findings" appendix): WHP is already Enabled with RestartNeeded=False on both images,
+  # so no enablement step is needed here (unlike the spike, which probed for that).
+  #
+  # Scoped to `-p rightsize-msb` alone, not `--workspace` and not `-p rightsize` too:
+  # - `rightsize-docker` is unix-socket-only by design (`tokio::net::UnixStream`/
+  #   `std::os::unix::net::UnixStream`, no Windows arm — see docs/backends.md's
+  #   "Unix-socket-only, and why"), so it does not compile on windows-msvc, and
+  #   `rightsize-modules`'s dev-dependencies pull it in unconditionally (its shared
+  #   contract suite exercises both backends), which would drag that same compile
+  #   failure into any `--workspace` invocation here.
+  # - `rightsize` (core)'s own unit suite has two pre-existing, Windows-path-portability
+  #   gaps unrelated to msb: `mountable_file::for_host_path_leaves_an_absolute_path_
+  #   untouched` asserts a hardcoded POSIX path (`/etc/hosts`) round-trips unmodified
+  #   through `PathBuf`, which Windows absolutizes to `D:/etc/hosts`; `wait::do_while_
+  #   performs_at_least_one_probe_even_on_a_short_timeout` asserts a loopback
+  #   connection-refused round-trip completes within a 2s slack budget, which Windows'
+  #   TCP stack occasionally exceeds by ~20ms. Both are core path/timing-portability
+  #   gaps in `rightsize`'s own test suite, not `rightsize-msb` regressions — out of
+  #   scope for the msb Windows work, so this lane doesn't compile/run core's unit
+  #   suite at all rather than fighting either gap here.
+  # This lane verifies the crate this task actually changed (`rightsize-msb`, whose
+  # own `backend_it.rs`/`network_links_it.rs` already exercise `rightsize` at the
+  # integration level) on real WHP.
+  msb-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      # Same incremental image-cache warming as msb-linux, Windows-suffixed keys and
+      # msb's Windows-native cache path (see install.ps1's own default install root;
+      # this crate's Windows cache root is %LOCALAPPDATA%\rightsize, but msb's own
+      # pulled-image cache is still under %USERPROFILE%\.microsandbox\cache).
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: msb-images-${{ runner.os }}-
+      # --test-threads=1, Windows-only: the msb-linux lane runs this same
+      # backend_it.rs concurrently (its 4 #[tokio::test]s booting real microVMs at
+      # once) without issue, but on windows-2025 that concurrency hit a real msb-side
+      # race — concurrent `msb run` invocations corrupted msb's own internal SQLite
+      # state ("UNIQUE constraint failed: seaql_migrations.version"), not this crate's
+      # code. Serializing this job's test execution avoids the race; it does not mask
+      # a rightsize-msb bug, since the same assertions still run, just one at a time.
+      - run: RIGHTSIZE_BACKEND=microsandbox cargo test -p rightsize-msb --features sandbox-it -- --test-threads=1
+        shell: bash
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+
   # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
   # without nested virtualization, so Hypervisor.framework VM creation fails
   # (msb: build_microvm VmSetup(VmCreate)). macOS support is verified on real

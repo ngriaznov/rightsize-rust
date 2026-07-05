@@ -12,9 +12,22 @@ runs unchanged on either.
 |---|---|
 | macOS (Apple Silicon) | microsandbox (microVMs) |
 | Linux x86_64 / arm64 with `/dev/kvm` | microsandbox (microVMs) |
+| Windows x86_64 / arm64 with WHP enabled | microsandbox (microVMs)¹ |
 | Intel Mac | Docker (auto-fallback) |
-| Windows | Docker (auto-fallback) |
+| Windows without WHP | Docker (auto-fallback) |
 | Linux without KVM | Docker (auto-fallback) |
+
+¹ Windows msb runs Linux guests on the Windows Hypervisor Platform (WHP);
+upstream still labels this beta. `Platform::current()` reports a Windows build
+exists; `virtualization_available()` on Windows is attempt-and-report (no cheap,
+reliable, no-elevation WHP-state probe exists in portable `std`) — an unusable
+WHP surfaces at `msb`'s own first-boot failure rather than at resolution time.
+CI-verified on `windows-2022`/`windows-2025` hosted runners: WHP was already
+Enabled with `RestartNeeded: False`, so no enablement step or reboot was needed.
+If `RIGHTSIZE_BACKEND=microsandbox` is forced on a Windows host without usable
+WHP, resolution errors naming the precondition (`msb doctor --fix` in an
+elevated terminal, which may require a reboot) rather than silently falling
+back — the same convention as any other unsupported forced backend.
 
 Resolution logic (`rightsize::backends::resolve`), precisely:
 
@@ -35,7 +48,7 @@ at the first `Container::start()`/module `start()` call.
 |---|---|
 | `RIGHTSIZE_BACKEND` | Force `microsandbox` or `docker`. |
 | `MSB_PATH` | Use a pre-installed `msb` binary; skip downloads. |
-| `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`). |
+| `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`, `%LOCALAPPDATA%\rightsize` on Windows). |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail instead of downloading (air-gapped CI). |
 
 ## microsandbox deep-dive
@@ -95,6 +108,10 @@ crate's dependency tree structurally cannot be the reason a Docker client gets
 misrouted onto TCP by an unrelated bump elsewhere in your tree — the whole surface is
 exactly the daemon endpoints this backend uses, talking to the daemon over a plain
 unix-socket HTTP connection, always.
+
+On Windows this means the Docker fallback needs a daemon reachable over a real unix
+socket — Docker Desktop's WSL2-backed daemon exposes one — not Windows' native named
+pipe (`\\.\pipe\docker_engine`), which this client does not speak.
 
 Chunked transfer decoding and the daemon's log-stream multiplexing frame format
 (`[stream_type: u8, 0, 0, 0, len: u32_be, payload]`) are still hand-parsed — that's

@@ -12,11 +12,16 @@ containers). Read on for how to build, test, and submit changes.
   2024 edition). `rustup` provisions it automatically if you don't have it.
 - Git.
 - To run integration tests against a real backend, at least one of:
-  - **microsandbox**: macOS on Apple Silicon, or Linux (x86_64/arm64) with a
-    readable `/dev/kvm`. rightsize-rust self-provisions the `msb` binary on
-    first use — no manual install required.
-  - **Docker**: any Docker-compatible daemon reachable at the default socket,
-    or via `DOCKER_HOST`.
+  - **microsandbox**: macOS on Apple Silicon, Linux (x86_64/arm64) with a
+    readable `/dev/kvm`, or Windows (x86_64/arm64) with the Windows
+    Hypervisor Platform (WHP) enabled — upstream beta, CI-verified on
+    `windows-2022`/`windows-2025` hosted runners. rightsize-rust
+    self-provisions the `msb` binary on first use — no manual install
+    required.
+  - **Docker**: any Docker-compatible daemon reachable at the default socket
+    (a unix socket — the client is unix-socket-only, so on Windows this
+    means WSL2/Docker Desktop's Linux-daemon-backed socket, not a native
+    Windows named pipe), or via `DOCKER_HOST`.
 
 ## Building
 
@@ -54,7 +59,7 @@ RIGHTSIZE_BACKEND=docker cargo test --workspace --features sandbox-it
 Both backends satisfy the same `SandboxBackend` contract (see the shared
 contract suite in `crates/rightsize-modules/tests/contract.rs`), so **a change
 that affects observable behavior should be exercised on both before you open a
-PR** — CI runs the full matrix (`unit`, `msb-linux`,
+PR** — CI runs the full matrix (`unit`, `msb-linux`, `msb-windows`,
 `docker-fallback`; see `.github/workflows/ci.yml`), but a local run catches
 problems faster and doesn't wait on a runner queue.
 
@@ -62,6 +67,10 @@ problems faster and doesn't wait on a runner queue.
 > runners are themselves VMs without nested virtualization, so microVMs cannot
 > boot there (Hypervisor.framework rejects VM creation). macOS support is
 > verified on real Apple Silicon hardware before release.
+>
+> **Windows in CI:** `msb-windows` runs on `windows-2025`, where WHP is
+> already enabled with no reboot required (confirmed on both
+> `windows-2022`/`windows-2025` hosted runner images).
 
 
 Before running the msb-backed suite for the first time, redpanda's image needs
@@ -79,7 +88,7 @@ Env vars useful while developing (full reference in the
 | --- | --- |
 | `RIGHTSIZE_BACKEND` | Force `microsandbox` or `docker`. Required to pick a lane for `--features sandbox-it` runs. |
 | `MSB_PATH` | Point at a pre-installed `msb` binary; skips the download/verify step entirely. |
-| `RIGHTSIZE_CACHE_DIR` | Relocate the provisioner's cache root away from `~/.cache/rightsize`. |
+| `RIGHTSIZE_CACHE_DIR` | Relocate the provisioner's cache root away from `~/.cache/rightsize` (`%LOCALAPPDATA%\rightsize` on Windows). |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` turns a cache miss into a hard, actionable error instead of a network fetch — useful for air-gapped CI that pre-seeds the cache. |
 
 ## Coverage

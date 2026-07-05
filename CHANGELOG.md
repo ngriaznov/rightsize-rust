@@ -12,6 +12,24 @@ but no `0.1.0` tag has been cut.
 
 ### Added
 
+- **Native Windows support** (`rightsize-msb`): `Platform::WindowsX64`/
+  `WindowsArm64` (msb 0.6.3's `msb-windows-<arch>.exe` +
+  `libkrunfw-windows-<arch>.dll`, checksum-verified against the pinned
+  release the same as every other platform); the provisioner installs the
+  binary as `bin\msb.exe` (a platform-derived basename, no longer the
+  literal `"msb"` constant) and treats "exists and is a regular file" as the
+  Windows equivalent of the POSIX executable-bit check, since Windows has no
+  execute-bit concept; the default cache root is `%LOCALAPPDATA%\rightsize`
+  on Windows (`RIGHTSIZE_CACHE_DIR` still overrides on every platform).
+  `virtualization_available()` on Windows is attempt-and-report — an
+  unusable Windows Hypervisor Platform (WHP) surfaces at msb's own first-boot
+  failure, with the unsupported-backend error naming `msb doctor --fix` as
+  the remedy. CI-verified on `windows-2025` hosted runners
+  (`msb-windows` job in `.github/workflows/ci.yml`); WHP is already enabled
+  there with no reboot required. No host-side process-supervision code
+  changed — `std::process::Child::kill` is already cross-platform
+  (`TerminateProcess` on Windows), and the crate had no POSIX-only signal
+  handling to begin with.
 - **Examples** (`rightsize-modules`): three runnable examples under
   `crates/rightsize-modules/examples/` — a plain-API Redis quickstart speaking RESP
   PING/PONG directly over a `TcpStream` (`cargo run -p rightsize-modules --example

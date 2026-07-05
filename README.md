@@ -141,9 +141,17 @@ rightsize-rust picks a backend automatically; override with
 |---|---|
 | macOS (Apple Silicon) | microsandbox (microVMs) |
 | Linux x86_64 / arm64 with `/dev/kvm` | microsandbox (microVMs) |
+| Windows x86_64 / arm64 with WHP enabled | microsandbox (microVMs)¹ |
 | Intel Mac | Docker (auto-fallback) |
-| Windows | Docker (auto-fallback) |
+| Windows without WHP | Docker (auto-fallback) |
 | Linux without KVM | Docker (auto-fallback) |
+
+¹ Windows support runs on the Windows Hypervisor Platform (WHP) and is upstream
+beta. CI-verified on `windows-2022`/`windows-2025` hosted runners, where WHP is
+already enabled with no reboot required. If WHP isn't enabled on your machine,
+`RIGHTSIZE_BACKEND=microsandbox` fails naming the precondition (run
+`msb doctor --fix` in an elevated terminal — this may require a reboot); leaving
+`RIGHTSIZE_BACKEND` unset falls back to Docker silently.
 
 Both backends satisfy one behavioral contract (`SandboxBackend`), verified by a
 shared test suite — the tests you write run unchanged on either. A few edges are
@@ -263,7 +271,7 @@ Violations fail fast with an actionable error.
 |---|---|
 | `RIGHTSIZE_BACKEND` | Force `microsandbox` or `docker` |
 | `MSB_PATH` | Use a pre-installed `msb` binary; skip downloads |
-| `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`) |
+| `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`, `%LOCALAPPDATA%\rightsize` on Windows) |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail instead of downloading (air-gapped CI) |
 
 ## Examples

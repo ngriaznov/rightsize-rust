@@ -31,10 +31,14 @@ impl BackendProvider for MsbBackendProvider {
     fn unsupported_reason(&self) -> String {
         if Platform::current().is_none() {
             format!(
-                "no msb build for {}/{} (Intel Mac/Windows: use the docker backend)",
+                "no msb build for {}/{} (Intel Mac: use the docker backend)",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             )
+        } else if std::env::consts::OS == "windows" {
+            "Windows Hypervisor Platform is not enabled (run `msb doctor --fix` in an \
+             elevated terminal, which may require a reboot), or use the docker backend"
+                .to_string()
         } else {
             "/dev/kvm is not accessible (need KVM, or run on Apple Silicon macOS)".to_string()
         }
@@ -74,5 +78,22 @@ mod tests {
             reason.to_lowercase().contains("kvm") || reason.to_lowercase().contains("docker"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn windows_unsupported_reason_names_whp_and_the_fix_command() {
+        // std::env::consts::OS is compile-time, so this dev/CI matrix (macOS/Linux)
+        // never actually hits the Windows branch of unsupported_reason — this pins the
+        // exact message that branch produces (mirroring the string literal there)
+        // rather than exercising it live. The Windows spike record (msb 0.6.3, both
+        // windows-2022 and windows-2025 hosted runners) is what `msb doctor --fix`
+        // references: WHP was already Enabled with RestartNeeded=False there, so the
+        // reboot caveat in this message is a worst-case hint, not this crate's own
+        // finding for every host.
+        let reason = "Windows Hypervisor Platform is not enabled (run `msb doctor --fix` in an \
+             elevated terminal, which may require a reboot), or use the docker backend";
+        assert!(reason.to_lowercase().contains("hypervisor"));
+        assert!(reason.contains("msb doctor --fix"));
+        assert!(reason.to_lowercase().contains("docker"));
     }
 }
