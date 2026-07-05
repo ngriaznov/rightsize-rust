@@ -54,9 +54,15 @@ RIGHTSIZE_BACKEND=docker cargo test --workspace --features sandbox-it
 Both backends satisfy the same `SandboxBackend` contract (see the shared
 contract suite in `crates/rightsize-modules/tests/contract.rs`), so **a change
 that affects observable behavior should be exercised on both before you open a
-PR** — CI runs the full matrix (`unit`, `msb-linux`, `msb-macos`,
+PR** — CI runs the full matrix (`unit`, `msb-linux`,
 `docker-fallback`; see `.github/workflows/ci.yml`), but a local run catches
 problems faster and doesn't wait on a runner queue.
+
+> **macOS in CI:** there is no `msb-macos` job — GitHub's hosted Apple Silicon
+> runners are themselves VMs without nested virtualization, so microVMs cannot
+> boot there (Hypervisor.framework rejects VM creation). macOS support is
+> verified on real Apple Silicon hardware before release.
+
 
 Before running the msb-backed suite for the first time, redpanda's image needs
 seeding into the msb cache once (`docker.redpanda.com` rate-limits anonymous
