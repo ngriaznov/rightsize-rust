@@ -3,7 +3,7 @@
 A single-node Redpanda broker (Kafka API-compatible) with its schema registry
 enabled.
 
-**Default image:** `docker.redpanda.com/redpandadata/redpanda:latest`
+**Default image:** `docker.redpanda.com/redpandadata/redpanda:v24.2.4`
 **Guest ports:** `9092` (external Kafka), `9093` (internal Kafka), `8081` (schema
 registry)
 

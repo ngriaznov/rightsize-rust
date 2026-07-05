@@ -200,7 +200,7 @@ async fn redpanda_advertises_the_mapped_host_port_via_metadata() {
     // past any reasonable warm-up window) either keeps returning that 503 or the
     // connection stops responding at all — a persistent condition, not a startup
     // race this module's readiness wait could plausibly paper over. This looks like
-    // an environment/image-version issue with this redpanda:latest build's schema
+    // an environment/image-version issue with this redpanda build's schema
     // registry rather than something `RedpandaContainer` gets wrong (the module sets
     // `--schema-registry-addr 0.0.0.0:8081` exactly per the upstream quickstart
     // docs), so it's recorded here as an assumption-skip rather than faked — see the

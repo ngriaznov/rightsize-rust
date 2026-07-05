@@ -46,14 +46,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      - uses: actions/cache@v4
+      # Image-cache warming is incremental: registries rate-limit the runners'
+      # shared IPs, so each run restores the newest prior cache, pulls what the
+      # quota allows, and saves its grown copy even on failure — after a few
+      # runs the cache is warm and pulls stop entirely.
+      - uses: actions/cache/restore@v4
         with:
           path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}
-      # No sandbox-it tests exist yet, so this job currently has nothing to
-      # run; continue-on-error keeps it green until they land.
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: msb-images-${{ runner.os }}-
       - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
-        continue-on-error: true
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
 
   msb-macos:
     runs-on: macos-latest # Apple Silicon
@@ -62,14 +69,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      - uses: actions/cache@v4
+      # Image-cache warming is incremental: registries rate-limit the runners'
+      # shared IPs, so each run restores the newest prior cache, pulls what the
+      # quota allows, and saves its grown copy even on failure — after a few
+      # runs the cache is warm and pulls stop entirely.
+      - uses: actions/cache/restore@v4
         with:
           path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}
-      # No sandbox-it tests exist yet, so continue-on-error keeps this job
-      # green until they land.
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: msb-images-${{ runner.os }}-
       - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
-        continue-on-error: true
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
 
   docker-fallback:
     runs-on: ubuntu-latest

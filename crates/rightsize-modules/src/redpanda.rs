@@ -17,9 +17,9 @@ impl RedpandaContainer {
     const SCHEMA_REGISTRY_PORT: u16 = 8081;
 
     /// Builds a container from the pinned default image
-    /// (`docker.redpanda.com/redpandadata/redpanda:latest`).
+    /// (`docker.redpanda.com/redpandadata/redpanda:v24.2.4`).
     pub fn new() -> Self {
-        Self::with_image("docker.redpanda.com/redpandadata/redpanda:latest")
+        Self::with_image("docker.redpanda.com/redpandadata/redpanda:v24.2.4")
     }
 
     /// Builds a container from a caller-chosen image.
