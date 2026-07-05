@@ -106,7 +106,7 @@ if you're writing tooling of your own against `msb`.
 
 ## "Registry pulls are rate-limited / a broker image won't pull"
 
-**Cause:** some registries (`docker.redpanda.com` specifically) rate-limit
+**Cause:** registries rate-limit
 anonymous pulls, and msb's image pulls are single-arch — a cold cache plus a
 rate-limited registry can make the first `RedpandaContainer` boot in CI fail well
 before any rightsize-rust-specific logic runs.

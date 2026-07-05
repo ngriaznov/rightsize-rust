@@ -67,7 +67,9 @@ async fn container_publishes_tcp_port_to_host_loopback() {
         .waiting_for(
             // 120s: shared CI runners boot a microVM + python noticeably slower
             // than dev hardware; the default 60s flakes there.
-            Wait::for_http("/").for_port(8000).with_startup_timeout(Duration::from_secs(120)),
+            Wait::for_http("/")
+                .for_port(8000)
+                .with_startup_timeout(Duration::from_secs(120)),
         );
     let guard = c.start().await.expect("container must start");
 

@@ -65,7 +65,7 @@ problems faster and doesn't wait on a runner queue.
 
 
 Before running the msb-backed suite for the first time, redpanda's image needs
-seeding into the msb cache once (`docker.redpanda.com` rate-limits anonymous
+seeding into the msb cache once (registries rate-limit anonymous
 pulls):
 
 ```bash

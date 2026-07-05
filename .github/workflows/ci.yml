@@ -73,8 +73,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      # Image cache: GitHub-hosted runners are exempt from Docker Hub rate limits, but
-      # docker.redpanda.com is NOT covered, and warm loads beat re-pulls anyway.
+      # Image cache: warm loads beat re-pulls and keep registry rate limits out of
+      # the picture entirely.
       # Cache key = hash of the pinned image list file.
       - name: Restore docker image cache
         id: docker-image-cache
