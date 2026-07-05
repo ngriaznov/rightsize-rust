@@ -2,10 +2,11 @@
 
 use rightsize::{Container, ContainerGuard, Result, Wait};
 
-/// A single-node Redis container, ready-checked with a plain TCP read-probe (see
-/// [`Wait::for_listening_port`]) — Redis speaks first on connect, so the bare
-/// listening-port wait is sufficient here (contrast [`crate::memcached::MemcachedContainer`],
-/// which needs a protocol-level probe).
+/// A single-node Redis container. Readiness is anchored on Redis's own
+/// "Ready to accept connections" log line rather than a TCP probe: on a loaded
+/// host the port forwarder can accept and hold a connection in the window
+/// between Redis binding its socket and actually serving, which a bare
+/// listening-port check cannot see through.
 pub struct RedisContainer(Container);
 
 impl RedisContainer {
@@ -22,7 +23,7 @@ impl RedisContainer {
         Self(
             Container::new(image)
                 .with_exposed_ports(&[Self::PORT])
-                .waiting_for(Wait::for_listening_port()),
+                .waiting_for(Wait::for_log_message(".*Ready to accept connections.*", 1)),
         )
     }
 
