@@ -55,7 +55,20 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-v2-${{ runner.os }}-${{ github.run_id }}
           restore-keys: msb-images-v2-${{ runner.os }}-
-      - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
+      - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it 2>&1 | tee /tmp/it-output.log
+        shell: bash
+      # A pull interrupted mid-write can leave the image cache's index pointing at
+      # layer files that don't exist; msb then hard-errors on that image forever.
+      # Purge before saving so a corrupted cache is never banked for future runs —
+      # the next run re-pulls clean instead of restoring the poison.
+      - name: Purge image cache if corruption was observed
+        if: always()
+        shell: bash
+        run: |
+          if grep -q "cache error at .*No such file" /tmp/it-output.log 2>/dev/null; then
+            echo "image-cache corruption detected — purging before save"
+            rm -rf ~/.microsandbox/cache
+          fi
       - uses: actions/cache/save@v4
         if: always()
         with:
