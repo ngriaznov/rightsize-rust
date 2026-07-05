@@ -1,0 +1,30 @@
+[package]
+name = "rightsize-docker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Hand-rolled unix-socket Docker backend for rightsize — the correctness oracle"
+repository.workspace = true
+keywords = ["testing", "containers", "docker"]
+categories = ["development-tools::testing", "asynchronous"]
+
+[dependencies]
+rightsize = { path = "../rightsize", version = "0.1.0" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+# Integration tests that exercise a real Docker daemon — see
+# crates/rightsize-docker/tests/. Selected the same way as rightsize-msb's
+# `sandbox-it` feature (see that crate's Cargo.toml for the rationale): a Cargo
+# feature rather than `#[ignore]`, so `cargo test -p rightsize-docker --features
+# sandbox-it` is the whole invocation.
+sandbox-it = []

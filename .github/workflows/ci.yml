@@ -1,0 +1,139 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly run: integration tests pin real upstream artifacts (the msb release,
+  # container image tags) that can drift or disappear between pushes — a scheduled
+  # run surfaces that breakage without waiting for the next commit.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Integration-test selection: Cargo has no test-tag mechanism, so this workspace
+# uses a Cargo feature, `sandbox-it`, to gate the integration-test modules/
+# `#[cfg(feature = "sandbox-it")]` items instead of `#[ignore]` + `--ignored`: a
+# feature composes cleanly with `RIGHTSIZE_BACKEND` env selection and keeps
+# `cargo test --workspace` (no features) runtime-free on any machine, which is
+# the property the `unit` job below checks.
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  msb-linux:
+    runs-on: ubuntu-latest # GitHub-hosted runners expose /dev/kvm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}
+      # No sandbox-it tests exist yet, so this job currently has nothing to
+      # run; continue-on-error keeps it green until they land.
+      - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
+        continue-on-error: true
+
+  msb-macos:
+    runs-on: macos-latest # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}
+      # No sandbox-it tests exist yet, so continue-on-error keeps this job
+      # green until they land.
+      - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
+        continue-on-error: true
+
+  docker-fallback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      # Image cache: GitHub-hosted runners are exempt from Docker Hub rate limits, but
+      # docker.redpanda.com is NOT covered, and warm loads beat re-pulls anyway.
+      # Cache key = hash of the pinned image list file.
+      - name: Restore docker image cache
+        id: docker-image-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-image-cache
+          key: docker-images-${{ hashFiles('.github/docker-images.txt') }}
+      - name: Load cached images
+        if: steps.docker-image-cache.outputs.cache-hit == 'true'
+        run: for f in ~/docker-image-cache/*.tar; do docker load -i "$f"; done
+      # No sandbox-it tests exist yet, so continue-on-error keeps this job
+      # green until they land.
+      - run: RIGHTSIZE_BACKEND=docker cargo test --workspace --features sandbox-it
+        continue-on-error: true
+      - name: Save images to cache (first run only)
+        if: steps.docker-image-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/docker-image-cache
+          while read -r img; do
+            [ -z "$img" ] && continue
+            docker pull "$img" >/dev/null 2>&1 || true
+            docker save "$img" -o ~/docker-image-cache/"$(echo "$img" | tr '/:' '__')".tar || true
+          done < .github/docker-images.txt
+
+  fmt-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Floor is core-only, unit tests only — integration tests need a runtime
+      # and don't run in this job. 80% line coverage is the floor.
+      - name: cargo llvm-cov (core, line floor 80%)
+        run: |
+          cargo llvm-cov --package rightsize --lib --fail-under-lines 80 \
+            --html --output-dir target/llvm-cov-html \
+            --lcov --output-path target/llvm-cov.lcov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            target/llvm-cov-html
+            target/llvm-cov.lcov

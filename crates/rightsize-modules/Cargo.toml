@@ -1,0 +1,78 @@
+[package]
+name = "rightsize-modules"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Preconfigured rightsize containers — Redis, Memcached, ArangoDB, MongoDB, Redpanda, Kafka, SpringCloudConfig, PostgreSQL, MySQL, Apache Pinot, RabbitMQ, MariaDB, WireMock, ClickHouse, Keycloak, Neo4j, Floci, Apache Flink"
+repository.workspace = true
+keywords = ["testing", "containers", "integration-testing"]
+categories = ["development-tools::testing", "asynchronous"]
+
+[features]
+default = ["backend-msb", "backend-docker"]
+backend-msb = ["dep:rightsize-msb"]
+backend-docker = ["dep:rightsize-docker"]
+# Integration tests that boot a real container against a real backend (msb or
+# docker) and exercise a real client/protocol round-trip — selected the same way
+# the backend crates' `sandbox-it` feature is (see rightsize-msb/Cargo.toml for the
+# rationale): `cargo test -p rightsize-modules --features sandbox-it` is the whole
+# invocation, no `--ignored` flag to remember.
+sandbox-it = []
+
+[dependencies]
+rightsize = { path = "../rightsize", version = "0.1.0" }
+rightsize-msb = { path = "../rightsize-msb", version = "0.1.0", optional = true }
+rightsize-docker = { path = "../rightsize-docker", version = "0.1.0", optional = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+rightsize-msb = { path = "../rightsize-msb" }
+rightsize-docker = { path = "../rightsize-docker" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Real-client round-trip proof for the Postgres/MySQL module ITs — test-only, does
+# not enter the runtime dependency budget (the four shipped crates' own runtime deps
+# are what that budget covers).
+# Pinned to 0.34 (not the latest 0.36) because mysql_async >= 0.35 pulls in
+# mysql_common >= 0.35, whose derive macro depends on darling >= 0.23 — which
+# requires rustc 1.88, above this workspace's MSRV (1.85, `rust-toolchain.toml`).
+# 0.34 is the newest line still buildable on the pinned toolchain. `minimal-rust`
+# (no TLS, no binlog, no bigdecimal/time/frunk) is all the module IT needs — a
+# plaintext local connection and a CREATE/INSERT/SELECT round-trip — and it drops
+# the `native-tls` transitive tree that otherwise requires a newer rustc than this
+# workspace's MSRV.
+mysql_async = { version = "0.34", default-features = false, features = [
+    "minimal-rust",
+] }
+tokio-postgres = "0.7"
+# Schema POST/GET round-trip for the Pinot module IT — already in the workspace tree
+# as a runtime dep of rightsize-msb, reused here as a plain blocking HTTP client for
+# test assertions instead of adding a second HTTP crate.
+ureq = { workspace = true }
+# Transitive-dependency MSRV pins — NOT used directly by this crate's own code.
+# `Cargo.lock` is now committed (see the workspace root `.gitignore`), which is the
+# durable fix for reproducible builds in general going forward; these two pins
+# are still required on top of that for anyone who deletes/regenerates the
+# lockfile from scratch (`rm Cargo.lock && cargo generate-lockfile`) rather than
+# trusting the committed one, or who runs `cargo update` — re-verified directly,
+# with a `cargo clean -p <crate>` before each rebuild so a stale cached artifact
+# from a prior pin can't mask a real failure:
+# - `mysql_common`'s unconditional build-dependency on `subprocess`: without this
+#   pin, a from-scratch resolve picks 0.2.15, and `cargo build --all-targets` fails
+#   with 8 `E0658` errors ("`let` expressions in this position are unstable") in
+#   `subprocess-0.2.15/src/{communicate,popen}.rs` — genuine let-chains syntax
+#   requiring a nightly feature/rustc 1.88, on the pinned 1.85 toolchain.
+# - `tokio-postgres` -> `url` -> `idna` -> `idna_adapter`: without this pin, a
+#   from-scratch resolve picks 1.2.2, which pulls in the `icu_*` 2.2.0 crates, and
+#   `cargo build` fails outright with "rustc 1.85.1 is not supported by ...
+#   idna_adapter@1.2.2 requires rustc 1.86" (and five `icu_*` crates alongside it).
+#
+# The `time` pin this crate previously carried alongside these two is dropped: it
+# does not appear anywhere in a from-scratch resolve of this graph at all (confirmed
+# via `cargo tree -i time`, empty) — `mysql_async` 0.34.2's `minimal-rust` feature
+# set does not pull it in transitively, so pinning it was a no-op.
+subprocess = "=0.2.9"
+idna_adapter = "=1.2.0"

@@ -1,0 +1,20 @@
+[book]
+title = "rightsize-rust"
+authors = []
+description = "Testcontainers-style integration testing on microVMs — no Docker required."
+src = "docs"
+language = "en"
+
+[build]
+# Keep the built HTML out of docs/ (which also holds SUMMARY.md's own source and the
+# internal plans/verification/coverage records) — gitignored, see .gitignore.
+build-dir = "book-build"
+
+[output.html]
+git-repository-url = "https://github.com/ngriaznov/rightsize-rust"
+edit-url-template = "https://github.com/ngriaznov/rightsize-rust/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true

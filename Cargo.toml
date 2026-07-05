@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Mykyta Hriaznov"]
+repository = "https://github.com/ngriaznov/rightsize-rust"
+
+[workspace.dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "process", "macros"] }
+thiserror = "2.0.18"
+async-trait = "0.1.89"
+sha2 = "0.11.0"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+# MSRV 1.65 (well under this workspace's 1.85). Same author and syntax family as
+# `regex`, far smaller and faster to compile, no unicode tables — log-line matching
+# needs none of that. Replaces the hand-rolled `.`/`.*`/literal mini-matcher that used
+# to live in `rightsize::wait`.
+regex-lite = "0.1.9"
+# MSRV 1.71 (well under 1.85). Replaces the hand-rolled JSON encode/tolerant-extract
+# helpers in rightsize-docker and rightsize-msb.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

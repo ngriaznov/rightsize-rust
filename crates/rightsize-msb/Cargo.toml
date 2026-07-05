@@ -1,0 +1,31 @@
+[package]
+name = "rightsize-msb"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "microsandbox (msb) backend for rightsize — attached-mode microVM sandboxes"
+repository.workspace = true
+keywords = ["testing", "containers", "microvm", "microsandbox"]
+categories = ["development-tools::testing", "asynchronous"]
+
+[dependencies]
+rightsize = { path = "../rightsize", version = "0.1.0" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+ureq = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+# Integration tests that exercise a real `msb` binary against real microVMs — see
+# crates/rightsize-msb/tests/. Gated behind a Cargo feature rather than `#[ignore]`,
+# so `cargo test -p rightsize-msb --features sandbox-it` is the whole invocation, no
+# `--ignored` flag to remember.
+sandbox-it = []

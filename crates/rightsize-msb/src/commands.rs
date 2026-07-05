@@ -1,0 +1,213 @@
+//! Pure `msb` CLI argv construction — no process spawning here, just building the
+//! argument vectors [`crate::backend::MsbCliBackend`] hands to `std::process::Command`.
+//! Keeping this pure makes every flag spelling a plain data-in/data-out unit test,
+//! independent of a real `msb` binary.
+//!
+//! **Attached mode, always** (no `-d`): microsandbox's detached mode never starts the
+//! image's `ENTRYPOINT` on 0.6.2 — only attached mode does — so [`run`] never
+//! emits `-d`, and the backend supervises the resulting child directly.
+
+use rightsize::model::ContainerSpec;
+
+/// Builds the argv for `msb run`, in the pinned order: name, memory (if set), ports,
+/// env, mounts, image, then `-- <command>` iff `spec.command` is `Some` — a `None`
+/// command means "run the image's default `ENTRYPOINT`/`CMD`", which requires omitting
+/// the trailing `--` entirely rather than passing it with no arguments after it.
+pub fn run(spec: &ContainerSpec) -> Vec<String> {
+    let mut argv = vec!["run".to_string(), "--name".to_string(), spec.name.clone()];
+
+    // `msb run --help`: -m/--memory <MEMORY>, e.g. 512M/1G — right after --name.
+    if let Some(mb) = spec.memory_limit_mb {
+        argv.push("-m".to_string());
+        argv.push(format!("{mb}M"));
+    }
+
+    for port in &spec.ports {
+        argv.push("-p".to_string());
+        argv.push(format!("{}:{}", port.host_port, port.guest_port));
+    }
+
+    for (k, v) in &spec.env {
+        argv.push("-e".to_string());
+        argv.push(format!("{k}={v}"));
+    }
+
+    for mount in &spec.mounts {
+        argv.push("--mount-file".to_string());
+        argv.push(format!(
+            "{}:{}",
+            mount.host_path.display(),
+            mount.guest_path
+        ));
+    }
+
+    argv.push(spec.image.clone());
+
+    if let Some(command) = &spec.command {
+        argv.push("--".to_string());
+        argv.extend(command.iter().cloned());
+    }
+
+    argv
+}
+
+/// Builds the argv for a plain (non-streaming) `msb exec`.
+pub fn exec(name: &str, cmd: &[String]) -> Vec<String> {
+    let mut argv = vec!["exec".to_string(), name.to_string(), "--".to_string()];
+    argv.extend(cmd.iter().cloned());
+    argv
+}
+
+/// Builds the argv for `msb exec --stream` — the only guest data path microsandbox
+/// exposes, used exclusively by the exec-tunnel network-link emulation.
+pub fn exec_stream(name: &str, cmd: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "exec".to_string(),
+        "--stream".to_string(),
+        name.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(cmd.iter().cloned());
+    argv
+}
+
+/// Builds the argv for a one-shot logs fetch (the last 1000 lines).
+pub fn logs(name: &str) -> Vec<String> {
+    vec![
+        "logs".to_string(),
+        name.to_string(),
+        "--tail".to_string(),
+        "1000".to_string(),
+    ]
+}
+
+/// Builds the argv for a following logs stream. Never exits on its own once the
+/// sandbox stops — the backend's watchdog is what reclaims this child.
+pub fn follow_logs(name: &str) -> Vec<String> {
+    vec!["logs".to_string(), name.to_string(), "-f".to_string()]
+}
+
+/// Builds the argv for `msb stop`.
+pub fn stop(name: &str) -> Vec<String> {
+    vec!["stop".to_string(), name.to_string()]
+}
+
+/// Builds the argv for `msb rm`.
+pub fn rm(name: &str) -> Vec<String> {
+    vec!["rm".to_string(), name.to_string()]
+}
+
+/// Builds the argv for listing sandboxes as JSON. Note: no `--json` flag exists on
+/// `ls` — it's `--format json`.
+pub fn ls() -> Vec<String> {
+    vec!["ls".to_string(), "--format".to_string(), "json".to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rightsize::model::{FileMount, PortBinding};
+    use std::path::PathBuf;
+
+    fn full_spec() -> ContainerSpec {
+        ContainerSpec {
+            name: "rz-abc-1".to_string(),
+            image: "redis:8.6-alpine".to_string(),
+            env: vec![("A".to_string(), "1".to_string())],
+            command: Some(vec![
+                "redis-server".to_string(),
+                "--port".to_string(),
+                "6379".to_string(),
+            ]),
+            ports: vec![PortBinding {
+                host_port: 12345,
+                guest_port: 6379,
+            }],
+            mounts: vec![FileMount::new(
+                PathBuf::from("/tmp/f.conf"),
+                "/etc/f.conf".to_string(),
+            )],
+            network_id: Some("rz-net-1".to_string()),
+            aliases: vec!["redis".to_string()],
+            run_id: "abc".to_string(),
+            memory_limit_mb: None,
+        }
+    }
+
+    #[test]
+    fn run_command_carries_all_spec_parts_attached_no_d() {
+        let cmd = run(&full_spec());
+        assert_eq!(
+            cmd,
+            vec![
+                "run",
+                "--name",
+                "rz-abc-1",
+                "-p",
+                "12345:6379",
+                "-e",
+                "A=1",
+                "--mount-file",
+                "/tmp/f.conf:/etc/f.conf",
+                "redis:8.6-alpine",
+                "--",
+                "redis-server",
+                "--port",
+                "6379",
+            ]
+        );
+        assert!(!cmd.contains(&"-d".to_string()));
+    }
+
+    #[test]
+    fn image_default_entrypoint_runs_when_command_is_none() {
+        let mut spec = full_spec();
+        spec.command = None;
+        let cmd = run(&spec);
+        // No trailing `--`: attached mode runs the image default.
+        assert_eq!(cmd.last().unwrap(), "redis:8.6-alpine");
+        assert!(!cmd.contains(&"--".to_string()));
+    }
+
+    #[test]
+    fn run_command_includes_dash_m_when_memory_limit_is_set_absent_when_none() {
+        let mut spec = full_spec();
+        spec.memory_limit_mb = Some(1024);
+        let with_limit = run(&spec);
+        let m_index = with_limit
+            .iter()
+            .position(|a| a == "-m")
+            .expect("expected -m flag");
+        assert_eq!(with_limit[m_index + 1], "1024M");
+        // -m comes right after --name, before ports/env/mounts.
+        assert_eq!(with_limit[3], "-m");
+
+        let without_limit = run(&full_spec()); // memory_limit_mb defaults to None
+        assert!(!without_limit.contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn exec_logs_stop_rm_ls_spellings() {
+        assert_eq!(
+            exec("rz-abc-1", &["redis-cli".to_string(), "ping".to_string()]),
+            vec!["exec", "rz-abc-1", "--", "redis-cli", "ping"]
+        );
+        assert_eq!(
+            exec_stream("rz-abc-1", &["nc".to_string(), "-l".to_string()]),
+            vec!["exec", "--stream", "rz-abc-1", "--", "nc", "-l"]
+        );
+        assert_eq!(logs("rz-abc-1"), vec!["logs", "rz-abc-1", "--tail", "1000"]);
+        assert_eq!(follow_logs("rz-abc-1"), vec!["logs", "rz-abc-1", "-f"]);
+        assert_eq!(stop("rz-abc-1"), vec!["stop", "rz-abc-1"]);
+        assert_eq!(rm("rz-abc-1"), vec!["rm", "rz-abc-1"]);
+        // Confirmed empirically against the real msb binary: no `--json` flag on `ls`.
+        assert_eq!(ls(), vec!["ls", "--format", "json"]);
+    }
+
+    #[test]
+    fn run_command_with_no_ports_env_or_mounts_omits_their_flags() {
+        let spec = ContainerSpec::new("rz-bare-1", "alpine:3.19", "bare");
+        let cmd = run(&spec);
+        assert_eq!(cmd, vec!["run", "--name", "rz-bare-1", "alpine:3.19"]);
+    }
+}
