@@ -104,10 +104,7 @@ jobs:
       - name: Load cached images
         if: steps.docker-image-cache.outputs.cache-hit == 'true'
         run: for f in ~/docker-image-cache/*.tar; do docker load -i "$f"; done
-      # No sandbox-it tests exist yet, so continue-on-error keeps this job
-      # green until they land.
       - run: RIGHTSIZE_BACKEND=docker cargo test --workspace --features sandbox-it
-        continue-on-error: true
       - name: Save images to cache (first run only)
         if: steps.docker-image-cache.outputs.cache-hit != 'true'
         run: |
