@@ -53,14 +53,14 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: msb-images-${{ runner.os }}-
+          key: msb-images-v2-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: msb-images-v2-${{ runner.os }}-
       - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it
       - uses: actions/cache/save@v4
         if: always()
         with:
           path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+          key: msb-images-v2-${{ runner.os }}-${{ github.run_id }}
 
   # msb-windows: native msb on Windows Hypervisor Platform (WHP). Confirmed working on
   # both windows-2022 and windows-2025 hosted runners by the windows-spike workflow
@@ -102,8 +102,8 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: msb-images-${{ runner.os }}-
+          key: msb-images-v2-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: msb-images-v2-${{ runner.os }}-
       # --test-threads=1, Windows-only: the msb-linux lane runs this same
       # backend_it.rs concurrently (its 4 #[tokio::test]s booting real microVMs at
       # once) without issue, but on windows-2025 that concurrency hit a real msb-side
@@ -117,7 +117,7 @@ jobs:
         if: always()
         with:
           path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+          key: msb-images-v2-${{ runner.os }}-${{ github.run_id }}
 
   # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
   # without nested virtualization, so Hypervisor.framework VM creation fails
