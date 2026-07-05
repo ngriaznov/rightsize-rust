@@ -92,7 +92,9 @@ pub(crate) fn ensure_installed_at(
 
     let install_dir = cache_dir.join("msb").join(MSB_VERSION);
     let msb = install_dir.join("bin").join("msb");
-    let krun = install_dir.join("lib").join(platform.krun_asset());
+    // Installed under the canonical name msb resolves (`../lib/` next to its binary),
+    // not the release-asset name it is downloaded as — msb never probes the asset name.
+    let krun = install_dir.join("lib").join(platform.krun_install_name());
 
     // An install is complete only when BOTH the msb binary and the krun asset are
     // present. The msb binary is written last (see the module docs), so its presence
@@ -592,7 +594,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("lib")
-            .join(platform.krun_asset());
+            .join(platform.krun_install_name());
         assert!(krun_path.exists());
         assert_eq!(fs::read(&krun_path).unwrap(), fake_krun);
 
@@ -688,7 +690,7 @@ mod tests {
         let stale_msb = bin_dir.join("msb");
         fs::write(&stale_msb, b"#!/bin/sh\necho stale\n").unwrap();
         set_executable(&stale_msb).unwrap();
-        let krun_path = install_dir.join("lib").join(platform.krun_asset());
+        let krun_path = install_dir.join("lib").join(platform.krun_install_name());
         assert!(is_executable(&stale_msb));
         assert!(!krun_path.exists());
 

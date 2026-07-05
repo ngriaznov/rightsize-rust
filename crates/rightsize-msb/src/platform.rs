@@ -44,12 +44,25 @@ impl Platform {
     }
 
     /// The `libkrunfw-<os>-<arch>.{dylib,so}` release asset name for this platform —
-    /// installed as a sibling of `msb_asset()` in the install dir's `lib/`, never `bin/`.
+    /// what the file is downloaded as, never what it is installed as (see
+    /// [`Platform::krun_install_name`]).
     pub fn krun_asset(&self) -> &'static str {
         match self {
             Platform::DarwinArm64 => "libkrunfw-darwin-aarch64.dylib",
             Platform::LinuxX64 => "libkrunfw-linux-x86_64.so",
             Platform::LinuxArm64 => "libkrunfw-linux-aarch64.so",
+        }
+    }
+
+    /// The exact filename `msb` resolves the library under: it probes `../lib/` next to
+    /// its own binary for `libkrunfw.so.<version>` on Linux and `libkrunfw.<abi>.dylib`
+    /// on macOS — never the release-asset name — so the provisioner installs the
+    /// downloaded asset under this name. The embedded libkrunfw version/ABI is part of
+    /// the pinned msb release; re-verify both names when bumping the pin.
+    pub fn krun_install_name(&self) -> &'static str {
+        match self {
+            Platform::DarwinArm64 => "libkrunfw.5.dylib",
+            Platform::LinuxX64 | Platform::LinuxArm64 => "libkrunfw.so.5.5.0",
         }
     }
 
