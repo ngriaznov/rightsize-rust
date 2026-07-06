@@ -80,7 +80,7 @@ async fn mysql_round_trips_a_row() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Backend notes
 
-No memory-limit override: MySQL 8.4's InnoDB default footprint boots clean on msb's
-default ~450 MB microVM RAM well under 60s, unlike
+No memory-limit override: MySQL 8.4's InnoDB default footprint fits msb's
+default ~450 MB microVM RAM, unlike
 [`SpringCloudConfigContainer`](./spring-cloud-config.md)'s Paketo JVM image — no
 module-level memory floor was warranted here after measurement.
