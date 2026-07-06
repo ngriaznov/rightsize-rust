@@ -7,8 +7,16 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-06
+
 ### Fixed
 
+- **`ClickHouseContainer` readiness gets a 180-second budget**
+  (`rightsize-modules`). The entrypoint runs a second server pass for
+  user/database provisioning before the HTTP interface opens, and a loaded
+  Windows CI runner was observed still in early config processing at the
+  previous default budget. The budget is a deadline, not a wait — readiness
+  returns the moment `/ping` answers.
 - **The backend retries a boot that lost msb's startup-migration race**
   (`rightsize-msb`). Every msb invocation runs schema migrations against its
   shared SQLite state database on startup, and two concurrent invocations can
@@ -202,5 +210,6 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ngriaznov/rightsize-rust/releases/tag/v0.1.0

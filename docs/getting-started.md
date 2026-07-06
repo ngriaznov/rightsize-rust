@@ -5,16 +5,14 @@
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = "0.1.0"
-rightsize-modules = "0.1.0"
+rightsize = "0.1.1"
+rightsize-modules = "0.1.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 `rightsize-modules` pulls in both backend crates by default (`backend-msb` and
 `backend-docker` Cargo features, both on) so you don't have to wire anything up by
-hand for the common case. Once a tagged release exists, the same dependency block
-works with a version requirement (`rightsize = "0.1"`) instead of a `git` key —
-nothing else about the API changes.
+hand for the common case.
 
 ## Your first test
 
