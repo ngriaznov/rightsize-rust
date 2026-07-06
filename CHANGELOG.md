@@ -11,6 +11,13 @@ reaches its first tagged release.
 
 ### Fixed
 
+- **The default readiness budget is 120 seconds** (was 60; `rightsize`). Three
+  modules in a row (MySQL, ClickHouse, Redpanda) were observed overrunning a
+  60-second ceiling on loaded CI runners while booting normally. The budget is
+  a deadline, not a wait — `start()` still returns the moment the readiness
+  signal fires — so the larger default costs nothing on the happy path and
+  only delays the failure verdict when a container is genuinely broken.
+  `with_startup_timeout` overrides it as before.
 - **`ClickHouseContainer` readiness gets a 180-second budget**
   (`rightsize-modules`). The entrypoint runs a second server pass for
   user/database provisioning before the HTTP interface opens, and a loaded

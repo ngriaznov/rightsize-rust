@@ -227,7 +227,7 @@ impl HttpWaitStrategy {
             path: path.into(),
             guest_port: None,
             status: 200,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(120),
         }
     }
 
@@ -325,7 +325,7 @@ impl Wait {
     /// ready immediately if the container exposes no ports.
     pub fn for_listening_port() -> Box<dyn WaitStrategy> {
         Box::new(ListeningPortWait {
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(120),
         })
     }
 
@@ -357,7 +357,7 @@ impl Wait {
             re,
             times,
             what,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(120),
         })
     }
 }
