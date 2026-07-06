@@ -29,6 +29,7 @@ impl RedisContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<RedisGuard> {
+        crate::register_default_backends();
         Ok(RedisGuard(self.0.start().await?))
     }
 }

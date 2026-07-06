@@ -47,6 +47,7 @@ impl SpringCloudConfigContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<SpringCloudConfigGuard> {
+        crate::register_default_backends();
         Ok(SpringCloudConfigGuard(self.0.start().await?))
     }
 }

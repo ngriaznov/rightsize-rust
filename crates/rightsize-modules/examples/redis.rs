@@ -18,20 +18,12 @@
 //! RIGHTSIZE_BACKEND=docker       cargo run -p rightsize-modules --example redis
 //! ```
 
-use rightsize::backends;
-use rightsize_docker::DockerBackendProvider;
 use rightsize_modules::RedisContainer;
-use rightsize_msb::MsbBackendProvider;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() {
-    // Registers both backend providers so RIGHTSIZE_BACKEND (or, if unset, whichever one
-    // is actually usable on this host) picks the one that resolves.
-    backends::register_provider(Box::new(MsbBackendProvider));
-    backends::register_provider(Box::new(DockerBackendProvider));
-
     let guard = RedisContainer::new()
         .start()
         .await

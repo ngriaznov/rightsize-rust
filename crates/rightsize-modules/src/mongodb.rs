@@ -40,6 +40,7 @@ impl MongoDbContainer {
 
     /// Boots the container. Does not return until the replica set has a primary.
     pub async fn start(self) -> Result<MongoDbGuard> {
+        crate::register_default_backends();
         Ok(MongoDbGuard(self.0.start().await?))
     }
 }

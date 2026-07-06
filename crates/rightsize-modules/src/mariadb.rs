@@ -106,6 +106,7 @@ impl MariaDbContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<MariaDbGuard> {
+        crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(MariaDbGuard {
             guard,

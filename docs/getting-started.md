@@ -82,29 +82,35 @@ Useful env vars while you're getting set up (full reference in
 | `RIGHTSIZE_CACHE_DIR` | Relocate the provisioner's cache root. |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` turns a cache miss into a hard error instead of a network fetch — for air-gapped CI that pre-seeds the cache. |
 
-## Wiring a backend yourself (when not using `rightsize-modules`' defaults)
+## Backend wiring — automatic with modules, explicit without
 
-If you depend on `rightsize` directly (not through `rightsize-modules`, or with its
-default features turned off), you register at least one backend once per process
-before the first `Container::start()`:
+Consumers of `rightsize-modules` write no backend wiring at all: the
+feature-enabled backends (`backend-msb`, `backend-docker` — both default
+features) register themselves the first time any module starts.
 
-```rust,ignore
-use std::sync::Once;
+Backend resolution happens at the process's **first** `Container::start()` and
+is cached for the life of the process. Two cases still call for one explicit
+line:
 
-static REGISTER: Once = Once::new();
+- **Your first container is a plain `Container`, not a module.** Call the same
+  entry point every module start uses, before that first start:
 
-fn ensure_backends_registered() {
-    REGISTER.call_once(|| {
-        rightsize::backends::register_provider(Box::new(rightsize_msb::MsbBackendProvider));
-        rightsize::backends::register_provider(Box::new(rightsize_docker::DockerBackendProvider));
-    });
-}
-```
+  ```rust,ignore
+  rightsize_modules::register_default_backends();
+  ```
 
-Rust has no `ServiceLoader`-style automatic plugin discovery, so this registration
-step is explicit. Call `ensure_backends_registered()` at the top of a shared
-test-fixture module (or your binary's startup path); `rightsize::backends::resolve`
-then picks among whatever's registered, honoring `RIGHTSIZE_BACKEND` when it's set.
+- **You depend on `rightsize` and the backend crates directly**, without
+  `rightsize-modules`. Rust has no `ServiceLoader`-style automatic plugin
+  discovery, so register once per process before the first start:
+
+  ```rust,ignore
+  rightsize::backends::register_provider(Box::new(rightsize_msb::MsbBackendProvider));
+  rightsize::backends::register_provider(Box::new(rightsize_docker::DockerBackendProvider));
+  ```
+
+  Registration is idempotent by provider name, so a shared test-fixture module
+  calling this from several places is fine. `rightsize::backends::resolve` picks
+  among whatever's registered, honoring `RIGHTSIZE_BACKEND` when it's set.
 
 ## The shared-container recipe
 

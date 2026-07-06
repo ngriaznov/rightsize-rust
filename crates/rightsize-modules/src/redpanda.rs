@@ -75,6 +75,7 @@ impl RedpandaContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<RedpandaGuard> {
+        crate::register_default_backends();
         Ok(RedpandaGuard(self.0.start().await?))
     }
 }

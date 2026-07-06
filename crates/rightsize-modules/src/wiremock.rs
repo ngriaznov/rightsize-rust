@@ -48,6 +48,7 @@ impl WireMockContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<WireMockGuard> {
+        crate::register_default_backends();
         Ok(WireMockGuard(self.0.start().await?))
     }
 }

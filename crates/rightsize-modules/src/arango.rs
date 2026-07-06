@@ -55,6 +55,7 @@ impl ArangoContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<ArangoGuard> {
+        crate::register_default_backends();
         Ok(ArangoGuard(self.0.start().await?))
     }
 }

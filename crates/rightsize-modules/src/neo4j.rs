@@ -93,6 +93,7 @@ impl Neo4jContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<Neo4jGuard> {
+        crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(Neo4jGuard {
             guard,

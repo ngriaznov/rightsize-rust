@@ -98,6 +98,7 @@ impl KeycloakContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<KeycloakGuard> {
+        crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(KeycloakGuard {
             guard,

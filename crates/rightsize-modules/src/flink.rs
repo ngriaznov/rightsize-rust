@@ -155,6 +155,7 @@ impl FlinkContainer {
     /// Boots the JobManager, then (if [`FlinkContainer::with_task_manager`] was
     /// called) the companion TaskManager.
     pub async fn start(self) -> Result<FlinkGuard> {
+        crate::register_default_backends();
         let jobmanager = self.container.start().await?;
         let task_manager = match self.task_manager {
             Some(tm) => match tm.start().await {

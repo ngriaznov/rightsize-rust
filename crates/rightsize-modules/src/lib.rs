@@ -12,7 +12,29 @@
 //! Backend wiring is a Cargo feature choice, not a runtime one: `backend-msb` and
 //! `backend-docker` (both on by default) pull in `rightsize-msb` and
 //! `rightsize-docker` respectively so consumers can trim the dependency they don't
-//! need.
+//! need. The feature-enabled backends register themselves the first time any module
+//! starts — no `register_provider` boilerplate; see [`register_default_backends`]
+//! for the one case where calling it yourself is still useful.
+
+/// Registers the feature-enabled backend providers (`backend-msb`, `backend-docker`)
+/// with [`rightsize::backends`]. Runs its body once per process, and the core
+/// registry is itself idempotent by provider name, so calling this again — or also
+/// registering a provider by hand — is harmless.
+///
+/// Every module's `start` calls this on its way into the core, so consumers of this
+/// crate write no backend wiring at all. Call it yourself only when the **first**
+/// container your process starts is a plain [`rightsize::Container`] rather than one
+/// of these modules (backend resolution happens at that first start and is cached
+/// for the life of the process).
+pub fn register_default_backends() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(feature = "backend-msb")]
+        rightsize::backends::register_provider(Box::new(rightsize_msb::MsbBackendProvider));
+        #[cfg(feature = "backend-docker")]
+        rightsize::backends::register_provider(Box::new(rightsize_docker::DockerBackendProvider));
+    });
+}
 
 pub mod arango;
 pub mod clickhouse;

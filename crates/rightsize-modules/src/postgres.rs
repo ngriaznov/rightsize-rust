@@ -84,6 +84,7 @@ impl PostgresContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<PostgresGuard> {
+        crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(PostgresGuard {
             guard,

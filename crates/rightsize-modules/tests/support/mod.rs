@@ -15,24 +15,18 @@
 //! exactly that reason, rather than chasing per-binary warnings for a file that's
 //! shared by construction.
 
-use std::sync::Once;
-
 use rightsize::backend::BackendProvider;
 use rightsize_docker::DockerBackendProvider;
 use rightsize_msb::MsbBackendProvider;
 
-static REGISTER: Once = Once::new();
-
-/// Registers both providers exactly once per process. Does NOT force a default
-/// `RIGHTSIZE_BACKEND` — unlike the backend crates' own single-backend ITs, module
-/// ITs are meant to run once per backend via an explicit `RIGHTSIZE_BACKEND=...`
-/// invocation (see each test file's module doc), so silently defaulting here would
-/// mask a caller forgetting to set it.
+/// Registers both providers through the crate's own public entry point — the same
+/// call every module `start` makes — so these tests exercise the exact registration
+/// path a real caller gets. Does NOT force a default `RIGHTSIZE_BACKEND` — unlike
+/// the backend crates' own single-backend ITs, module ITs are meant to run once per
+/// backend via an explicit `RIGHTSIZE_BACKEND=...` invocation (see each test file's
+/// module doc), so silently defaulting here would mask a caller forgetting to set it.
 pub fn ensure_registered() {
-    REGISTER.call_once(|| {
-        rightsize::backends::register_provider(Box::new(MsbBackendProvider));
-        rightsize::backends::register_provider(Box::new(DockerBackendProvider));
-    });
+    rightsize_modules::register_default_backends();
 }
 
 /// True if the backend named by `RIGHTSIZE_BACKEND` (or the highest-priority

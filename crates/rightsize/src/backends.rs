@@ -83,11 +83,22 @@ static PROVIDERS: std::sync::Mutex<Vec<Box<dyn BackendProvider>>> =
 /// Registers `provider` so a later `active` call can consider it. Must be called
 /// before the first `active` call to have any effect — `active` caches its result
 /// after the first successful resolution.
+///
+/// Idempotent by name: registering a provider whose `name()` is already present is
+/// a no-op (first registration wins). That's what lets `rightsize-modules`'
+/// automatic registration and a caller's own explicit `register_provider` coexist
+/// without double entries.
 pub fn register_provider(provider: Box<dyn BackendProvider>) {
-    PROVIDERS
+    let mut providers = PROVIDERS
         .lock()
-        .expect("backend provider registry mutex poisoned")
-        .push(provider);
+        .expect("backend provider registry mutex poisoned");
+    if providers
+        .iter()
+        .any(|p| p.name().eq_ignore_ascii_case(provider.name()))
+    {
+        return;
+    }
+    providers.push(provider);
 }
 
 static ACTIVE: OnceLock<Arc<dyn SandboxBackend>> = OnceLock::new();
@@ -182,6 +193,22 @@ mod tests {
             priority,
             supported,
         })
+    }
+
+    /// The only test that touches the process-global registry (the rest exercise
+    /// `resolve` on explicit lists): same-name registration must be a no-op, case
+    /// notwithstanding, so automatic and manual registration can overlap.
+    #[test]
+    fn register_provider_is_idempotent_by_name() {
+        register_provider(provider("dedup-fake", 1, false));
+        register_provider(provider("DEDUP-FAKE", 9, true));
+        let count = PROVIDERS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.name().eq_ignore_ascii_case("dedup-fake"))
+            .count();
+        assert_eq!(count, 1);
     }
 
     /// `Box<dyn SandboxBackend>` isn't `Debug` (trait objects for an async trait aren't,

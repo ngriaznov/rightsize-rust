@@ -7,6 +7,18 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Backends register themselves** (`rightsize-modules`): the feature-enabled
+  backend providers are registered automatically the first time any module
+  starts, so consumers write no `register_provider` boilerplate. A new public
+  `rightsize_modules::register_default_backends()` covers the one case that
+  still needs a call — a plain `Container` as the process's first start. Core's
+  `register_provider` is now idempotent by provider name (first registration
+  wins), so automatic and manual registration coexist without double entries.
+  Registering providers by hand remains the path for consumers depending on
+  the backend crates directly.
+
 ## [0.1.0] - 2026-07-06
 
 Initial public release.

@@ -104,6 +104,7 @@ impl MySqlContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<MySqlGuard> {
+        crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(MySqlGuard {
             guard,

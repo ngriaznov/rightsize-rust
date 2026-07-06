@@ -88,6 +88,7 @@ impl FlociContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<FlociGuard> {
+        crate::register_default_backends();
         Ok(FlociGuard {
             guard: self.container.start().await?,
             port: self.port,

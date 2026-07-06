@@ -165,9 +165,12 @@ but a few edges are real, not just timing quirks:
   userland proxy/forwarder on *either* backend can accept a connection before the
   guest process is actually listening.
 
-## Wiring a backend explicitly
+## Wiring a backend
 
-Covered in [Getting Started](./getting-started.md#wiring-a-backend-yourself-when-not-using-rightsize-modules-defaults) —
-register whichever provider(s) you want via
-`rightsize::backends::register_provider` once per process, before the first
-`Container::start()`.
+Automatic for `rightsize-modules` consumers: the feature-enabled backends
+register themselves the first time any module starts. Covered in
+[Getting Started](./getting-started.md#backend-wiring--automatic-with-modules-explicit-without) —
+including the two cases that still take one explicit line
+(`rightsize_modules::register_default_backends()` before a plain-`Container`
+first start, or `rightsize::backends::register_provider` when depending on the
+backend crates directly).

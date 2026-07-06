@@ -26,17 +26,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rightsize::backends;
 use rightsize::{Container, Network, Wait};
-use rightsize_docker::DockerBackendProvider;
-use rightsize_msb::MsbBackendProvider;
 
 #[tokio::main]
 async fn main() {
-    // Registers both backend providers so RIGHTSIZE_BACKEND (or, if unset, whichever one
-    // is actually usable on this host) picks the one that resolves.
-    backends::register_provider(Box::new(MsbBackendProvider));
-    backends::register_provider(Box::new(DockerBackendProvider));
+    // This example starts plain `Container`s (no module), and backend resolution
+    // happens at the process's first start — so the feature-enabled backends are
+    // registered explicitly here. Module starts do this automatically.
+    rightsize_modules::register_default_backends();
 
     let net = Arc::new(Network::new_network());
 

@@ -87,6 +87,7 @@ impl PinotContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<PinotGuard> {
+        crate::register_default_backends();
         Ok(PinotGuard(self.0.start().await?))
     }
 }

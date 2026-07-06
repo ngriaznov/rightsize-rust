@@ -31,6 +31,7 @@ impl MemcachedContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<MemcachedGuard> {
+        crate::register_default_backends();
         Ok(MemcachedGuard(self.0.start().await?))
     }
 }

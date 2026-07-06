@@ -96,6 +96,7 @@ impl ClickHouseContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<ClickHouseGuard> {
+        crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(ClickHouseGuard {
             guard,

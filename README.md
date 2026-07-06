@@ -59,28 +59,25 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 and `backend-docker` Cargo features); disable `default-features` and re-enable
 one to trim the dependency you don't need.
 
-Rust has no `ServiceLoader`-style plugin discovery, so register the backend(s)
-once per process before the first `start()`:
+No backend wiring: the feature-enabled backends (`backend-msb` and
+`backend-docker`, both on by default) register themselves the first time any
+module starts. On first test run, rightsize-rust downloads the pinned
+microsandbox runtime (SHA-256-verified, from GitHub releases) into
+`~/.cache/rightsize/` and boots your containers as microVMs — resolution picks
+the best supported backend, honoring `RIGHTSIZE_BACKEND` when set. No daemon,
+no root, no pre-installed anything.
+
+The one wrinkle: resolution happens at the process's **first** `start()` and is
+cached. If that first start is a plain `Container` rather than a module, make
+one call first:
 
 ```rust
-use std::sync::Once;
-
-static REGISTER: Once = Once::new();
-
-fn ensure_backends_registered() {
-    REGISTER.call_once(|| {
-        rightsize::backends::register_provider(Box::new(rightsize_msb::MsbBackendProvider));
-        rightsize::backends::register_provider(Box::new(rightsize_docker::DockerBackendProvider));
-    });
-}
+rightsize_modules::register_default_backends();
 ```
 
-Call it at the top of a shared test-fixture module (or your binary's startup
-path). On first test run, rightsize-rust downloads the pinned microsandbox runtime
-(SHA-256-verified, from GitHub releases) into `~/.cache/rightsize/` and boots your
-containers as microVMs — `rightsize::backends::resolve` picks among whatever's
-registered, honoring `RIGHTSIZE_BACKEND` when set. No daemon, no root, no
-pre-installed anything.
+(Depending on `rightsize` and the backend crates directly, without
+`rightsize-modules`? Register providers by hand via
+`rightsize::backends::register_provider` — see the book.)
 
 ### Driving a container by hand
 

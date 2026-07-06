@@ -53,6 +53,7 @@ impl KafkaContainer {
 
     /// Boots the container.
     pub async fn start(self) -> Result<KafkaGuard> {
+        crate::register_default_backends();
         Ok(KafkaGuard(self.0.start().await?))
     }
 }
