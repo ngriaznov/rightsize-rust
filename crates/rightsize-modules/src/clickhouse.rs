@@ -31,6 +31,8 @@
 //! needed) — a single-node ClickHouse server, unlike Pinot's four-JVM QuickStart
 //! cluster, is not a JVM process at all.
 
+use std::time::Duration;
+
 use rightsize::{Container, ContainerGuard, Result, Wait};
 
 const HTTP_PORT: u16 = 8123;
@@ -63,8 +65,15 @@ impl ClickHouseContainer {
             .with_env("CLICKHOUSE_DB", &database)
             // Protocol-aware HTTP probe: /ping answers "Ok.\n" once the HTTP
             // interface is really up — no double-boot restart race the way the
-            // Postgres/MySQL/MariaDB entrypoints have.
-            .waiting_for(Wait::for_http("/ping").for_port(HTTP_PORT));
+            // Postgres/MySQL/MariaDB entrypoints have. 180s: the entrypoint's
+            // user/database provisioning runs a second server pass before the
+            // HTTP interface opens; a loaded Windows CI runner was observed
+            // still in early config processing at 120s.
+            .waiting_for(
+                Wait::for_http("/ping")
+                    .for_port(HTTP_PORT)
+                    .with_startup_timeout(Duration::from_secs(180)),
+            );
         Self {
             container,
             username,
