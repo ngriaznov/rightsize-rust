@@ -434,6 +434,14 @@ impl SandboxBackend for MsbCliBackend {
         Ok(result.stdout)
     }
 
+    /// On Windows, `msb logs -f` stays alive for the sandbox's whole run but never
+    /// relays a single line to its stdout pipe while the sandbox is Running (confirmed
+    /// against a real `windows-2025` hosted runner) — a live-follow child can never
+    /// deliver on that channel there, so this dispatches to
+    /// [`crate::watchdog::spawn_follow_polling`] instead of the POSIX pipe-follow path.
+    /// Everywhere else, `msb logs -f`'s pipe carries lines live and only its
+    /// never-exits-on-its-own defect needs working around (see
+    /// [`crate::watchdog::spawn_follow`]).
     async fn follow_logs(
         &self,
         handle: &dyn SandboxHandle,
@@ -441,7 +449,11 @@ impl SandboxBackend for MsbCliBackend {
     ) -> Result<FollowHandle> {
         let msb = self.msb.clone();
         let name = handle.id().to_string();
-        crate::watchdog::spawn_follow(msb, name, consumer)
+        if cfg!(windows) {
+            crate::watchdog::spawn_follow_polling(msb, name, consumer)
+        } else {
+            crate::watchdog::spawn_follow(msb, name, consumer)
+        }
     }
 
     async fn ensure_network(&self, _network_id: &str) -> Result<()> {
@@ -776,6 +788,48 @@ pub fn is_image_cache_corruption_for_test(output: &str) -> bool {
 /// either.
 pub(crate) fn invoke_logs_for_watchdog(msb: &Path, name: &str) -> Result<String> {
     Ok(invoke_standalone(msb, &commands::logs(name), LOGS_TIMEOUT)?.stdout)
+}
+
+/// A one-shot `msb logs` fetch that surfaces a non-zero exit as `Err` instead of
+/// silently handing back whatever (possibly empty) stdout accompanied it — unlike
+/// [`invoke_logs_for_watchdog`], which callers use precisely because a missing/
+/// removed sandbox legitimately exits non-zero with harmless empty stdout there.
+/// The Windows log poller (`crate::watchdog::spawn_follow_polling`) needs the
+/// distinction the other helper doesn't: an `msb logs` invocation that fails because
+/// msb itself hit an internal error (e.g. the Windows sqlite migration/contention
+/// race — `error: database error: ... UNIQUE constraint failed`) prints that error
+/// to stderr and exits non-zero with EMPTY stdout, which is indistinguishable from a
+/// genuinely-empty log unless the exit code is checked — and treating that failure
+/// as "confirmed empty content" is exactly what let the poller finalize delivery
+/// with nothing, observed on real `windows-2025` CI runs.
+pub(crate) fn logs_snapshot_for_poller(msb: &Path, name: &str) -> Result<String> {
+    let result = invoke_standalone(msb, &commands::logs(name), LOGS_TIMEOUT)?;
+    if result.exit_code != 0 {
+        return Err(RightsizeError::Backend(format!(
+            "msb logs {name} --tail 1000 exited {}: {}",
+            result.exit_code,
+            result.stderr.trim()
+        )));
+    }
+    Ok(result.stdout)
+}
+
+/// A one-shot `msb ls` fetch that surfaces a non-zero exit as `Err` — the same
+/// distinction [`logs_snapshot_for_poller`] draws, and for the same reason: `msb ls`
+/// failing on the Windows sqlite race prints its error to stderr and exits non-zero
+/// with stdout that is not valid JSON (or empty), which `ls_json::running_names`'s
+/// tolerant parser would otherwise silently read as "no sandboxes running" — the
+/// Windows log poller must not mistake that for "this sandbox has stopped."
+pub(crate) fn running_names_for_poller(msb: &Path) -> Result<HashSet<String>> {
+    let result = invoke_standalone(msb, &commands::ls(), LOGS_TIMEOUT)?;
+    if result.exit_code != 0 {
+        return Err(RightsizeError::Backend(format!(
+            "msb ls --format json exited {}: {}",
+            result.exit_code,
+            result.stderr.trim()
+        )));
+    }
+    Ok(ls_json::running_names(&result.stdout))
 }
 
 /// Drains `stream` line-by-line into `tail`, keeping only the last [`TAIL_LINES`] —

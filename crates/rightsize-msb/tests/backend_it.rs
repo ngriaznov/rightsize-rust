@@ -60,6 +60,26 @@ fn unique_name(label: &str) -> String {
     format!("rz-{label}-{}", &format!("{nanos:x}")[..8])
 }
 
+/// Polls `condition` every 200ms until it returns true or `timeout` elapses, then
+/// returns whether it was ever observed true — never a fixed sleep-then-assert.
+/// Shared Windows CI runners have run a guest workload's in-guest `sleep 2` (and the
+/// log poller's own fetch of it) meaningfully slower than a fixed few-second budget
+/// assumes; a condition-poll with generous headroom absorbs that without weakening
+/// what's actually being proven (the line must still show up, and duplicate/early
+/// delivery is checked separately once this returns).
+async fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Attached-mode boot + Running-poll readiness: a plain `sleep`-based alpine sandbox
 /// must reach `Running` and be reported by `running_sandbox_names()`, and `stop`+
 /// `remove` must clean it up (no leftover `msb ls` entry afterward).
@@ -143,28 +163,16 @@ async fn exec_completes_with_closed_stdin_and_returns_the_real_exit_code() {
 /// delivered by the watchdog's authoritative flush — exactly once, never duplicated
 /// with whatever the live stream managed to deliver before the sandbox stopped.
 ///
-/// Windows fact (confirmed on a real `windows-2025` hosted runner, msb 0.6.3): the
-/// final unterminated line is never observed on either channel (`msb logs -f`'s live
-/// stream nor the watchdog's own `msb logs --tail` authoritative re-fetch after the
-/// sandbox is confirmed stopped) — `line-one` (newline-terminated) is delivered
-/// correctly, but `line-two-no-newline` never is, on both the live and replayed reads.
-/// This reads as an msb-on-Windows log-store gap for trailing unterminated output,
-/// distinct from and beyond the spike's recorded "attached-stdout isn't a log source
-/// on Windows" finding (this backend already sources exclusively from the logs
-/// channel, never the attached pipe, so that fact is already handled correctly here).
-/// Gated rather than fought: msb's Windows support is upstream beta, and this needs a
-/// live Windows box to debug further than what this CI lane's log output shows.
+/// Previously gated on Windows: `msb logs -f`'s live pipe never observed a trailing
+/// unterminated line there, and the POSIX watchdog's authoritative re-fetch used the
+/// same stuck-child channel to quiesce before replaying. `follow_logs` on Windows no
+/// longer goes anywhere near that channel — [`crate::watchdog::spawn_follow_polling`]
+/// polls plain `msb logs --tail`, which does surface a trailing unterminated line, so
+/// this contract case now holds on Windows too (mirroring the Kotlin backend's
+/// polling follower, which proved the same case passes there).
 #[tokio::test]
 async fn follow_logs_watchdog_replays_the_final_unterminated_line_exactly_once() {
     require_msb!();
-    if cfg!(windows) {
-        eprintln!(
-            "skipping: msb-on-Windows does not surface a trailing unterminated log line \
-             on either the live-follow or tail-replay channel (see this test's doc comment) \
-             — a beta-msb-on-Windows gap, not a rightsize-msb regression"
-        );
-        return;
-    }
     let backend = MsbCliBackend::new(provisioned_msb_path());
 
     // Sleep briefly first so `start()`'s Running-poll has a real chance to observe the
@@ -195,11 +203,31 @@ async fn follow_logs_watchdog_replays_the_final_unterminated_line_exactly_once()
         .await
         .expect("follow_logs must start");
 
-    // The workload exits almost immediately; give the watchdog time to notice the
-    // sandbox left Running and perform its one authoritative flush.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Poll for the final line rather than assume a fixed sleep is enough: on a
+    // shared Windows CI runner the in-guest `sleep 2` plus this backend's own
+    // ls/logs polling cadence can take meaningfully longer in wall-clock time than
+    // on a local dev machine (observed directly — a fixed 5s budget here left the
+    // workload's second line never yet visible in any `msb logs` fetch taken within
+    // that window). 30s is generous headroom, not a loosened assertion: a genuine
+    // regression (the line never delivered at all) still fails below.
+    let got_final_line = wait_until(
+        || {
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("line-two-no-newline"))
+        },
+        Duration::from_secs(30),
+    )
+    .await;
     follow.close();
 
+    assert!(
+        got_final_line,
+        "the final unterminated line was never delivered within the wait budget, got: {:?}",
+        received.lock().unwrap()
+    );
     let lines = received.lock().unwrap().clone();
     let occurrences = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
     assert_eq!(

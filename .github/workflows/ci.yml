@@ -124,8 +124,19 @@ jobs:
       # state ("UNIQUE constraint failed: seaql_migrations.version"), not this crate's
       # code. Serializing this job's test execution avoids the race; it does not mask
       # a rightsize-msb bug, since the same assertions still run, just one at a time.
-      - run: RIGHTSIZE_BACKEND=microsandbox cargo test -p rightsize-msb --features sandbox-it -- --test-threads=1
+      - run: RIGHTSIZE_BACKEND=microsandbox cargo test -p rightsize-msb --features sandbox-it -- --test-threads=1 2>&1 | tee /tmp/it-output.log
         shell: bash
+      # Same guard as msb-linux: never bank a cache a run observed corrupted, so the
+      # next run re-pulls clean instead of restoring the poisoned entry. `shell: bash`
+      # above (and here) matters on Windows runners, whose default shell is pwsh.
+      - name: Purge image cache if corruption was observed
+        if: always()
+        shell: bash
+        run: |
+          if grep -q "cache error at .*No such file" /tmp/it-output.log 2>/dev/null; then
+            echo "image-cache corruption detected — purging before save"
+            rm -rf ~/.microsandbox/cache
+          fi
       - uses: actions/cache/save@v4
         if: always()
         with:

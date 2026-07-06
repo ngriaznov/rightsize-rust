@@ -26,7 +26,7 @@
 //!    no-op.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -291,6 +291,150 @@ fn quiesce_reader_then_snapshot(
     }
     s.flushed = true;
     Some(s.delivered)
+}
+
+/// Windows-only follow path: no `msb logs -f` child at all. `msb logs -f` on Windows
+/// stays alive for the sandbox's whole run but never relays a single line to its
+/// stdout pipe while the sandbox is Running (confirmed against a real `windows-2025`
+/// hosted runner) — a pipe-reading follow child can never deliver a live line there,
+/// so this polls the non-follow `msb logs --tail` fetch on one worker thread instead
+/// and diffs each fetch against a monotonic `delivered` line count, mirroring the
+/// POSIX watchdog's own index-based tail replay ([`replay_lines`]) made continuous
+/// rather than one-shot.
+///
+/// Every `msb` invocation this poller makes runs to completion (spawn, wait, exit)
+/// strictly before the next one starts — the loop below has exactly one in-flight
+/// child at a time, on this one worker thread, never two `msb` processes racing each
+/// other from this poller. Real msb-Windows sqlite contention (the migration race
+/// under genuinely CONCURRENT `msb` invocations — a fact already documented in this
+/// crate's CI comments) is a different failure this poller must recognize rather
+/// than compound: it surfaces as a non-zero exit with empty stdout, and both
+/// [`crate::backend::running_names_for_poller`] and
+/// [`crate::backend::logs_snapshot_for_poller`] (unlike their watchdog-path
+/// siblings, which treat a missing/removed sandbox's harmless non-zero exit as
+/// fine) surface that as `Err` specifically so this poller never mistakes an
+/// msb-side failure for "the sandbox stopped" or "the log is genuinely empty."
+///
+/// Contract, identical to the POSIX path: ordered, at-most-once delivery, and nothing
+/// delivered after [`FollowHandle::close`]/`Drop`. The last line of each fetch is held
+/// back while the sandbox is still `Running`, because a fetch can land mid-write of
+/// that line — delivering it early would split one workload line into two separate
+/// consumer calls (the next fetch's index-diff would then skip its now-complete
+/// form). Once the sandbox has left `Running`, one final fetch delivers everything
+/// outstanding, including a trailing unterminated line — the same guarantee the
+/// POSIX watchdog's own authoritative replay gives, achieved here by simply not
+/// withholding the last line on that final pass.
+pub(crate) fn spawn_follow_polling(
+    msb: PathBuf,
+    name: String,
+    consumer: Box<dyn Fn(String) + Send + Sync>,
+) -> Result<FollowHandle> {
+    let close_requested = Arc::new(AtomicBool::new(false));
+    let worker_close = close_requested.clone();
+    let worker = std::thread::spawn(move || {
+        let mut delivered = 0usize;
+        loop {
+            if worker_close.load(Ordering::SeqCst) {
+                return; // An explicit close never triggers delivery of anything new.
+            }
+            // A failed `msb ls` (transient CLI/db hiccup, or the Windows sqlite race
+            // itself) must NOT be treated as "the sandbox stopped" — that would
+            // finalize delivery on a mere blip and could permanently stop polling
+            // before the workload ever produced its output. Only a successful ls
+            // response that genuinely omits this name counts as not-running;
+            // anything else (including the fetch below failing) retries.
+            let running = match crate::backend::running_names_for_poller(&msb) {
+                Ok(names) => names.contains(&name),
+                Err(_) => {
+                    std::thread::sleep(READINESS_POLL);
+                    continue;
+                }
+            };
+
+            if !running {
+                deliver_terminal_tail(&msb, &name, delivered, &consumer, &worker_close);
+                return;
+            }
+
+            let full = match crate::backend::logs_snapshot_for_poller(&msb, &name) {
+                Ok(text) => text,
+                Err(_) => {
+                    std::thread::sleep(READINESS_POLL);
+                    continue;
+                }
+            };
+            // replay_lines(&full, 0) is just "every line in `full`" — reused here
+            // rather than re-deriving the same trailing-newline-safe split.
+            let lines = replay_lines(&full, 0);
+            // Hold back a possibly-mid-write last line while still Running — see
+            // deliver_terminal_tail for the confirmed-stopped case, which withholds
+            // nothing.
+            let deliverable = delivered.max(lines.len().saturating_sub(1));
+            for line in lines.iter().take(deliverable).skip(delivered) {
+                if worker_close.load(Ordering::SeqCst) {
+                    return;
+                }
+                consumer(line.clone());
+            }
+            delivered = delivered.max(deliverable);
+            std::thread::sleep(READINESS_POLL);
+        }
+    });
+    Ok(FollowHandle::from_threads(close_requested, vec![worker]))
+}
+
+/// Upper bound on how long the terminal fetch keeps retrying an `msb logs`
+/// invocation that itself keeps FAILING (spawn error, timeout, or msb exiting
+/// non-zero — e.g. the Windows sqlite contention race) — never a "wait for content
+/// to settle" budget. Once `running_names_for_poller` has already confirmed the
+/// sandbox is no longer `Running` (the caller's own precondition for calling this
+/// at all), the log content cannot grow any further: nothing is still writing to
+/// it. So the very first *successful* fetch is authoritative and final — retrying
+/// past that point was solving a problem (content still settling) that cannot occur
+/// here.
+///
+/// Windows CI evidence (real `windows-2025` run, captured via temporary per-
+/// iteration instrumentation while diagnosing this contract case): the poller's own
+/// ls/logs cadence there runs close to [`READINESS_POLL`]'s 300ms interval, not
+/// seconds per invocation as first suspected — the actual persistent-failure cause
+/// was the guest workload's in-guest `sleep 2` (plus scheduling overhead under WHP)
+/// taking longer, in wall-clock terms, than the *test's* fixed few-second patience
+/// window before ever writing its final line, which every poll faithfully observed
+/// as "still Running, only line-one so far" right up until the test gave up and
+/// closed. That is a test-budget gap, not a poller defect — fixed in
+/// `backend_it.rs` by polling for the expected content with generous headroom
+/// instead of a fixed sleep.
+const TERMINAL_FETCH_FAILURE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Delivers everything outstanding once the sandbox is confirmed no longer
+/// `Running`: retries [`crate::backend::logs_snapshot_for_poller`] only while it
+/// keeps failing to invoke at all (bounded by [`TERMINAL_FETCH_FAILURE_BUDGET`]),
+/// and delivers from the very first successful fetch — withholding nothing, since
+/// the sandbox being confirmed stopped means there is no more mid-write risk. This
+/// is the one place a trailing unterminated line reaches the consumer.
+fn deliver_terminal_tail(
+    msb: &Path,
+    name: &str,
+    delivered: usize,
+    consumer: &(dyn Fn(String) + Send + Sync),
+    close_requested: &Arc<AtomicBool>,
+) {
+    let deadline = std::time::Instant::now() + TERMINAL_FETCH_FAILURE_BUDGET;
+    let full = loop {
+        if let Ok(fetched) = crate::backend::logs_snapshot_for_poller(msb, name) {
+            break fetched;
+        }
+        if close_requested.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+            break String::new();
+        }
+        std::thread::sleep(READINESS_POLL);
+    };
+    for line in replay_lines(&full, delivered) {
+        if close_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        consumer(line);
+    }
 }
 
 /// Drains `stream` line-by-line, calling `on_line` for each complete line and once
