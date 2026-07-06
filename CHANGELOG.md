@@ -7,8 +7,9 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Initial public groundwork — not yet released. Everything below exists on `main`
-but no `0.1.0` tag has been cut.
+## [0.1.0] - 2026-07-06
+
+Initial public release.
 
 ### Added
 
@@ -175,4 +176,5 @@ but no `0.1.0` tag has been cut.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/commits/main
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ngriaznov/rightsize-rust/releases/tag/v0.1.0

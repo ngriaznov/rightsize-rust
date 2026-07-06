@@ -2,14 +2,11 @@
 
 ## Install
 
-> **Status: early.** rightsize-rust is not yet on crates.io. Depend on it via a git
-> reference until a tagged release exists.
-
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = { git = "https://github.com/ngriaznov/rightsize-rust" }
-rightsize-modules = { git = "https://github.com/ngriaznov/rightsize-rust" }
+rightsize = "0.1.0"
+rightsize-modules = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

@@ -47,15 +47,11 @@ transport-routing risk.
 
 ## Quickstart
 
-> **Status: early.** Not yet on crates.io — the workspace metadata is
-> publish-ready, but until a tagged release exists, depend on it by path or git
-> reference.
-
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = { git = "https://github.com/ngriaznov/rightsize-rust" }
-rightsize-modules = { git = "https://github.com/ngriaznov/rightsize-rust" }
+rightsize = "0.1.0"
+rightsize-modules = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
