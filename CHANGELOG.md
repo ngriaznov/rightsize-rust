@@ -24,17 +24,19 @@ reaches its first tagged release.
   Windows CI runner was observed still in early config processing at the
   previous default budget. The budget is a deadline, not a wait — readiness
   returns the moment `/ping` answers.
-- **The backend retries a boot that lost msb's startup-migration race**
-  (`rightsize-msb`). Every msb invocation runs schema migrations against its
-  shared SQLite state database on startup, and two concurrent invocations can
-  race them — the loser exits with `database error: ... index ... already
-  exists` (or the `UNIQUE constraint failed: seaql_migrations.version` shape)
-  before doing any work. A boot is never inherently alone (the attached
-  `msb run` races the backend's own state polling), so this can fire even under
-  fully serialized tests. Transient by construction — the winner's migration
-  commits and later invocations find the schema in place — so a boot failing
-  with that signature is retried exactly once after a short delay; a second
-  loss propagates with both attempts' output.
+- **The backend retries a boot that hit msb's state-database error**
+  (`rightsize-msb`; `error: database error: ...`). Every msb invocation runs
+  schema migrations against its shared SQLite state database on startup, and
+  two concurrent invocations can race them — the loser exits before doing any
+  work, with whatever wording matches the statement it lost on (three shapes
+  observed: `index ... already exists`, `duplicate column name: ...`, and
+  `UNIQUE constraint failed: seaql_migrations.version`). A boot is never
+  inherently alone (the attached `msb run` races the backend's own state
+  polling), so this can fire even under fully serialized tests. The race is
+  transient by construction — the winner's migration commits and later
+  invocations find the schema in place — so a boot failing with msb's
+  state-database framing is retried exactly once after a short delay; a second
+  failure propagates with both attempts' output.
 
 ### Changed
 

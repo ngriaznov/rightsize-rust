@@ -254,36 +254,35 @@ fn is_image_cache_corruption(output: &str) -> bool {
     output.contains("cache error at") && output.contains("No such file")
 }
 
-/// True if `output` (a `msb run` child's combined stdout/stderr) names msb's
-/// startup-migration race: every msb invocation runs schema migrations against the
-/// shared SQLite state database on startup, and two concurrent invocations can race
-/// them — the loser dies before doing any work. Observed verbatim against the real
-/// msb 0.6.3 Windows binary:
+/// True if `output` (a `msb run` child's combined stdout/stderr) names a failure of
+/// msb's own shared SQLite state database. Every msb invocation runs schema
+/// migrations against it on startup, and two concurrent invocations can race them —
+/// the loser dies before doing any work, with whatever wording matches the migration
+/// statement it lost on. Observed verbatim against the real msb 0.6.3 Windows
+/// binary, one race, three shapes:
 ///
 /// ```text
 /// error: database error: Execution Error: error returned from database: (code: 1) index idx_manifest_layers_unique already exists
+/// error: database error: Execution Error: error returned from database: (code: 1) duplicate column name: kind
 /// ```
 ///
-/// and, from the same underlying race, the shape that first surfaced it:
-/// `UNIQUE constraint failed: seaql_migrations.version`.
+/// plus `UNIQUE constraint failed: seaql_migrations.version`. Chasing individual
+/// wordings is a losing game — the stable part is msb's own `error: database error:`
+/// framing, which is always msb's state database and never the workload's output.
 ///
 /// A boot is never inherently alone even under fully serialized tests: the attached
 /// `msb run` child races this backend's own `msb ls` readiness polling (and, on
-/// Windows, an active log poller). Transient by construction — the winner's migration
-/// completes and every later invocation finds the schema already in place.
-///
-/// Deliberately a substring match on the stable parts of msb's wording — the
-/// index/constraint being raced varies with which migration statement loses, and msb
-/// has no structured/typed error for this.
-fn is_msb_migration_race(output: &str) -> bool {
-    output.contains("database error")
-        && (output.contains("already exists") || output.contains("UNIQUE constraint failed"))
+/// Windows, an active log poller). The migration race is transient by construction;
+/// for a state-database failure that is NOT the race, the one-shot retry costs a
+/// moment and then propagates the failure with both attempts' output.
+fn is_msb_state_db_error(output: &str) -> bool {
+    output.contains("error: database error:")
 }
 
-/// Before retrying a boot that lost msb's startup-migration race — enough for the
-/// winning invocation's migration transaction to commit; the retry's own `msb run`
+/// Before retrying a boot that hit msb's state-database error — enough for a winning
+/// concurrent invocation's migration transaction to commit; the retry's own `msb run`
 /// startup dwarfs this either way.
-const MIGRATION_RACE_RETRY_DELAY: Duration = Duration::from_millis(500);
+const STATE_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Extracts every `rz-<8 hex>-<seq>`-shaped name appearing anywhere in `ls` output —
 /// used by the orphan reaper, which doesn't need the full tolerant JSON parse (any
@@ -552,7 +551,7 @@ impl SandboxBackend for MsbCliBackend {
 /// gets one chance to heal and retry before giving up.
 enum PreRunningFailure {
     CacheCorruption { output: String },
-    MigrationRace { output: String },
+    StateDbError { output: String },
     Other(RightsizeError),
 }
 
@@ -561,8 +560,9 @@ enum PreRunningFailure {
 /// live child for `start()` to keep around.
 ///
 /// Two classified transient failures are retried once each. A first attempt that
-/// lost msb's startup-migration race (see [`is_msb_migration_race`]) is retried
-/// after a short delay with no heal step — the race is transient by construction.
+/// hit msb's state-database error — usually the startup-migration race (see
+/// [`is_msb_state_db_error`]) — is retried after a short delay with no heal step;
+/// the race is transient by construction.
 /// On a first attempt that exits before `Running` with msb's image-cache-corruption
 /// signature (see [`is_image_cache_corruption`]), this heals the affected image's
 /// cache entry (see [`heal_image_cache`]) and retries the boot exactly once — the
@@ -576,20 +576,22 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
     match try_spawn_and_await_running(msb, spec) {
         Ok(child) => Ok(child),
         Err(PreRunningFailure::Other(e)) => Err(e),
-        Err(PreRunningFailure::MigrationRace { output }) => {
-            // Transient by construction (see is_msb_migration_race): the winning msb
-            // invocation's migration commits and a retried boot finds the schema in
-            // place. No heal step, one retry, second loss propagates — the same
-            // one-shot policy as the image-cache heal below.
-            std::thread::sleep(MIGRATION_RACE_RETRY_DELAY);
+        Err(PreRunningFailure::StateDbError { output }) => {
+            // Usually the startup-migration race, transient by construction (see
+            // is_msb_state_db_error): the winning msb invocation's migration commits
+            // and a retried boot finds the schema in place. No heal step, one retry,
+            // second failure propagates — the same one-shot policy as the image-cache
+            // heal below.
+            std::thread::sleep(STATE_DB_RETRY_DELAY);
             match try_spawn_and_await_running(msb, spec) {
                 Ok(child) => Ok(child),
-                Err(PreRunningFailure::MigrationRace {
+                Err(PreRunningFailure::StateDbError {
                     output: retry_output,
                 }) => Err(RightsizeError::Backend(format!(
-                    "msb run for sandbox {} lost msb's startup-migration race twice in a \
-                         row — expected at most a transient one-off from concurrent msb \
-                         invocations; something is hammering msb's state database on this \
+                    "msb run for sandbox {} hit msb's state-database error twice in a \
+                         row — the usual cause (concurrent msb invocations racing startup \
+                         migrations) is transient and one retry covers it, so this looks \
+                         like real state-database trouble on this \
                          host.\nfirst attempt:\n{output}\nafter retry:\n{retry_output}",
                     spec.name,
                 ))),
@@ -607,7 +609,7 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
             match try_spawn_and_await_running(msb, spec) {
                 Ok(child) => Ok(child),
                 Err(PreRunningFailure::Other(e)) => Err(e),
-                Err(PreRunningFailure::MigrationRace {
+                Err(PreRunningFailure::StateDbError {
                     output: retry_output,
                 }) => Err(RightsizeError::Backend(format!(
                     "msb run for sandbox {} exited before reaching Running:\n{retry_output}",
@@ -680,8 +682,8 @@ fn try_spawn_and_await_running(
                 .join("\n");
             return Err(if is_image_cache_corruption(&output) {
                 PreRunningFailure::CacheCorruption { output }
-            } else if is_msb_migration_race(&output) {
-                PreRunningFailure::MigrationRace { output }
+            } else if is_msb_state_db_error(&output) {
+                PreRunningFailure::StateDbError { output }
             } else if is_port_bind_conflict(&output) {
                 PreRunningFailure::Other(RightsizeError::PortBindConflict {
                     message: format!(
@@ -1073,37 +1075,50 @@ mod tests {
     }
 
     #[test]
-    fn is_msb_migration_race_matches_the_captured_msb_error_verbatim() {
-        // Captured verbatim from a real msb 0.6.3 Windows binary: the spawned
+    fn is_msb_state_db_error_matches_the_captured_race_shapes_verbatim() {
+        // Both captured verbatim from a real msb 0.6.3 Windows binary: the spawned
         // `msb run` lost the startup-migration race against a concurrent msb
-        // invocation (see this function's doc comment).
-        assert!(is_msb_migration_race(
+        // invocation — one race, different losing statements (see this function's
+        // doc comment).
+        assert!(is_msb_state_db_error(
             "error: database error: Execution Error: error returned from database: (code: 1) index idx_manifest_layers_unique already exists"
+        ));
+        assert!(is_msb_state_db_error(
+            "error: database error: Execution Error: error returned from database: (code: 1) duplicate column name: kind"
         ));
     }
 
     #[test]
-    fn is_msb_migration_race_matches_the_unique_constraint_shape() {
-        // The other observed loser's message: the migrations bookkeeping row itself,
-        // rather than a migration's DDL statement, loses the race.
-        assert!(is_msb_migration_race(
+    fn is_msb_state_db_error_matches_the_unique_constraint_shape() {
+        assert!(is_msb_state_db_error(
             "error: database error: Execution Error: error returned from database: UNIQUE constraint failed: seaql_migrations.version"
         ));
     }
 
     #[test]
-    fn is_msb_migration_race_negative_cases_do_not_match() {
-        assert!(!is_msb_migration_race(""));
-        assert!(!is_msb_migration_race(
+    fn is_msb_state_db_error_matches_any_state_db_failure_not_just_known_wordings() {
+        // The classifier keys on msb's own framing, not the SQLite message — chasing
+        // individual wordings is how the third race shape slipped through. A one-shot
+        // retry on a non-race database error is harmless: it costs a moment and then
+        // propagates with both attempts' output.
+        assert!(is_msb_state_db_error(
             "error: database error: disk I/O error"
         ));
-        // A name conflict ("already exists" without database-error framing) is the
-        // start-retry path's concern, not this classifier's.
-        assert!(!is_msb_migration_race(
+    }
+
+    #[test]
+    fn is_msb_state_db_error_negative_cases_do_not_match() {
+        assert!(!is_msb_state_db_error(""));
+        // A workload's stderr complaining about ITS database — no msb `error:` framing.
+        assert!(!is_msb_state_db_error(
+            "app: database error: connection refused"
+        ));
+        // A name conflict is the start-retry path's concern, not this classifier's.
+        assert!(!is_msb_state_db_error(
             "error: sandbox 'rz-abc-1' already exists"
         ));
         // The image-cache corruption signature belongs to its own classifier and heal.
-        assert!(!is_msb_migration_race(
+        assert!(!is_msb_state_db_error(
             "error: image error: cache error at /tmp/cache/layers/sha256_dead.tar.gz: No such file or directory (os error 2)"
         ));
     }
