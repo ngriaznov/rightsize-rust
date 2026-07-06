@@ -161,6 +161,11 @@ but no `0.1.0` tag has been cut.
   gone delivers the terminal tail exactly once — including a final line with no
   trailing newline. The contract case covering that final unterminated line
   runs on Windows again instead of being gated out there.
+- **`MySqlContainer` readiness gets a 120-second budget** (`rightsize-modules`).
+  MySQL's first boot initializes the datafiles and boots mysqld twice (a temp
+  server for init scripts, then the real one); the previous 60-second budget
+  held on fast hosts but a loaded Windows CI runner overruns it. The strategy
+  also honors `with_startup_timeout` now instead of silently ignoring it.
 - **Provisioner downloads over 10 MiB no longer fail** (`rightsize-msb`). ureq's
   `read_to_vec` defaults to a 10 MiB body cap, and both real release assets
   (`msb`, `libkrunfw`) are ~25 MiB — so any genuine download aborted with "the

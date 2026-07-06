@@ -69,11 +69,10 @@ impl MySqlContainer {
             // Anchored on the real server's line (see the module doc for the
             // captured log excerpt and why an unanchored "port: 3306" search
             // misfires on the temp-server boot).
-            .waiting_for(MySqlReadyForConnections);
-        // No with_memory_limit override: boots clean on msb's default ~450M microVM
-        // RAM well under 60s (see the module report for timed evidence) — unlike
-        // SpringCloudConfig's Paketo JVM image, MySQL 8.4's InnoDB default footprint
-        // fits the default, so no module-level memory floor is warranted here.
+            .waiting_for(MySqlReadyForConnections::default());
+        // No with_memory_limit override: unlike SpringCloudConfig's Paketo JVM
+        // image, MySQL 8.4's InnoDB default footprint fits msb's default ~450M
+        // microVM RAM, so no module-level memory floor is warranted here.
         Self {
             container,
             username,
@@ -131,7 +130,21 @@ const PORT_MARKER: &str = "port: 3306";
 /// Ready when a log line contains `mysqld: ready for connections` and, later on that
 /// same line, `port: 3306` immediately followed by end-of-line or a non-digit — never
 /// matching the X Plugin's `port: 33060` (whose digits merely start with `3306`).
-struct MySqlReadyForConnections;
+struct MySqlReadyForConnections {
+    timeout: Duration,
+}
+
+impl Default for MySqlReadyForConnections {
+    fn default() -> Self {
+        // First boot initializes the datafiles and boots mysqld twice (a throwaway
+        // temp server for init scripts, then the real one). On a fast host that
+        // finishes well under 60s, but a loaded Windows CI runner's first boot
+        // overruns it — 120s absorbs the slow case without masking a real hang.
+        Self {
+            timeout: Duration::from_secs(120),
+        }
+    }
+}
 
 impl MySqlReadyForConnections {
     fn line_signals_ready(line: &str) -> bool {
@@ -158,14 +171,15 @@ impl WaitStrategy for MySqlReadyForConnections {
     async fn wait_until_ready(&self, target: &dyn WaitTarget) -> Result<()> {
         rightsize::wait::poll_until_ready(
             target,
-            Duration::from_secs(60),
+            self.timeout,
             "mysqld ready for connections on port 3306",
             || Self::is_ready(target),
         )
         .await
     }
 
-    fn with_startup_timeout(self: Box<Self>, _timeout: Duration) -> Box<dyn WaitStrategy> {
+    fn with_startup_timeout(mut self: Box<Self>, timeout: Duration) -> Box<dyn WaitStrategy> {
+        self.timeout = timeout;
         self
     }
 }
