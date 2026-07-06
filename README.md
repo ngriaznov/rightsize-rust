@@ -306,10 +306,11 @@ PR — see [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## Documentation
 
-The [book](docs/) (source under `docs/`, built with `mdbook build` from the repo
-root) covers getting started, core concepts (containers & guards, wait strategies,
-networking, files & resources), backends, every module, and the internals — all its
-samples are machine-compile-verified.
+The book is at
+**[ngriaznov.github.io/rightsize-rust](https://ngriaznov.github.io/rightsize-rust/)**
+(source under `docs/`, built with mdBook). It covers getting started, core concepts
+(containers & guards, wait strategies, networking, files & resources), backends,
+every module, and the internals — all its samples are machine-compile-verified.
 
 ## License
 
