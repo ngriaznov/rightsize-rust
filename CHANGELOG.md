@@ -144,6 +144,23 @@ but no `0.1.0` tag has been cut.
 
 ### Fixed
 
+- **The backend self-heals msb's image-cache race** (`rightsize-msb`). Concurrent
+  pulls of images sharing base layers can corrupt msb's image cache — the losing
+  pull reads a layer tarball the winner's cleanup already deleted, and every
+  later boot of that image fails with `cache error at .../layers/<sha>.tar.gz:
+  No such file or directory`. A boot that fails with that signature now removes
+  the affected image from msb's cache (`msb image remove`, scoped to the one
+  reference) and retries the boot exactly once; any other failure, or a second
+  failure after the heal, propagates unchanged.
+- **`follow_logs` delivers workload output on Windows** (`rightsize-msb`). msb's
+  `logs -f` on Windows stays alive but never relays lines while the sandbox
+  runs, so followed output was silent until the sandbox stopped. On Windows the
+  follow channel is now a polling follower over `msb logs` snapshots: one worker
+  thread issues sequential msb invocations, treats a failed invocation as
+  no-signal (never as content, never as "stopped"), and once the sandbox is
+  gone delivers the terminal tail exactly once — including a final line with no
+  trailing newline. The contract case covering that final unterminated line
+  runs on Windows again instead of being gated out there.
 - **Provisioner downloads over 10 MiB no longer fail** (`rightsize-msb`). ureq's
   `read_to_vec` defaults to a 10 MiB body cap, and both real release assets
   (`msb`, `libkrunfw`) are ~25 MiB — so any genuine download aborted with "the
