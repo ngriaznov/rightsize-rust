@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "Tokio-async-native, RAII-guard integration-test containers — core API"
 repository.workspace = true
+readme.workspace = true
 keywords = ["testing", "containers", "integration-testing", "async"]
 categories = ["development-tools::testing", "asynchronous"]
 

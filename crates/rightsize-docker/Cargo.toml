@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "Hand-rolled unix-socket Docker backend for rightsize — the correctness oracle"
 repository.workspace = true
+readme.workspace = true
 keywords = ["testing", "containers", "docker"]
 categories = ["development-tools::testing", "asynchronous"]
 

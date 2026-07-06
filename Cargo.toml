@@ -8,6 +8,10 @@ rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["Mykyta Hriaznov"]
 repository = "https://github.com/ngriaznov/rightsize-rust"
+# Inherited by every crate: crates.io renders this as the crate's page. The path
+# resolves against the workspace root and cargo copies the file into each
+# published .crate archive.
+readme = "README.md"
 
 [workspace.dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "process", "macros"] }

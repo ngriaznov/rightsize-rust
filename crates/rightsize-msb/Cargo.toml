@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "microsandbox (msb) backend for rightsize — attached-mode microVM sandboxes"
 repository.workspace = true
+readme.workspace = true
 keywords = ["testing", "containers", "microvm", "microsandbox"]
 categories = ["development-tools::testing", "asynchronous"]
 

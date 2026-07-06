@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "Preconfigured rightsize containers — Redis, Memcached, ArangoDB, MongoDB, Redpanda, Kafka, SpringCloudConfig, PostgreSQL, MySQL, Apache Pinot, RabbitMQ, MariaDB, WireMock, ClickHouse, Keycloak, Neo4j, Floci, Apache Flink"
 repository.workspace = true
+readme.workspace = true
 keywords = ["testing", "containers", "integration-testing"]
 categories = ["development-tools::testing", "asynchronous"]
 
