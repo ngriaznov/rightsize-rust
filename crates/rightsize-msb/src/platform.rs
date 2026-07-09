@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn windows_asset_names_match_the_v0_6_3_checksums_sha256_shape() {
-        // Verified directly against `checksums.sha256` for microsandbox v0.6.3 — the
+        // Verified directly against `checksums.sha256` for microsandbox v0.6.6 — the
         // standalone (non-bundle) Windows asset names, which carry a `.exe`/`.dll`
         // suffix the macOS/Linux assets don't.
         assert_eq!(Platform::WindowsX64.msb_asset(), "msb-windows-x86_64.exe");

@@ -35,10 +35,10 @@ use rightsize::error::{Result, RightsizeError};
 /// The pinned microsandbox release this crate provisions. Bumping this is the only
 /// change needed to move the whole workspace to a newer msb — asset names, checksums,
 /// and the install-dir path are all derived from it.
-pub const MSB_VERSION: &str = "0.6.3";
+pub const MSB_VERSION: &str = "0.6.6";
 
 const DEFAULT_BASE: &str =
-    "https://github.com/superradcompany/microsandbox/releases/download/v0.6.3";
+    "https://github.com/superradcompany/microsandbox/releases/download/v0.6.6";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
