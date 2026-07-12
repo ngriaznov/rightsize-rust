@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] - 2026-07-12
+
 ### Added
 
 - **Orphan reaping** (`rightsize`, `rightsize-msb`, `rightsize-docker`): a run-record
@@ -327,7 +331,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ngriaznov/rightsize-rust/releases/tag/v0.1.0
