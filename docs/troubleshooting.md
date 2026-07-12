@@ -117,6 +117,31 @@ before any rightsize-rust-specific logic runs.
 docker save redpanda/redpanda:<tag> | msb load -t redpanda/redpanda:<tag>
 ```
 
+## "Sandboxes left behind after a crashed test run"
+
+**Cause:** normal lifecycle (`stop()`, `Drop`'s cleanup thread) only runs while the
+test *process* is alive. A `SIGKILL`, an OOM-kill, or a crashed CI step that tears
+down the process itself skips all of that — see [Orphan Reaping](./reaping.md) for
+the full design. Two layers cover it: a per-run watchdog reaps within seconds of the
+crash (default on), and an init-time sweep reaps a dead run's leftovers the next time
+any process resolves the same backend, even if the watchdog itself never fired.
+
+**Fix:** if a sandbox is still visible right after a crash, give the watchdog a few
+seconds, or just start a new process against the same `RIGHTSIZE_CACHE_DIR` and
+backend — its own init-time sweep reaps the leftover on its way up. If sandboxes
+accumulate persistently:
+
+- Check `RIGHTSIZE_REAPER` isn't set to `off` (or, if you only need the sweep and not
+  a spawned watchdog process, `sweep` is the lighter middle ground).
+- A **remote** docker daemon (not the common one-VM-per-run case) has a real gap: a
+  local watchdog cannot outlive the machine it runs on, so containers on a daemon that
+  outlives the caller wait for the next process to reap them at its own init-time
+  sweep — see [the docker-remote caveat](./reaping.md#the-docker-remote-caveat).
+- A crashed run's leftovers only get reaped by a process running the SAME backend
+  that created them (a docker process cannot remove msb sandboxes, and vice versa) —
+  if your workflow alternates backends across runs, the leftover waits for a process
+  on its own backend.
+
 ## "My wait strategy times out even though the service looks fine in the logs"
 
 **Cause:** a bare TCP-connect readiness check (or even the built-in read-probe) is

@@ -254,9 +254,38 @@ Violations fail fast with an actionable error.
 - **Two-tier cleanup, no async `Drop`.** The happy path is an explicit, awaited
   `guard.stop().await`. The fallback — a guard simply dropped, a test panicking
   mid-body — hands a small teardown descriptor to a dedicated background OS thread
-  that tears the container down with blocking I/O only, no Tokio required. A
-  run-id-scoped orphan reaper at backend startup is the backstop for the backstop,
-  cleaning up whatever a prior process's hard `SIGKILL` left behind.
+  that tears the container down with blocking I/O only, no Tokio required. Orphan
+  reaping (below) is the backstop for the backstop, cleaning up whatever a prior
+  process's hard `SIGKILL` left behind.
+- **Orphan reaping.** A run-record ledger under the rightsize cache dir, an
+  init-time sweep, and a per-run watchdog (default on) reap sandboxes a crashed
+  process (`SIGKILL`, OOM-kill, a killed CI step) left behind — liveness-aware, so
+  it's safe across concurrent runs, unlike a bare name-prefix scan. Controlled by
+  `RIGHTSIZE_REAPER=on|sweep|off`. See [Orphan Reaping](docs/reaping.md).
+- **Container reuse.** `.reuse(true)` combined with `RIGHTSIZE_REUSE=true`/`1`
+  marks a sandbox to survive process exit and be ADOPTED — not rebuilt — by a
+  later, spec-identical `start()`. Identity is a `sha256` over a canonical
+  serialization of the reuse-relevant spec, pinned as a cross-language test
+  vector so the same spec hashes identically here and in the Kotlin/Node ports.
+  See [Container Reuse](docs/reuse.md).
+- **Failure diagnostics.** `rightsize::diagnostics()` — and the automatic
+  `DiagnosticsGuard` hook, which prints on panic and stays silent otherwise —
+  renders every container this process has running, its state, ports, and last
+  50 log lines, in a report format pinned identically across the Kotlin/Node
+  ports. See [Failure Diagnostics](docs/diagnostics.md).
+- **Isolation requirement.** `.require_isolation(true)` refuses to start on a
+  backend that doesn't provide hardware isolation, instead of silently running
+  an untrusted workload wherever `RIGHTSIZE_BACKEND` happened to resolve. See
+  [Isolation Requirement](docs/isolation.md).
+- **Checkpoint / restore (docker only).** `guard.checkpoint()` commits a running
+  container's filesystem to an image; `Container::from_checkpoint(&cp)` restores
+  as many fresh containers from it as needed — boot once, seed once, restore per
+  test instead of re-seeding. See [Checkpoint / Restore](docs/checkpoints.md).
+- **Cross-language parity.** The `SandboxBackend` contract above — lifecycle,
+  networking, reaping, reuse, diagnostics, isolation, checkpoints — is verified
+  identically in the Kotlin and TypeScript ports of this library by each port's
+  own copy of the shared contract suite. See
+  [Cross-Language Parity](docs/parity.md).
 
 ## Configuration
 
@@ -266,6 +295,8 @@ Violations fail fast with an actionable error.
 | `MSB_PATH` | Use a pre-installed `msb` binary; skip downloads |
 | `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`, `%LOCALAPPDATA%\rightsize` on Windows) |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail instead of downloading (air-gapped CI) |
+| `RIGHTSIZE_REAPER` | `on` (default) / `sweep` / `off` — see [Orphan Reaping](docs/reaping.md) |
+| `RIGHTSIZE_REUSE` | `true` or `1` enables the reuse half of `.reuse(true)`'s double opt-in — see [Container Reuse](docs/reuse.md) |
 
 ## Examples
 

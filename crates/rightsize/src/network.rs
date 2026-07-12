@@ -118,6 +118,12 @@ impl Network {
         if let Some(backend) = backend {
             // Best-effort: a network that's already gone (or never created) isn't an error.
             let _ = backend.remove_network(&self.id).await;
+            // No `Network`-level reaper-cache-dir test seam exists (or is needed —
+            // no test asserts against the ledger through `Network::close`): every
+            // caller here is production or a test that doesn't touch the ledger,
+            // so this always uses the real, process-wide ledger. See
+            // `crate::reaper::ledger_for`'s doc for what `None` means here.
+            crate::reaper::after_remove_network(&self.id, None);
         }
         Ok(())
     }
@@ -195,6 +201,10 @@ mod tests {
             Ok(())
         }
         fn cleanup_sync(&self, _container_id: &str) {}
+        fn remove_by_name(&self, _name: &str) {}
+        fn watchdog_kill_command(&self) -> Vec<String> {
+            vec!["true".to_string()]
+        }
     }
 
     #[test]

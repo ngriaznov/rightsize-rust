@@ -85,6 +85,15 @@ pub struct ContainerSpec {
     pub run_id: String,
     /// An optional memory cap in megabytes.
     pub memory_limit_mb: Option<u64>,
+    /// Marks this container as a **reuse** sandbox — one meant to outlive this
+    /// process's own lifecycle rather than be torn down by it. Defaults to `false`;
+    /// no builder in this crate sets it yet (reuse itself is a later wave), but every
+    /// own-run cleanup path (the reaping ledger's `.sandboxes` file, the msb backend's
+    /// `started_names`, the docker backend's run-id label, this crate's `Drop`-path
+    /// cleanup) already knows to leave a `keep_alive` spec's container alone, so
+    /// wiring the field in now costs nothing and the reuse wave doesn't need to touch
+    /// any of those call sites again.
+    pub keep_alive: bool,
 }
 
 impl ContainerSpec {
@@ -106,6 +115,7 @@ impl ContainerSpec {
             aliases: Vec::new(),
             run_id: run_id.into(),
             memory_limit_mb: None,
+            keep_alive: false,
         }
     }
 }
@@ -127,6 +137,7 @@ mod tests {
         assert!(spec.network_id.is_none());
         assert!(spec.aliases.is_empty());
         assert_eq!(spec.memory_limit_mb, None);
+        assert!(!spec.keep_alive);
     }
 
     #[test]

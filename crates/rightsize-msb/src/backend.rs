@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rightsize::backend::{FollowHandle, NetworkLink, SandboxBackend, SandboxHandle};
+use rightsize::backend::{Capabilities, FollowHandle, NetworkLink, SandboxBackend, SandboxHandle};
 use rightsize::error::{Result, RightsizeError};
 use rightsize::model::{ContainerSpec, ExecResult};
 
@@ -97,24 +97,29 @@ impl MsbCliBackend {
         }
     }
 
-    /// Removes leftover `rz-*` sandboxes from crashed earlier runs — never this run's
-    /// own (matched by `RunId::value()`), so a live run's containers are untouched.
-    pub fn sweep_orphans(&self) -> Result<()> {
-        let out = self.invoke(&commands::ls(), LOGS_TIMEOUT)?;
-        let this_run_prefix = format!("rz-{}-", rightsize::RunId::value());
-        let mut seen = HashSet::new();
-        for name in orphan_candidate_names(&out.stdout) {
-            if name.starts_with(&this_run_prefix) || !seen.insert(name.clone()) {
-                continue;
-            }
-            self.silently_remove(&name);
-        }
-        Ok(())
+    fn silently_remove(&self, name: &str) {
+        self.invoke_retrying_on_state_db_error(&commands::stop(name), STOP_TIMEOUT);
+        self.invoke_retrying_on_state_db_error(&commands::rm(name), STOP_TIMEOUT);
     }
 
-    fn silently_remove(&self, name: &str) {
-        let _ = self.invoke(&commands::stop(name), STOP_TIMEOUT);
-        let _ = self.invoke(&commands::rm(name), STOP_TIMEOUT);
+    /// Runs `args` via [`Self::invoke`], retrying once after [`STATE_DB_RETRY_DELAY`]
+    /// if the combined stdout/stderr matches msb's state-database error signature
+    /// (see [`is_msb_state_db_error`]) — the same one-shot policy the boot path
+    /// (`spawn_and_await_running`) and the external watchdog script
+    /// ([`watchdog_kill_script`]) both apply to this exact stop/rm pair. This is the
+    /// third caller of that policy: [`Self::remove_by_name`] (the init-time sweep's
+    /// removal path, via [`Self::silently_remove`]) must retry a state-database hit
+    /// exactly like the other two, per spec's "msb specifics" requirement.
+    ///
+    /// Best-effort throughout, matching [`Self::silently_remove`]'s callers: neither
+    /// the first attempt's error nor the retry's is surfaced.
+    fn invoke_retrying_on_state_db_error(&self, args: &[String], timeout: Duration) {
+        if let Ok(result) = self.invoke(args, timeout) {
+            if is_msb_state_db_error(&result.stdout) || is_msb_state_db_error(&result.stderr) {
+                std::thread::sleep(STATE_DB_RETRY_DELAY);
+                let _ = self.invoke(args, timeout);
+            }
+        }
     }
 
     /// Spawns `msb <args>`, feeding it a closed/null stdin (`msb exec` blocks on
@@ -279,55 +284,22 @@ fn is_msb_state_db_error(output: &str) -> bool {
     output.contains("error: database error:")
 }
 
+/// True if `output` (a `msb run` child's combined stdout/stderr) names a sandbox-
+/// name collision — msb refuses to create a second sandbox under a name it already
+/// has one for. This backend's own cue, mirrored by
+/// `rightsize::reuse::is_name_conflict`'s string fallback (`"already exists"`), for
+/// the reuse start flow's "another process won the create race" retry path — a
+/// reuse container's name is deterministic (`rz-reuse-<hash>`, not the usual
+/// process-unique `rz-<run-id>-<seq>`), so two processes racing to adopt the same
+/// identity can genuinely both attempt `msb run` under the same name.
+fn is_name_conflict(output: &str) -> bool {
+    output.to_lowercase().contains("already exists")
+}
+
 /// Before retrying a boot that hit msb's state-database error — enough for a winning
 /// concurrent invocation's migration transaction to commit; the retry's own `msb run`
 /// startup dwarfs this either way.
 const STATE_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// Extracts every `rz-<8 hex>-<seq>`-shaped name appearing anywhere in `ls` output —
-/// used by the orphan reaper, which doesn't need the full tolerant JSON parse (any
-/// status counts, not just `Running`) but does need to recognize this backend's own
-/// naming convention among whatever else `msb ls` prints.
-fn orphan_candidate_names(ls_output: &str) -> Vec<String> {
-    let bytes = ls_output.as_bytes();
-    let mut names = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"rz-") {
-            let start = i;
-            let mut j = i + 3;
-            let mut hex_len = 0;
-            while j < bytes.len() && (bytes[j] as char).is_ascii_hexdigit() && hex_len < 8 {
-                j += 1;
-                hex_len += 1;
-            }
-            if hex_len == 8 && bytes.get(j) == Some(&b'-') {
-                let mut k = j + 1;
-                let mut digit_len = 0;
-                while k < bytes.len() && (bytes[k] as char).is_ascii_digit() {
-                    k += 1;
-                    digit_len += 1;
-                }
-                if digit_len > 0 {
-                    // Reject a longer identifier-like run continuing past the matched
-                    // shape (e.g. alphanumerics glued on) so this stays a whole-token
-                    // match, not a prefix of some other name.
-                    if k >= bytes.len() || !is_ident_continue(bytes[k]) {
-                        names.push(String::from_utf8_lossy(&bytes[start..k]).to_string());
-                        i = k;
-                        continue;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    names
-}
-
-fn is_ident_continue(b: u8) -> bool {
-    (b as char).is_ascii_alphanumeric() || b == b'-' || b == b'_'
-}
 
 #[async_trait::async_trait]
 impl SandboxBackend for MsbCliBackend {
@@ -339,6 +311,14 @@ impl SandboxBackend for MsbCliBackend {
         // Networks are emulated via /etc/hosts + exec-stream tunnels — a
         // microVM has no real bridge/subnet to join on this msb build.
         false
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            // Every microsandbox sandbox is its own microVM with its own kernel.
+            hardware_isolated: true,
+            checkpoint: false,
+        }
     }
 
     async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
@@ -353,6 +333,7 @@ impl SandboxBackend for MsbCliBackend {
     async fn start(&self, handle: &dyn SandboxHandle) -> Result<()> {
         let id = handle.id().to_string();
         let spec = handle.spec().clone();
+        let keep_alive = spec.keep_alive;
         let msb = self.msb.clone();
 
         // The actual boot work is blocking (child-process spawn + polling `msb ls`),
@@ -367,10 +348,15 @@ impl SandboxBackend for MsbCliBackend {
             state.attached = Some(attached);
         }
         drop(handles);
-        self.started_names
-            .lock()
-            .expect("started_names mutex poisoned")
-            .insert(id);
+        // A `keep_alive` (reuse) sandbox is never added to `started_names` — that set
+        // is exactly what `close()` sweeps on this run's own-process shutdown, and a
+        // reuse sandbox must survive that (see `ContainerSpec::keep_alive`'s doc).
+        if !keep_alive {
+            self.started_names
+                .lock()
+                .expect("started_names mutex poisoned")
+                .insert(id);
+        }
         Ok(())
     }
 
@@ -543,6 +529,85 @@ impl SandboxBackend for MsbCliBackend {
         let _ = invoke_standalone(&self.msb, &commands::stop(container_id), STOP_TIMEOUT);
         let _ = invoke_standalone(&self.msb, &commands::rm(container_id), STOP_TIMEOUT);
     }
+
+    fn remove_by_name(&self, name: &str) {
+        // Promoted straight from this backend's own former orphan-sweep helper — same
+        // stop-then-rm, best-effort shape `close()`/`cleanup_sync` already use.
+        self.silently_remove(name);
+    }
+
+    /// Checks `msb ls --format json`'s running set for `spec.name` — the reuse
+    /// adopt path's own query (`rightsize::reuse`). Registers a default (empty)
+    /// `HandleState` for the name if this is the first this backend instance has
+    /// heard of it (`Entry::or_default`, never overwriting a same-process entry
+    /// that already exists from this backend's own earlier `start()` of it), so
+    /// later calls on the returned handle (`stop`, `exec`, `logs`) find the same
+    /// `handles`-map lookup shape every other method already assumes.
+    async fn find_running(&self, spec: &ContainerSpec) -> Result<Option<Box<dyn SandboxHandle>>> {
+        let msb = self.msb.clone();
+        let running = tokio::task::spawn_blocking(move || running_names_via(&msb))
+            .await
+            .map_err(|e| RightsizeError::Backend(format!("find_running task panicked: {e}")))??;
+        if !running.contains(&spec.name) {
+            return Ok(None);
+        }
+        self.handles
+            .lock()
+            .expect("handles mutex poisoned")
+            .entry(spec.name.clone())
+            .or_default();
+        Ok(Some(Box::new(Handle { spec: spec.clone() })))
+    }
+
+    fn watchdog_kill_command(&self) -> Vec<String> {
+        let msb = self.msb.display().to_string();
+        watchdog_kill_script(&msb)
+    }
+
+    fn backend_binary_path(&self) -> Option<PathBuf> {
+        Some(self.msb.clone())
+    }
+}
+
+/// Builds the external, standalone-process kill command the reaping watchdog uses to
+/// remove an msb sandbox by name after this library process has already exited (see
+/// `SandboxBackend::watchdog_kill_command`'s doc). Two invocations are needed (`stop`
+/// then `rm` — msb has no single "kill" verb), each retried once on msb's own
+/// state-database error signature (the same transient race
+/// [`is_msb_state_db_error`] classifies during a normal boot) — so both are wrapped
+/// in one `sh -c`/PowerShell script rather than expressed as a literal argv prefix,
+/// keeping the watchdog's own generic script (see `rightsize::reaper::watchdog`)
+/// backend-agnostic: it always just runs ONE external command per sandbox name.
+#[cfg(unix)]
+fn watchdog_kill_script(msb: &str) -> Vec<String> {
+    let msb_q = shell_single_quote(msb);
+    let script = format!(
+        "try() {{ out=$(\"$@\" 2>&1); case \"$out\" in *'error: database error:'*) sleep 0.5; \"$@\" >/dev/null 2>&1 ;; esac; }}; try {msb_q} stop \"$1\"; try {msb_q} rm \"$1\""
+    );
+    vec!["sh".to_string(), "-c".to_string(), script, "sh".to_string()]
+}
+
+#[cfg(windows)]
+fn watchdog_kill_script(msb: &str) -> Vec<String> {
+    let script = format!(
+        "$m = '{msb}'; function Try-Cmd($a) {{ $o = & $m $a $args[0] 2>&1 | Out-String; if ($o -match 'error: database error:') {{ Start-Sleep -Milliseconds 500; & $m $a $args[0] | Out-Null }} }}; Try-Cmd 'stop'; Try-Cmd 'rm'",
+        msb = msb.replace('\'', "''")
+    );
+    vec![
+        "powershell".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        script,
+    ]
+}
+
+/// Single-quotes `s` for embedding inside a POSIX `sh -c '...'` script — msb's own
+/// install path is fully within this process's control (never untrusted input), but
+/// quoting it defensively costs nothing and keeps a path containing spaces working.
+#[cfg(unix)]
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// A single `msb run` attempt's outcome when the child exits before reaching
@@ -688,6 +753,15 @@ fn try_spawn_and_await_running(
                 PreRunningFailure::Other(RightsizeError::PortBindConflict {
                     message: format!(
                         "msb run for sandbox {} could not bind a host port: {output}",
+                        spec.name
+                    ),
+                    source: None,
+                })
+            } else if is_name_conflict(&output) {
+                PreRunningFailure::Other(RightsizeError::NameConflict {
+                    message: format!(
+                        "msb run for sandbox {} could not start — a sandbox with this name \
+                         already exists: {output}",
                         spec.name
                     ),
                     source: None,
@@ -1035,6 +1109,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capabilities_report_hardware_isolation_and_no_checkpoint_support() {
+        let backend = MsbCliBackend::new(PathBuf::from("/opt/msb/bin/msb"));
+        let caps = backend.capabilities();
+        assert!(
+            caps.hardware_isolated,
+            "each msb sandbox is its own microVM"
+        );
+        assert!(!caps.checkpoint, "not supported yet");
+    }
+
+    #[test]
     fn is_port_bind_conflict_matches_known_phrasings() {
         assert!(is_port_bind_conflict(
             "Error: address already in use (os error 48)"
@@ -1124,6 +1209,23 @@ mod tests {
     }
 
     #[test]
+    fn is_name_conflict_matches_a_sandbox_already_exists_message() {
+        assert!(is_name_conflict(
+            "error: sandbox 'rz-reuse-abc123def456' already exists"
+        ));
+        assert!(is_name_conflict("Sandbox already exists"));
+    }
+
+    #[test]
+    fn is_name_conflict_negative_cases_do_not_match() {
+        assert!(!is_name_conflict(""));
+        assert!(!is_name_conflict("connection refused"));
+        assert!(!is_name_conflict(
+            "error: database error: Execution Error: disk I/O error"
+        ));
+    }
+
+    #[test]
     fn is_image_cache_corruption_negative_cases_do_not_match() {
         assert!(!is_image_cache_corruption("panic: index out of bounds"));
         assert!(!is_image_cache_corruption(""));
@@ -1140,37 +1242,6 @@ mod tests {
         assert!(!is_image_cache_corruption(
             "error: cache error at /tmp/x/layers/sha256_abc.tar.gz: Permission denied (os error 13)"
         ));
-    }
-
-    #[test]
-    fn orphan_candidate_names_extracts_rz_shaped_tokens_only() {
-        let out = "rz-deadbeef-0  alpine:3.19  Running\nrz-cafebabe-12 redis:8.6-alpine Stopped\nnotarealname\n";
-        let names = orphan_candidate_names(out);
-        assert_eq!(
-            names,
-            vec!["rz-deadbeef-0".to_string(), "rz-cafebabe-12".to_string()]
-        );
-    }
-
-    #[test]
-    fn orphan_candidate_names_ignores_non_matching_prefixes() {
-        assert!(orphan_candidate_names("rz-short-0").is_empty());
-        assert!(orphan_candidate_names("rz-deadbeefzz-0").is_empty());
-        assert!(orphan_candidate_names("rz-deadbeef-").is_empty());
-    }
-
-    #[test]
-    fn sweep_orphans_filters_out_this_runs_own_prefix() {
-        let this_run = format!("rz-{}-3", rightsize::RunId::value());
-        let other_run = "rz-00000000-1".to_string();
-        let out = format!("{this_run}\n{other_run}\n");
-        let candidates = orphan_candidate_names(&out);
-        let this_run_prefix = format!("rz-{}-", rightsize::RunId::value());
-        let survivors: Vec<&String> = candidates
-            .iter()
-            .filter(|n| !n.starts_with(&this_run_prefix))
-            .collect();
-        assert_eq!(survivors, vec![&other_run]);
     }
 
     #[test]
@@ -1227,5 +1298,159 @@ mod tests {
         }];
         let err = require_aliases_are_valid(&links).unwrap_err();
         assert!(err.to_string().contains("bad'alias"), "{err}");
+    }
+
+    #[test]
+    fn backend_binary_path_returns_the_provisioned_msb_path() {
+        let backend = MsbCliBackend::new(PathBuf::from("/opt/msb/bin/msb"));
+        assert_eq!(
+            backend.backend_binary_path(),
+            Some(PathBuf::from("/opt/msb/bin/msb"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kill_command_wraps_stop_then_rm_with_a_retry_on_state_db_error() {
+        let backend = MsbCliBackend::new(PathBuf::from("/opt/msb/bin/msb"));
+        let cmd = backend.watchdog_kill_command();
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        let script = &cmd[2];
+        assert!(script.contains("/opt/msb/bin/msb"), "{script}");
+        assert!(script.contains("stop"), "{script}");
+        assert!(script.contains("rm"), "{script}");
+        assert!(script.contains("error: database error:"), "{script}");
+        assert_eq!(cmd[3], "sh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_single_quote_escapes_an_embedded_single_quote() {
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+    }
+
+    /// Writes a stub `msb` replacement to `dir` that logs one call per invocation to
+    /// the state file passed as its SECOND argument (`$2`) — matching the shape of
+    /// every real argv this backend builds (`["stop", name]`, `["rm", name]`: the
+    /// name/state-file is always the last/second element). `$2` holds the prior call
+    /// count on entry, so the count on disk after N invocations is N. When
+    /// `fail_first_call`, the first invocation additionally prints msb's own
+    /// state-database error framing to stderr and exits non-zero (every later
+    /// invocation succeeds), letting a test assert exactly how many times
+    /// [`MsbCliBackend::invoke_retrying_on_state_db_error`] actually re-ran it.
+    #[cfg(unix)]
+    fn write_state_db_stub_script(dir: &Path, fail_first_call: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb.sh");
+        let body = if fail_first_call {
+            "#!/bin/sh\n\
+             n=$(cat \"$2\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$2\"\n\
+             if [ \"$n\" = \"0\" ]; then\n\
+             echo 'error: database error: Execution Error: index idx already exists' 1>&2\n\
+             exit 1\n\
+             fi\n\
+             exit 0\n"
+        } else {
+            "#!/bin/sh\n\
+             n=$(cat \"$2\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$2\"\n\
+             exit 0\n"
+        };
+        std::fs::write(&script, body).expect("write stub msb script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod stub msb script");
+        script
+    }
+
+    #[cfg(unix)]
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rz-msb-backend-test-{label}-{}-{nanos:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_retrying_on_state_db_error_retries_exactly_once_on_a_db_error() {
+        let dir = unique_test_dir("db-error");
+        let script = write_state_db_stub_script(&dir, true);
+        let state_file = dir.join("calls");
+        let backend = MsbCliBackend::new(script);
+
+        backend.invoke_retrying_on_state_db_error(
+            &["stop".to_string(), state_file.display().to_string()],
+            Duration::from_secs(5),
+        );
+
+        let calls = std::fs::read_to_string(&state_file).expect("stub must have run");
+        assert_eq!(
+            calls.trim(),
+            "2",
+            "a state-database error must be retried exactly once, matching the boot \
+             path's and the watchdog script's own one-shot policy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_retrying_on_state_db_error_does_not_retry_on_a_clean_success() {
+        let dir = unique_test_dir("clean-success");
+        let script = write_state_db_stub_script(&dir, false);
+        let state_file = dir.join("calls");
+        let backend = MsbCliBackend::new(script);
+
+        backend.invoke_retrying_on_state_db_error(
+            &["stop".to_string(), state_file.display().to_string()],
+            Duration::from_secs(5),
+        );
+
+        let calls = std::fs::read_to_string(&state_file).expect("stub must have run");
+        assert_eq!(calls.trim(), "1", "a clean run must not be retried");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silently_remove_retries_the_stop_and_the_rm_independently_on_state_db_errors() {
+        // `remove_by_name` -> `silently_remove` is the sweep's removal path (see
+        // `SandboxBackend::remove_by_name`'s callers) — this is the finding this test
+        // guards: that path must apply the same retry policy as the boot path and the
+        // watchdog script, not a bare best-effort call.
+        let dir = unique_test_dir("silently-remove");
+        let script = write_state_db_stub_script(&dir, true);
+        let backend = MsbCliBackend::new(script);
+
+        // `commands::stop`/`commands::rm` both build `["stop"|"rm", name]` — the
+        // stub's `$2` convention matches that shape directly, so passing the state
+        // file's own path as the sandbox NAME makes `silently_remove` drive the same
+        // stub the two tests above drive directly.
+        let state_file = dir.join("calls");
+        backend.silently_remove(&state_file.display().to_string());
+
+        let calls = std::fs::read_to_string(&state_file).expect("stub must have run");
+        // stop: fails (state-db error) then retries and succeeds -> 2 calls.
+        // rm: first call on THIS invocation of the stub is now a fresh process each
+        // time, so it again sees `n == 0` on disk only for the very first call ever;
+        // subsequent calls (the stop retry, and both rm calls) see a non-zero prior
+        // count and succeed immediately. Total: stop attempt + stop retry + rm
+        // attempt = 3.
+        assert_eq!(
+            calls.trim(),
+            "3",
+            "silently_remove must retry a state-db error on the stop call, not skip \
+             straight to rm without retrying"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

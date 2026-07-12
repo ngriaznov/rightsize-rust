@@ -17,6 +17,29 @@ use std::sync::atomic::AtomicBool;
 use crate::error::Result;
 use crate::model::{ContainerSpec, ExecResult};
 
+/// Capability flags a backend exposes about its own runtime — a small, growable
+/// struct rather than a single boolean (mirroring the existing
+/// [`SandboxBackend::supports_native_networks`] precedent, but deliberately NOT
+/// folded into it — that flag stays exactly as it is) so a later wave can add a
+/// field without another SPI break. This wave adds two:
+///
+/// - `hardware_isolated`: `true` when each sandbox this backend creates gets its own
+///   kernel (a microVM, e.g. microsandbox) rather than sharing the host's (e.g.
+///   Docker, whose containers are namespaces/cgroups on one shared kernel). Consulted
+///   by [`SandboxBackend::capabilities`]'s caller in `Container::start()` for
+///   `.require_isolation(true)`.
+/// - `checkpoint`: whether this backend supports checkpoint/restore of a running
+///   sandbox. Not consulted by anything yet — reserved so the next wave (warm
+///   restore) doesn't need another trait-level change to land it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// True for a backend whose sandboxes each run under their own kernel.
+    pub hardware_isolated: bool,
+    /// True for a backend that supports checkpoint/restore. Unused before the
+    /// checkpoint-restore wave.
+    pub checkpoint: bool,
+}
+
 /// A tunnel/alias route: inside the consumer container, `alias:guest_port` must reach
 /// `127.0.0.1:target_host_port` on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +73,13 @@ pub trait SandboxBackend: Send + Sync {
     /// True when the runtime has real container networks; false means network links are
     /// emulated (see [`SandboxBackend::install_network_links`]).
     fn supports_native_networks(&self) -> bool;
+    /// This backend's capability flags (see [`Capabilities`]). Default: neither
+    /// hardware-isolated nor checkpoint-capable — the conservative answer for a test
+    /// double or any backend that hasn't opted into either; both real backends (msb,
+    /// docker) override this with their real values.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
     /// Creates (but does not start) a container from `spec`. `spec.ports` are already
     /// chosen — this call binds them, it never allocates.
     async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>>;
@@ -105,6 +135,85 @@ pub trait SandboxBackend: Send + Sync {
     /// with no async runtime in context. Called only from that thread, never from async
     /// code.
     fn cleanup_sync(&self, container_id: &str);
+
+    /// Best-effort removal of a sandbox identified by NAME rather than the
+    /// backend-native id a [`SandboxHandle`] carries — the shape the reaping ledger
+    /// needs, since it persists names (`ContainerSpec::name`), never ids (see
+    /// `crate::reaper`). "Not found" is expected and must be silently ignored —
+    /// sweeps are idempotent and may race another process's sweep of the same
+    /// leftover.
+    ///
+    /// SYNCHRONOUS and blocking-std-I/O-only, exactly like [`Self::cleanup_sync`]:
+    /// the init-time sweep runs from `crate::backends::active()`'s resolution path,
+    /// which must work with no Tokio runtime guaranteed to be in context (see that
+    /// function's own doc) — an `async fn` here would have nowhere safe to `.await`
+    /// from that call site.
+    fn remove_by_name(&self, name: &str);
+
+    /// The external, backend-CLI-only command (program + fixed args, in argv order)
+    /// the reaping watchdog uses to best-effort remove a sandbox by name AFTER this
+    /// library process has already exited — invoked by a detached script as
+    /// `<word>... <sandbox-name>` (the name is appended as the final argument at call
+    /// time). Must be self-sufficient: the watchdog is a standalone process with no
+    /// access to anything living only inside this process (no in-memory client, no
+    /// open socket this process owned) — see `crate::reaper::watchdog`.
+    fn watchdog_kill_command(&self) -> Vec<String>;
+
+    /// Same shape as [`Self::watchdog_kill_command`], for removing a network by id.
+    /// Default empty — "nothing to do" — for backends with no real network resource
+    /// to remove externally (e.g. microsandbox, whose networking is emulated and
+    /// creates nothing at the backend level).
+    fn watchdog_network_kill_command(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The absolute path to this backend's own provisioned/installed binary, when it
+    /// has one — recorded in the reaping ledger's run record (`msbPath` in the
+    /// cross-language JSON schema) so a same-language sweep or diagnostic can
+    /// identify exactly which toolchain a dead run used. Default `None` for backends
+    /// with no such on-disk binary (docker, which talks to a daemon socket).
+    fn backend_binary_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Best-effort check for whether a sandbox named `spec.name` is already
+    /// running — the reuse adopt path's own query (`crate::reuse`), distinct from
+    /// [`Self::remove_by_name`]'s "make it gone" contract: this one answers "is it
+    /// there right now, and if so, hand me a fresh [`SandboxHandle`] for it."
+    /// Constructs the handle around `spec` (cloned), never around whatever this
+    /// backend instance may or may not already have cached for that name — the
+    /// whole point of reuse is adopting a sandbox a DIFFERENT process (or an
+    /// earlier `Container` in this one) created, so the handle must not depend on
+    /// in-process bookkeeping this call may know nothing about.
+    ///
+    /// `Ok(None)` for "not running" (including "no such sandbox at all") and for
+    /// any backend query failure that isn't worth failing the whole adopt attempt
+    /// over — the reuse start flow treats both identically: fall back to a fresh
+    /// create. Default `Ok(None)` — "nothing to adopt" — is a safe fallback for any
+    /// backend (real or test double) that hasn't implemented real support; both
+    /// real backends (msb, docker) override this with a real query.
+    async fn find_running(&self, _spec: &ContainerSpec) -> Result<Option<Box<dyn SandboxHandle>>> {
+        Ok(None)
+    }
+
+    /// Commits `handle`'s current filesystem state as a new image tagged
+    /// `image_ref` — the checkpoint feature's own backend primitive
+    /// (`ContainerGuard::checkpoint`, `crate::checkpoint`). `handle` must currently
+    /// be running.
+    ///
+    /// Gated by [`Capabilities::checkpoint`] at the CALLER (`ContainerGuard::checkpoint`
+    /// checks `capabilities().checkpoint` before ever reaching this method) — this
+    /// default implementation is the defensive fallback for a backend that hasn't
+    /// opted in (or a test double): it always errors with
+    /// [`crate::error::RightsizeError::CheckpointUnsupported`], never called in
+    /// practice because of the caller-side gate, but correct on its own if it ever
+    /// were. The docker backend overrides this with a real image-commit call; the
+    /// microsandbox backend has no commit primitive and relies on this default.
+    async fn commit_to_image(&self, _handle: &dyn SandboxHandle, _image_ref: &str) -> Result<()> {
+        Err(crate::error::RightsizeError::CheckpointUnsupported {
+            backend: self.name().to_string(),
+        })
+    }
 }
 
 /// A discoverable factory for a [`SandboxBackend`]. Each backend crate ships one (e.g.

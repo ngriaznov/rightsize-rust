@@ -124,7 +124,17 @@ pub(crate) fn active() -> Arc<dyn SandboxBackend> {
             let requested = std::env::var("RIGHTSIZE_BACKEND").ok();
             let backend =
                 resolve(&providers, requested.as_deref()).unwrap_or_else(|e| panic!("{e}"));
-            Arc::from(backend)
+            let backend: Arc<dyn SandboxBackend> = Arc::from(backend);
+            // The orphan-reaping init-time sweep: this `OnceLock::get_or_init` closure
+            // already runs exactly once per process, which is the "runs exactly once
+            // per process" guarantee the sweep needs — no extra `Once` required (the
+            // same precedent the former msb-only sweep relied on inside its own
+            // `BackendProvider::create`; this ledger-based sweep replaces that and
+            // covers every backend, not just msb). Best-effort: `crate::reaper::sweep`
+            // never fails loudly — a sweep problem must not prevent handing back a
+            // usable backend.
+            crate::reaper::sweep(&backend);
+            backend
         })
         .clone()
 }

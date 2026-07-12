@@ -1,4 +1,4 @@
-//! The shared backend contract suite — every `SandboxBackend` must satisfy these nine
+//! The shared backend contract suite — every `SandboxBackend` must satisfy these eleven
 //! behaviors identically. Parameterized by `RIGHTSIZE_BACKEND` so the same test bodies
 //! run against whichever backend is active.
 //!
@@ -11,7 +11,7 @@
 //! RIGHTSIZE_BACKEND=microsandbox cargo test -p rightsize-modules --features sandbox-it --test contract
 //! ```
 //!
-//! The nine contract behaviors:
+//! The eleven contract behaviors:
 //!
 //! - Container publishes TCP port to host loopback: [`container_publishes_tcp_port_to_host_loopback`]
 //! - Env vars are visible to the workload: [`env_vars_are_visible_to_the_workload`]
@@ -22,6 +22,36 @@
 //! - withCopyFileToContainer default read-only mount rejects an in-guest write: [`default_read_only_mount_rejects_an_in_guest_write`]
 //! - followOutput streams lines in order and close halts delivery: [`follow_output_streams_lines_in_order_and_close_halts_delivery`]
 //! - followOutput delivers a final unterminated line after the workload exits: [`follow_output_delivers_a_final_unterminated_line_after_the_workload_exits_exactly_once`]
+//! - Starting a container writes the reaping run record: [`starting_a_container_writes_the_reaping_run_record`]
+//! - A fabricated dead run's sandbox is reaped by a fresh process's sweep, provably
+//!   gone at the backend level: [`sweep_reaps_a_fabricated_dead_run_at_the_backend_level`]
+//!
+//! Plus four container-reuse behaviors (`Container::reuse`), each run in a spawned
+//! child process so its `RIGHTSIZE_REUSE`/`RIGHTSIZE_CACHE_DIR` env is deterministic
+//! and never races this binary's other parallel tests — no `RIGHTSIZE_REUSE` needs
+//! to be set for the `cargo test` invocation itself, each scenario sets its own:
+//!
+//! - Double opt-in gating: env-disabled falls through to an ordinary container: [`reuse_double_opt_in_gating_env_disabled_runs_as_an_ordinary_ephemeral_container`]
+//! - The pinned cross-language identity hash vector produces the contract sandbox name: [`reuse_pinned_cross_language_hash_vector_produces_the_contract_sandbox_name`]
+//! - Adopt: a second equivalent container reuses the first one's live sandbox and mapped port: [`reuse_adopt_reuses_the_same_sandbox_and_mapped_port_across_two_starts`]
+//! - Stop semantics: the sandbox is left running and never ledgered: [`reuse_stop_semantics_leaves_the_sandbox_running_and_never_ledgers_it`]
+//!
+//! Plus three failure-diagnostics / isolation-requirement behaviors:
+//!
+//! - Diagnostics report format: a live container's report section renders in the
+//!   pinned cross-language shape: [`diagnostics_report_reflects_a_live_container_in_the_pinned_cross_language_format`]
+//! - Capabilities: each backend reports its pinned `hardware_isolated`/`checkpoint`
+//!   values: [`capabilities_report_the_pinned_per_backend_values`]
+//! - requireIsolation gating: refuses to start on a non-isolated backend, starts
+//!   normally on a hardware-isolated one: [`require_isolation_gates_start_per_backend_hardware_isolation`]
+//!
+//! Plus two checkpoint/restore behaviors:
+//!
+//! - Gating: identical typed-error refusal on a non-checkpoint-capable backend,
+//!   success with a well-formed image ref on a capable one:
+//!   [`checkpoint_gating_matches_the_capability_per_backend`]
+//! - Restore (docker-only): a marker file written after boot survives
+//!   checkpoint -> stop -> restore: [`checkpoint_restore_round_trips_a_marker_file_written_after_boot`]
 //!
 //! `read_only_mount_enforced` is a per-backend override: true on docker (enforced),
 //! false on msb (advisory only on 0.6.2).
@@ -31,10 +61,16 @@
 #[allow(dead_code)]
 mod support;
 
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rightsize::backend::{BackendProvider, SandboxBackend};
+use rightsize::model::{ContainerSpec, PortBinding};
 use rightsize::{Container, MountableFile, Wait};
+use rightsize_docker::DockerBackendProvider;
+use rightsize_msb::MsbBackendProvider;
 
 macro_rules! require_backend {
     () => {
@@ -180,6 +216,35 @@ async fn stop_terminates_and_frees_the_container() {
         std::net::TcpStream::connect(("127.0.0.1", host_port)).is_err(),
         "port must no longer be reachable after stop() — container/sandbox must be torn down"
     );
+}
+
+/// The reaping ledger's run record ([`docs/reaping.md`](../../../docs/reaping.md))
+/// exists once any container has started in this process, naming this process's real
+/// pid — the cross-language contract both backends satisfy identically (the record's
+/// `backend` field is what lets the init-time sweep tell an msb run's leftovers apart
+/// from a docker run's; see `crate::reaper::sweep` in the core crate).
+#[tokio::test]
+async fn starting_a_container_writes_the_reaping_run_record() {
+    require_backend!();
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "120"])
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let guard = c.start().await.expect("container must start");
+
+    let record_path = rightsize::cache_dir::dir()
+        .join("runs")
+        .join(format!("{}.json", rightsize::RunId::value()));
+    let raw = std::fs::read_to_string(&record_path)
+        .unwrap_or_else(|e| panic!("run record must exist at {record_path:?}: {e}"));
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("run record must be valid JSON: {e}\n{raw}"));
+    assert_eq!(
+        parsed.get("pid").and_then(serde_json::Value::as_u64),
+        Some(u64::from(std::process::id())),
+        "run record must name this process's own pid: {raw}"
+    );
+
+    guard.stop().await.unwrap();
 }
 
 /// `with_copy_file_to_container` round-trips a bundled resource and a host path into
@@ -410,4 +475,923 @@ async fn follow_output_delivers_a_final_unterminated_line_after_the_workload_exi
 
     follow.close();
     guard.stop().await.unwrap();
+}
+
+/// Generous per the addendum's "robust on slow runners" requirement (same ceiling
+/// `crates/rightsize-msb/tests/reaper_it.rs` uses for its own msb-only sweep test).
+const SWEEP_REAP_CEILING: Duration = Duration::from_secs(60);
+const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Constructs a raw backend instance directly via its `BackendProvider`, bypassing
+/// `rightsize::backends::active()` entirely — the same "hand-register a real
+/// sandbox as though a different (dead) process created it" shape
+/// `crates/rightsize-msb/tests/reaper_it.rs`'s sweep test uses, generalized across
+/// both backends so this test can run through the shared contract suite.
+fn raw_backend_for(name: &str) -> Box<dyn SandboxBackend> {
+    if name == "docker" {
+        DockerBackendProvider
+            .create()
+            .expect("docker backend must construct")
+    } else {
+        MsbBackendProvider.create().expect(
+            "msb backend must construct — provisioning must already have \
+                     happened via an earlier test in this binary",
+        )
+    }
+}
+
+/// Sweep behavior, run through the shared contract suite so BOTH backends get
+/// equivalent coverage (the addendum's "common trap" note: msb's own coverage in
+/// `reaper_it.rs` only proves the ledger's bookkeeping is cleaned up, never docker's
+/// real sweep path against a real daemon). A fabricated dead run record pointing at
+/// a real, running sandbox is reaped by a FRESH process's init-time sweep — proven
+/// gone at the BACKEND level (the port it was serving on stops accepting
+/// connections), not just that the ledger's own files were deleted.
+#[tokio::test]
+async fn sweep_reaps_a_fabricated_dead_run_at_the_backend_level() {
+    require_backend!();
+
+    let backend_name = rightsize::backends::active_name();
+    let raw_backend = raw_backend_for(&backend_name);
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "rz-contract-sweep-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // A host port this test picks for itself (raw backend calls bypass the core
+    // free-port allocator entirely — see `ContainerSpec::ports`'s doc: a backend
+    // binds already-chosen ports, it never allocates).
+    let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port to reserve one")
+        .local_addr()
+        .unwrap()
+        .port();
+    let name = format!(
+        "rz-contractsweep-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let spec = ContainerSpec {
+        command: Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok' | \
+             nc -l -p 8000; done"
+                .to_string(),
+        ]),
+        ports: vec![PortBinding {
+            host_port,
+            guest_port: 8000,
+        }],
+        ..ContainerSpec::new(&name, "alpine:3.19", "contract-sweep-it")
+    };
+    let handle = raw_backend
+        .create(spec)
+        .await
+        .expect("create a real sandbox to fabricate as a dead run's leftover");
+    raw_backend
+        .start(handle.as_ref())
+        .await
+        .expect("start the sandbox this test hand-registers as a dead run's leftover");
+
+    // Give the sandbox a real chance to boot before fabricating the dead run around
+    // it — 120s: shared CI runners boot a microVM + alpine noticeably slower than
+    // dev hardware, same budget `container_publishes_tcp_port_to_host_loopback` uses.
+    let boot_deadline = Instant::now() + Duration::from_secs(120);
+    let mut booted = false;
+    while Instant::now() < boot_deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", host_port)).is_ok() {
+            booted = true;
+            break;
+        }
+        std::thread::sleep(SWEEP_POLL_INTERVAL);
+    }
+    assert!(
+        booted,
+        "the fabricated sandbox must actually boot and accept connections on port \
+         {host_port} before the sweep test proceeds"
+    );
+
+    // Fabricate the dead run's ledger by hand, matching the on-disk contract exactly
+    // (see docs/reaping.md) — deliberately raw file I/O, not rightsize's own
+    // (private) ledger API, mirroring how a DIFFERENT process (or language) would
+    // actually have produced these files.
+    let runs_dir = cache_dir.join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let dead_run_id = "contractdeadrun1";
+    std::fs::write(
+        runs_dir.join(format!("{dead_run_id}.json")),
+        format!(
+            r#"{{"pid":4294967294,"startedIso":"1999-01-01T00:00:00Z","backend":"{backend_name}"}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        runs_dir.join(format!("{dead_run_id}.sandboxes")),
+        format!("{name}\n"),
+    )
+    .unwrap();
+
+    // The fresh library init: a real child process whose first container start
+    // triggers `rightsize::backends::active()` — and therefore the sweep — from
+    // scratch, pointed at the SAME cache dir (so it finds the fabricated dead run)
+    // and the SAME backend (the sweep only reaps a dead run whose recorded backend
+    // matches its own).
+    let exe = std::env::current_exe().expect("current_exe");
+    let status = Command::new(&exe)
+        .args([
+            "--exact",
+            "helper_triggers_a_fresh_backend_resolution_for_the_sweep_contract_test",
+            "--nocapture",
+        ])
+        .env("RIGHTSIZE_HELPER_CHILD", "1")
+        .env("RIGHTSIZE_CACHE_DIR", &cache_dir)
+        .env("RIGHTSIZE_REAPER", "sweep") // sweep only: no watchdog needed for this test.
+        .env("RIGHTSIZE_BACKEND", &backend_name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("spawn fresh-init child process");
+    assert!(status.success(), "fresh-init child must exit cleanly");
+
+    // Prove the sandbox is gone AT THE BACKEND LEVEL, not just that the ledger's own
+    // bookkeeping was cleaned up: the port it was serving on must stop accepting
+    // connections.
+    let reap_deadline = Instant::now() + SWEEP_REAP_CEILING;
+    let mut gone = false;
+    while Instant::now() < reap_deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", host_port)).is_err() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(SWEEP_POLL_INTERVAL);
+    }
+    assert!(
+        gone,
+        "a fresh process's init-time sweep must reap the fabricated dead run's sandbox at \
+         the backend level (port {host_port} must stop accepting connections) within {}s",
+        SWEEP_REAP_CEILING.as_secs()
+    );
+
+    // The ledger's own bookkeeping must be cleaned up too.
+    assert!(
+        !runs_dir.join(format!("{dead_run_id}.json")).exists(),
+        "the sweep must also delete the fabricated dead run's ledger files"
+    );
+
+    // Best-effort cleanup of the sandbox this test created directly, in case the
+    // sweep somehow didn't reach it (the assertion above already failed in that case).
+    raw_backend.remove_by_name(&name);
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+/// The "fresh library init" helper for the sweep contract test: registers both
+/// backend providers and starts one trivial sandbox of its own — on whichever
+/// backend `RIGHTSIZE_BACKEND` names, the same one the parent resolved — which is
+/// what actually triggers `rightsize::backends::active()` (and therefore the sweep)
+/// inside a brand-new process pointed at the parent's cache dir. Cleans up its own
+/// sandbox before exiting. A normal `cargo test` run treats this as a no-op (the
+/// `RIGHTSIZE_HELPER_CHILD` guard) — it only does real work when re-exec'd by
+/// [`sweep_reaps_a_fabricated_dead_run_at_the_backend_level`] above.
+#[tokio::test]
+async fn helper_triggers_a_fresh_backend_resolution_for_the_sweep_contract_test() {
+    if std::env::var("RIGHTSIZE_HELPER_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    support::ensure_registered();
+
+    let guard = Container::new("alpine:3.19")
+        .with_command(&["true"])
+        .start()
+        .await
+        .expect("fresh-init helper must boot its own trivial sandbox");
+    guard.stop().await.expect("stop the helper's own sandbox");
+}
+
+// =================== Failure diagnostics / isolation requirement ==================
+
+/// Diagnostics report format contract: a container this process has registered as
+/// running appears in `rightsize::diagnostics()`'s report in the exact
+/// cross-language format pinned by `crates/rightsize/src/diagnostics.rs`'s golden
+/// fixture. That fixture itself is Rust-internal — `render`/`register`/`deregister`
+/// are all `pub(crate)`, unreachable from this external contract crate — so this
+/// proves the same contract at the observable-behavior level instead: start a real
+/// container, check ITS OWN report section renders with the pinned header/state-line
+/// shape, then stop it and check that section is gone. Other tests in this binary
+/// register their own containers into the same process-wide registry concurrently, so
+/// this asserts only on this container's own lines, never on exact report equality.
+#[tokio::test]
+async fn diagnostics_report_reflects_a_live_container_in_the_pinned_cross_language_format() {
+    require_backend!();
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sh", "-c", "echo DIAG-CONTRACT-MARKER; sleep 120"])
+        .waiting_for(Wait::for_log_message(".*DIAG-CONTRACT-MARKER.*", 1));
+    let guard = c.start().await.expect("container must start");
+    let name = guard.name().to_string();
+
+    let report = rightsize::diagnostics().await;
+    assert!(
+        report.contains(&format!("-- {name} (alpine:3.19) --")),
+        "report must contain this container's pinned header line: {report}"
+    );
+    assert!(
+        report.contains("state: running   host: 127.0.0.1   ports:"),
+        "report must contain the pinned state/host/ports line: {report}"
+    );
+    assert!(
+        report.contains("last 50 log lines:") || report.contains("logs: unavailable ("),
+        "report must contain either a log tail or a degraded-logs line: {report}"
+    );
+
+    guard.stop().await.unwrap();
+
+    let after_stop = rightsize::diagnostics().await;
+    assert!(
+        !after_stop.contains(&format!("-- {name} (alpine:3.19) --")),
+        "a stopped container must be deregistered from the report: {after_stop}"
+    );
+}
+
+/// Capabilities contract: the ACTIVE backend's `capabilities()` reports the pinned
+/// per-backend values from the isolation feature spec — msb (`"microsandbox"`) is
+/// hardware-isolated (its own kernel per sandbox) but not checkpoint-capable; docker
+/// is not hardware-isolated (shared host kernel) but is checkpoint-capable. Proven
+/// against the real backend instance this contract suite is parameterized over.
+#[tokio::test]
+async fn capabilities_report_the_pinned_per_backend_values() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+    let backend = raw_backend_for(&backend_name);
+    let caps = backend.capabilities();
+
+    if backend_name == "docker" {
+        assert!(
+            !caps.hardware_isolated,
+            "docker must not report hardware isolation"
+        );
+        assert!(caps.checkpoint, "docker must report checkpoint support");
+    } else {
+        assert!(caps.hardware_isolated, "msb must report hardware isolation");
+        assert!(
+            !caps.checkpoint,
+            "msb must not report checkpoint support (reserved for a later wave)"
+        );
+    }
+}
+
+/// requireIsolation gating contract: `.require_isolation(true)` refuses to start
+/// (`RightsizeError::IsolationRequired`, naming the active backend and the
+/// `RIGHTSIZE_BACKEND=microsandbox` remedy) on a backend without hardware isolation, and
+/// starts normally on one that has it — proven against the real backend this
+/// contract suite is parameterized over, not the fake backend
+/// `crates/rightsize/src/container.rs`'s own unit tests use.
+#[tokio::test]
+async fn require_isolation_gates_start_per_backend_hardware_isolation() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "30"])
+        .require_isolation(true);
+
+    if backend_name == "docker" {
+        // `ContainerGuard` (the `Ok` side) has no `Debug` impl, so `Result::expect_err`
+        // is unavailable here — match explicitly instead.
+        let err = match c.start().await {
+            Ok(_) => {
+                panic!("require_isolation(true) must refuse to start on a non-isolated backend")
+            }
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, rightsize::RightsizeError::IsolationRequired { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("docker"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=microsandbox"), "{msg}");
+    } else {
+        let guard = c
+            .start()
+            .await
+            .expect("require_isolation(true) must start normally on a hardware-isolated backend");
+        guard.stop().await.unwrap();
+    }
+}
+
+// ============================ checkpoint / restore =================================
+
+/// Best-effort `docker rmi <image_ref>` cleanup for a checkpoint image a test
+/// committed — shells out to the `docker` CLI rather than the daemon HTTP API
+/// (which this external contract crate has no client for), matching how this
+/// crate's other IT cleanup steps are plain best-effort side calls.
+fn docker_rmi(image_ref: &str) {
+    let _ = Command::new("docker")
+        .args(["rmi", "-f", image_ref])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// checkpoint gating contract: identical typed-error behavior across languages — a
+/// backend without `capabilities().checkpoint` refuses `checkpoint()` with
+/// `RightsizeError::CheckpointUnsupported` (naming the backend and the
+/// `RIGHTSIZE_BACKEND=docker` remedy) BEFORE any backend call; a checkpoint-capable
+/// backend succeeds and returns a well-formed `rightsize/checkpoint:<12hex>` ref.
+#[tokio::test]
+async fn checkpoint_gating_matches_the_capability_per_backend() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "60"])
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let guard = c.start().await.expect("container must start");
+
+    if backend_name == "docker" {
+        let cp = guard
+            .checkpoint()
+            .await
+            .expect("checkpoint must succeed on the docker backend");
+        assert!(
+            cp.image_ref.starts_with("rightsize/checkpoint:"),
+            "{}",
+            cp.image_ref
+        );
+        let tag = cp.image_ref.strip_prefix("rightsize/checkpoint:").unwrap();
+        assert_eq!(tag.len(), 12, "{}", cp.image_ref);
+        assert!(
+            tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "{}",
+            cp.image_ref
+        );
+        docker_rmi(&cp.image_ref);
+    } else {
+        let err = match guard.checkpoint().await {
+            Ok(_) => panic!("checkpoint() must refuse on a non-checkpoint-capable backend"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, rightsize::RightsizeError::CheckpointUnsupported { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("microsandbox"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=docker"), "{msg}");
+    }
+
+    guard.stop().await.unwrap();
+}
+
+/// The dedicated checkpoint/restore integration test (docker-only — microsandbox has
+/// no image-commit primitive, see the gating contract test above): boot a small
+/// image, exec-write a marker file, checkpoint it, stop the original, restore a new
+/// container from the checkpoint via `Container::from_checkpoint`, and assert the
+/// marker file is present in the restored container's filesystem — proving the
+/// "filesystem capture, not memory" semantics end to end. Cleans up the committed
+/// image at the end (checkpoint images are never auto-reaped — see the checkpoints
+/// docs).
+#[tokio::test]
+async fn checkpoint_restore_round_trips_a_marker_file_written_after_boot() {
+    require_backend!();
+    if rightsize::backends::active_name() != "docker" {
+        eprintln!("skipping: checkpoint/restore is docker-only (microsandbox is unsupported)");
+        return;
+    }
+
+    let original = Container::new("alpine:3.19")
+        .with_command(&["sleep", "60"])
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let original_guard = original.start().await.expect("original must start");
+
+    let write = original_guard
+        .exec(&[
+            "sh",
+            "-c",
+            "echo checkpoint-restore-marker > /tmp/rz-checkpoint-marker.txt",
+        ])
+        .await
+        .expect("exec must run");
+    assert_eq!(write.exit_code, 0, "{}", write.stderr);
+
+    let cp = original_guard
+        .checkpoint()
+        .await
+        .expect("checkpoint must succeed");
+    original_guard
+        .stop()
+        .await
+        .expect("stop the original container");
+
+    let restored = Container::from_checkpoint(&cp)
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let restored_guard = restored
+        .start()
+        .await
+        .expect("a container restored from the checkpoint image must start");
+
+    let read = restored_guard
+        .exec(&["cat", "/tmp/rz-checkpoint-marker.txt"])
+        .await
+        .expect("exec must run in the restored container");
+    assert_eq!(read.exit_code, 0, "{}", read.stderr);
+    assert!(
+        read.stdout.contains("checkpoint-restore-marker"),
+        "the restored container's filesystem must contain the marker file written before \
+         checkpointing: stdout was {:?}",
+        read.stdout
+    );
+
+    restored_guard
+        .stop()
+        .await
+        .expect("stop the restored container");
+    docker_rmi(&cp.image_ref);
+}
+
+// ======================= Container reuse (double opt-in) ==========================
+//
+// Reuse's gating is `RIGHTSIZE_REUSE`-env-sensitive, and this binary's OTHER
+// contract tests above run in parallel threads within the same process — mutating
+// that real env var here would race them (and `Container::reuse`'s own env read has
+// no per-call override at this crate's public surface; `Container::with_reuse_env_override`
+// is `pub(crate)` inside `rightsize` itself). Every scenario below therefore spawns a
+// fresh child process (same "re-exec this test binary with `--exact` + controlled
+// env" shape `sweep_reaps_a_fabricated_dead_run_at_the_backend_level` already uses
+// for `RIGHTSIZE_REAPER`) so its own `RIGHTSIZE_REUSE`/`RIGHTSIZE_CACHE_DIR` are
+// deterministic regardless of what's ambient in this process's environment or what
+// any other test in this binary is doing concurrently.
+
+/// A fresh, empty scratch cache dir for one reuse scenario, so its registry file
+/// (and any run-record ledger files) never collide with another test's — same shape
+/// `sweep_reaps_a_fabricated_dead_run_at_the_backend_level` uses for its own
+/// `cache_dir`.
+fn fresh_scratch_cache_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "rz-contract-reuse-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Removes a scratch cache dir (and the registry file it may hold) via `Drop`
+/// rather than a bare trailing `remove_dir_all` call, so it still runs if a
+/// `status.success()`/other assertion earlier in the test panics — a bare trailing
+/// call is simply never reached on that path, leaking the scratch dir (and, if the
+/// child itself failed after writing one, its reuse registry file) into the shared
+/// CI temp dir run after run.
+struct ScratchCacheDirGuard(PathBuf);
+
+impl Drop for ScratchCacheDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A random-enough-per-run hex nonce (reuses `rightsize::RunId`'s own
+/// time+pid-mixed generator rather than hand-rolling a second one), injected as
+/// `RZ_TEST_NONCE` into a reuse scenario's spec so its identity — and therefore its
+/// `rz-reuse-<hash>` sandbox name — can never collide with a sandbox left behind by
+/// an earlier, differently-timed run of the same scenario. Without this, a helper
+/// that always builds the exact same `{image, env, ports}` spec (e.g.
+/// `RZ_CONTRACT_ADOPT=1` every run) would reuse the identical identity forever, and
+/// a sandbox orphaned by a previous crashed run — the crash-mid-boot scenario
+/// `docs/reuse.md#crash-mid-boot-orphan-recovery` describes — could still be sitting
+/// there under that exact name. The library's own orphan recovery (see that doc)
+/// now makes that collision safe either way, but nonce'ing the identity here means
+/// these scenarios test what they say they test (adoption, stop semantics) without
+/// ever depending on that recovery path firing.
+///
+/// NOT used by [`helper_reuse_pinned_vector`] — nonce'ing that spec would change its
+/// hash and defeat the one thing it exists to prove: the exact pinned
+/// cross-language identity vector.
+fn contract_reuse_nonce() -> &'static str {
+    rightsize::RunId::value()
+}
+
+/// Re-execs this test binary with only `helper_name` selected, pointed at
+/// `cache_dir` and `backend_name`, with `RIGHTSIZE_REUSE` set to `reuse_env` — `None`
+/// removes it from the child's environment entirely (rather than merely not setting
+/// it) so a developer's own exported `RIGHTSIZE_REUSE=true` can never leak into the
+/// "env-disabled" scenario. Blocks until the child exits and returns its status;
+/// child stderr is surfaced on failure so a helper assertion failure is visible in
+/// the parent's own test output.
+fn spawn_reuse_helper(
+    helper_name: &str,
+    cache_dir: &Path,
+    backend_name: &str,
+    reuse_env: Option<&str>,
+) -> std::process::ExitStatus {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = Command::new(&exe);
+    cmd.args(["--exact", helper_name, "--nocapture"])
+        .env("RIGHTSIZE_HELPER_CHILD", "1")
+        .env("RIGHTSIZE_CACHE_DIR", cache_dir)
+        .env("RIGHTSIZE_BACKEND", backend_name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match reuse_env {
+        Some(v) => {
+            cmd.env("RIGHTSIZE_REUSE", v);
+        }
+        None => {
+            cmd.env_remove("RIGHTSIZE_REUSE");
+        }
+    }
+    let output = cmd.output().expect("spawn reuse helper child process");
+    if !output.status.success() {
+        eprintln!(
+            "reuse helper {helper_name} stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    output.status
+}
+
+/// Double opt-in gating: `.reuse(true)` with `RIGHTSIZE_REUSE` NOT set must fall
+/// straight through to an ordinary, non-reused container (Testcontainers semantics)
+/// on a REAL backend — proven two ways in the child helper: the sandbox name is an
+/// ordinary `rz-<runid>-<seq>`, never `rz-reuse-...`, and `stop()` genuinely tears it
+/// down (the reuse `keep_alive` short-circuit never engages). Also checked here in
+/// the parent: no reuse registry file was ever written.
+#[tokio::test]
+async fn reuse_double_opt_in_gating_env_disabled_runs_as_an_ordinary_ephemeral_container() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+    let cache_dir = fresh_scratch_cache_dir("gating");
+    let _cache_dir_guard = ScratchCacheDirGuard(cache_dir.clone());
+
+    let status = spawn_reuse_helper(
+        "helper_reuse_gating_env_disabled",
+        &cache_dir,
+        &backend_name,
+        None,
+    );
+    assert!(status.success(), "gating helper child must exit cleanly");
+    assert!(
+        !cache_dir.join("reuse").exists(),
+        "an env-disabled reuse request must never write a registry entry"
+    );
+}
+
+/// Helper for
+/// [`reuse_double_opt_in_gating_env_disabled_runs_as_an_ordinary_ephemeral_container`].
+/// A normal `cargo test` run treats this as a no-op (the `RIGHTSIZE_HELPER_CHILD`
+/// guard) — it only does real work when re-exec'd by that test.
+#[tokio::test]
+async fn helper_reuse_gating_env_disabled() {
+    if std::env::var("RIGHTSIZE_HELPER_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    support::ensure_registered();
+    assert!(
+        std::env::var("RIGHTSIZE_REUSE").is_err(),
+        "this helper must run with RIGHTSIZE_REUSE unset"
+    );
+
+    let c = Container::new("python:3.12-alpine")
+        .with_command(&["python", "-m", "http.server", "8000"])
+        .with_exposed_ports(&[8000])
+        .reuse(true)
+        .waiting_for(
+            Wait::for_http("/")
+                .for_port(8000)
+                .with_startup_timeout(Duration::from_secs(120)),
+        );
+    let guard = c
+        .start()
+        .await
+        .expect("gating helper must start as an ordinary container despite .reuse(true)");
+    let name = guard.name().to_string();
+    assert!(
+        !name.starts_with("rz-reuse-"),
+        "env-disabled reuse must produce an ordinary sandbox name, got {name}"
+    );
+    let port = guard
+        .get_mapped_port(8000)
+        .expect("ordinary container must have a mapped port");
+
+    guard
+        .stop()
+        .await
+        .expect("an env-disabled reuse container's stop() must behave like any ordinary stop()");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut gone = false;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        gone,
+        "stop() on an env-disabled reuse container must actually tear it down at the backend \
+         level (port {port} must stop accepting connections)"
+    );
+}
+
+/// Best-effort teardown for one reuse scenario's sandbox: removes it at the backend
+/// level by name. Built as a `Drop` guard — not a bare trailing call — specifically
+/// so it still runs if an assertion partway through a helper's body panics; a reuse
+/// sandbox is never torn down by `stop()` (that's the feature), so a panic between
+/// `start()` and the old trailing `remove_by_name` call used to leak it into shared
+/// CI backend state for good. (The registry FILE itself needs no separate handling
+/// here — it lives under this child's `RIGHTSIZE_CACHE_DIR`, which the PARENT's own
+/// [`ScratchCacheDirGuard`] removes wholesale regardless of how this child exits.)
+struct ReuseSandboxCleanup {
+    raw_backend: Box<dyn SandboxBackend>,
+    name: String,
+}
+
+impl Drop for ReuseSandboxCleanup {
+    fn drop(&mut self) {
+        self.raw_backend.remove_by_name(&self.name);
+    }
+}
+
+/// `rz-reuse-` + the first 12 hex chars of the reuse feature spec's pinned
+/// cross-language vector hash (see `crates/rightsize/src/reuse.rs`'s
+/// `PINNED_VECTOR_HASH` / `pinned_cross_language_vector_hashes_to_the_pinned_value`)
+/// — the exact spec `{image: "redis:7-alpine", env: {A: "1", B: "2"}, command: [],
+/// exposedPorts: [6379], memoryLimitMb: null, copies: []}` MUST hash (and therefore
+/// name) identically across every language's implementation.
+const PINNED_VECTOR_SANDBOX_NAME: &str = "rz-reuse-799aad5a3338";
+
+/// The cross-language identity hash contract, proven at the observable-behavior
+/// level on a REAL backend: `crate::reuse::compute_identity` is `pub(crate)` inside
+/// `rightsize` and unreachable from this external contract crate, so the only way
+/// this suite can prove the pinned vector holds end to end is to build the exact
+/// pinned spec, start it for real, and check the sandbox name the backend actually
+/// received — [`PINNED_VECTOR_SANDBOX_NAME`].
+#[tokio::test]
+async fn reuse_pinned_cross_language_hash_vector_produces_the_contract_sandbox_name() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+    let cache_dir = fresh_scratch_cache_dir("hashvec");
+    let _cache_dir_guard = ScratchCacheDirGuard(cache_dir.clone());
+
+    let status = spawn_reuse_helper(
+        "helper_reuse_pinned_vector",
+        &cache_dir,
+        &backend_name,
+        Some("true"),
+    );
+    assert!(
+        status.success(),
+        "hash-vector helper child must exit cleanly"
+    );
+}
+
+/// Helper for
+/// [`reuse_pinned_cross_language_hash_vector_produces_the_contract_sandbox_name`].
+/// Explicitly removes the sandbox it creates before exiting (a reuse sandbox is
+/// never torn down by `stop()` — that's the feature) so nothing leaks into shared
+/// CI backend state; the scratch cache dir itself is discarded by the parent right
+/// after this process exits.
+#[tokio::test]
+async fn helper_reuse_pinned_vector() {
+    if std::env::var("RIGHTSIZE_HELPER_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    support::ensure_registered();
+
+    let backend_name = rightsize::backends::active_name();
+    let raw_backend = raw_backend_for(&backend_name);
+
+    let c = Container::new("redis:7-alpine")
+        .with_env("A", "1")
+        .with_env("B", "2")
+        .with_exposed_ports(&[6379])
+        .reuse(true);
+    let guard = c
+        .start()
+        .await
+        .expect("pinned cross-language vector reuse container must start");
+    // From here on, cleanup must run even if a later assertion panics — this spec
+    // is deliberately NOT nonce'd (see `contract_reuse_nonce`'s doc), so its
+    // identity is the same every run.
+    let _cleanup = ReuseSandboxCleanup {
+        raw_backend,
+        name: PINNED_VECTOR_SANDBOX_NAME.to_string(),
+    };
+    assert_eq!(
+        guard.name(),
+        PINNED_VECTOR_SANDBOX_NAME,
+        "the pinned cross-language vector must produce the pinned sandbox name"
+    );
+    guard.stop().await.unwrap(); // reuse stop(): leaves the sandbox running.
+
+    // `_cleanup` fires on drop, whether we reach here normally or unwound through
+    // a panic above.
+}
+
+/// Adopt: a second, equivalent `.reuse(true)` container built AFTER the first one's
+/// `stop()` (which — being reuse — leaves the sandbox running) ADOPTS the exact same
+/// live sandbox instead of creating a new one: identical name, identical mapped
+/// port, and a real round trip against it proves it's genuinely the same live
+/// sandbox, not a coincidentally-matching new one. Generalizes
+/// `rightsize-msb/tests/reuse_it.rs`'s msb-only adoption proof across BOTH backends
+/// through the shared contract harness — msb-only coverage never proves docker's
+/// real `find_running` path against a real daemon.
+#[tokio::test]
+async fn reuse_adopt_reuses_the_same_sandbox_and_mapped_port_across_two_starts() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+    let cache_dir = fresh_scratch_cache_dir("adopt");
+    let _cache_dir_guard = ScratchCacheDirGuard(cache_dir.clone());
+
+    let status = spawn_reuse_helper(
+        "helper_reuse_adopt_across_two_starts",
+        &cache_dir,
+        &backend_name,
+        Some("true"),
+    );
+    assert!(status.success(), "adopt helper child must exit cleanly");
+}
+
+/// Helper for
+/// [`reuse_adopt_reuses_the_same_sandbox_and_mapped_port_across_two_starts`].
+#[tokio::test]
+async fn helper_reuse_adopt_across_two_starts() {
+    if std::env::var("RIGHTSIZE_HELPER_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    support::ensure_registered();
+
+    let backend_name = rightsize::backends::active_name();
+    let raw_backend = raw_backend_for(&backend_name);
+
+    let nonce = contract_reuse_nonce();
+    let build = move || {
+        Container::new("redis:7-alpine")
+            .with_env("RZ_CONTRACT_ADOPT", "1")
+            .with_env("RZ_TEST_NONCE", nonce)
+            .with_exposed_ports(&[6379])
+            .reuse(true)
+            // A bare listening-port check (this crate's default `WaitStrategy`) is not
+            // enough here: microsandbox's host-side port forwarder can accept — and
+            // silently hold open — a TCP connection before Redis has actually bound and
+            // started serving inside the guest (exactly the race `rightsize_modules::
+            // RedisContainer`'s own doc documents and works around the same way). Under
+            // this suite's own concurrent sandbox load that window was measured up to
+            // ~900ms, wide enough for this test's very next step — an immediate,
+            // unretried `redis-cli PING` against the ADOPTED sandbox — to race ahead of
+            // Redis actually being ready and observe "Connection refused" even though
+            // the wait strategy just reported success. Anchoring on Redis's own "Ready
+            // to accept connections" log line (as `RedisContainer` does) instead of a
+            // bare port probe closes that window for both the fresh-create wait AND the
+            // adopt-path's re-verification (`try_adopt` reuses this same
+            // `wait_strategy`), since a real log line can only appear once Redis is
+            // genuinely serving.
+            .waiting_for(Wait::for_log_message(".*Ready to accept connections.*", 1))
+    };
+
+    let first = build()
+        .start()
+        .await
+        .expect("first start() must create+start a fresh reuse sandbox");
+    let name = first.name().to_string();
+    // From here on, cleanup must run even if a later assertion panics.
+    let _cleanup = ReuseSandboxCleanup {
+        raw_backend,
+        name: name.clone(),
+    };
+    assert!(name.starts_with("rz-reuse-"), "{name}");
+    let first_port = first
+        .get_mapped_port(6379)
+        .expect("first sandbox must have a mapped port");
+
+    first.stop().await.unwrap(); // reuse stop(): leaves the sandbox running.
+
+    let second = build()
+        .start()
+        .await
+        .expect("second start() must ADOPT the first sandbox, not re-create one");
+    assert_eq!(
+        second.name(),
+        name,
+        "adoption must produce the identical sandbox name"
+    );
+    assert_eq!(
+        second.get_mapped_port(6379).unwrap(),
+        first_port,
+        "adoption must reuse the SAME mapped port, not allocate a fresh one"
+    );
+
+    let ping = second
+        .exec(&["redis-cli", "PING"])
+        .await
+        .expect("exec against the adopted sandbox must run");
+    assert_eq!(
+        ping.stdout.trim(),
+        "PONG",
+        "adopted sandbox must actually be alive and serving: {ping:?}"
+    );
+
+    second.stop().await.unwrap();
+
+    // `_cleanup` fires on drop, whether we reach here normally or unwound through
+    // a panic above.
+}
+
+/// Stop semantics: `stop()` on a reuse guard leaves the sandbox genuinely running
+/// (proven at the TCP level, not just an in-process flag) and never appears in the
+/// run's `.sandboxes` reaping ledger file, at any point — the reuse start/stop path
+/// never calls `crate::reaper::before_create`/`after_stop` at all (see
+/// `crate::container::create_fresh_reuse`), which this reads back from the raw
+/// on-disk ledger file to prove externally, since `crate::reaper::Ledger` itself is
+/// `pub(crate)` and unreachable from this contract crate.
+#[tokio::test]
+async fn reuse_stop_semantics_leaves_the_sandbox_running_and_never_ledgers_it() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+    let cache_dir = fresh_scratch_cache_dir("stopsem");
+    let _cache_dir_guard = ScratchCacheDirGuard(cache_dir.clone());
+
+    let status = spawn_reuse_helper(
+        "helper_reuse_stop_semantics",
+        &cache_dir,
+        &backend_name,
+        Some("true"),
+    );
+    assert!(
+        status.success(),
+        "stop-semantics helper child must exit cleanly"
+    );
+}
+
+/// Helper for
+/// [`reuse_stop_semantics_leaves_the_sandbox_running_and_never_ledgers_it`].
+#[tokio::test]
+async fn helper_reuse_stop_semantics() {
+    if std::env::var("RIGHTSIZE_HELPER_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    support::ensure_registered();
+
+    let backend_name = rightsize::backends::active_name();
+    let raw_backend = raw_backend_for(&backend_name);
+    let cache_dir = rightsize::cache_dir::dir();
+
+    let c = Container::new("redis:7-alpine")
+        .with_env("RZ_CONTRACT_STOPSEM", "1")
+        .with_env("RZ_TEST_NONCE", contract_reuse_nonce())
+        .with_exposed_ports(&[6379])
+        .reuse(true);
+    let guard = c
+        .start()
+        .await
+        .expect("stop-semantics reuse container must start");
+    let name = guard.name().to_string();
+    // From here on, cleanup must run even if a later assertion panics.
+    let _cleanup = ReuseSandboxCleanup {
+        raw_backend,
+        name: name.clone(),
+    };
+    let port = guard
+        .get_mapped_port(6379)
+        .expect("reuse sandbox must have a mapped port");
+
+    guard
+        .stop()
+        .await
+        .expect("stop() on a reuse guard must return Ok even though it leaves the sandbox running");
+
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "a reuse container's stop() must leave the sandbox genuinely running, not tear it down"
+    );
+
+    // Raw file read (see this test's module doc): the run's own `.sandboxes` ledger
+    // file, if it exists at all, must never contain the reuse sandbox's name.
+    let sandboxes_path = cache_dir
+        .join("runs")
+        .join(format!("{}.sandboxes", rightsize::RunId::value()));
+    if let Ok(contents) = std::fs::read_to_string(&sandboxes_path) {
+        assert!(
+            !contents.lines().any(|l| l == name),
+            "a reuse sandbox must never appear in the run's .sandboxes ledger file: {contents:?}"
+        );
+    }
+
+    // `_cleanup` fires on drop, whether we reach here normally or unwound through
+    // a panic above.
 }

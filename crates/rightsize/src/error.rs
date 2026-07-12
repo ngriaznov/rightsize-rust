@@ -47,6 +47,57 @@ pub enum RightsizeError {
     #[error("{0}")]
     Backend(String),
 
+    /// A backend's `create()` failed because another process already created a
+    /// sandbox with this name — the reuse start flow's cue (see
+    /// `crate::reuse::is_name_conflict`) to re-enter the adopt path once, on the
+    /// theory that the winner is about to (or already did) register itself in the
+    /// reuse registry. Typed first, string-matched ("already exists") fallback,
+    /// mirroring [`RightsizeError::PortBindConflict`]'s own classification shape.
+    #[error("{message}")]
+    NameConflict {
+        /// The rendered failure message (backend-specific wording is fine here).
+        message: String,
+        /// The underlying error, when a backend can supply one, so `source()` still
+        /// walks to it.
+        #[source]
+        source: Option<Box<RightsizeError>>,
+    },
+
+    /// `.reuse(true)` was combined with `.with_network(...)`. Reuse's identity hash
+    /// covers only image/env/command/ports/mounts — never cross-container network
+    /// topology — so this combination has no well-defined adopt/create behavior.
+    #[error(
+        "Container reuse cannot be combined with a custom network ('{network_id}') — reuse \
+         identity does not cover network topology; drop either .reuse(true) or \
+         .with_network(...)"
+    )]
+    ReuseNetworkConflict {
+        /// The network id the container was trying to join.
+        network_id: String,
+    },
+
+    /// `.require_isolation(true)` was set on a `Container` but the active backend's
+    /// `capabilities().hardware_isolated` is `false` — e.g. the docker backend, which
+    /// shares the host kernel. Raised in `Container::start()`, before any
+    /// create/network work: no sandbox is created. The message names the active
+    /// backend and the remedy (switch to the msb backend).
+    #[error("{}", format_isolation_required(backend))]
+    IsolationRequired {
+        /// The active backend's registered name (e.g. `"docker"`).
+        backend: String,
+    },
+
+    /// `ContainerGuard::checkpoint()` was called but the active backend's
+    /// `capabilities().checkpoint` is `false` — e.g. the microsandbox backend, which
+    /// has no image-commit primitive to build a checkpoint from. Raised BEFORE any
+    /// backend call (see `ContainerGuard::checkpoint`'s doc). The message names the
+    /// backend and points at the docker backend and the checkpoints docs.
+    #[error("{}", format_checkpoint_unsupported(backend))]
+    CheckpointUnsupported {
+        /// The active backend's registered name (e.g. `"microsandbox"`).
+        backend: String,
+    },
+
     /// The msb toolchain provisioner failed (download, checksum, install).
     #[error("{0}")]
     Provision(String),
@@ -66,6 +117,27 @@ fn format_unsupported(feature: &str, backend: &str, remedy: &Option<String>) -> 
         Some(r) => format!("{base} — {r}"),
         None => base,
     }
+}
+
+/// Renders `IsolationRequired`'s message: the same fact-em-dash-remedy grammar as
+/// [`format_unsupported`], naming the active backend and the fix.
+fn format_isolation_required(backend: &str) -> String {
+    format!(
+        "Hardware isolation was required (.require_isolation(true)) but the active '{backend}' \
+         backend does not provide it — set RIGHTSIZE_BACKEND=microsandbox to run on a hardware-isolated \
+         backend, or drop .require_isolation(true) if this workload does not need it"
+    )
+}
+
+/// Renders `CheckpointUnsupported`'s message: the same fact-em-dash-remedy grammar as
+/// [`format_unsupported`], naming the active backend and pointing at the backend/docs
+/// that do support it.
+fn format_checkpoint_unsupported(backend: &str) -> String {
+    format!(
+        "Checkpoint/restore was requested but the active '{backend}' backend does not support \
+         it — set RIGHTSIZE_BACKEND=docker to checkpoint (see the checkpoints docs for the \
+         microVM-memory-snapshot roadmap item)"
+    )
 }
 
 impl RightsizeError {
@@ -137,5 +209,49 @@ mod tests {
         assert_eq!(e.to_string(), "timed out waiting for port 6379");
         let e = RightsizeError::Backend("500: already allocated".into());
         assert_eq!(e.to_string(), "500: already allocated");
+    }
+
+    #[test]
+    fn name_conflict_displays_its_message() {
+        let e = RightsizeError::NameConflict {
+            message: "container name 'rz-reuse-abc' is already in use".into(),
+            source: None,
+        };
+        assert_eq!(
+            e.to_string(),
+            "container name 'rz-reuse-abc' is already in use"
+        );
+    }
+
+    #[test]
+    fn isolation_required_names_the_backend_and_the_remedy() {
+        let e = RightsizeError::IsolationRequired {
+            backend: "docker".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("docker"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=microsandbox"), "{msg}");
+        assert!(msg.contains(".require_isolation(true)"), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_unsupported_names_the_backend_and_the_docker_remedy() {
+        let e = RightsizeError::CheckpointUnsupported {
+            backend: "microsandbox".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("microsandbox"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=docker"), "{msg}");
+    }
+
+    #[test]
+    fn reuse_network_conflict_names_the_network_and_both_knobs() {
+        let e = RightsizeError::ReuseNetworkConflict {
+            network_id: "rz-net-1".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("rz-net-1"), "{msg}");
+        assert!(msg.contains(".reuse(true)"), "{msg}");
+        assert!(msg.contains(".with_network(...)"), "{msg}");
     }
 }

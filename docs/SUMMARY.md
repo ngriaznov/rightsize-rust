@@ -12,6 +12,18 @@
 
 - [Backends](./backends.md)
 
+- [Cross-Language Parity](./parity.md)
+
+- [Orphan Reaping](./reaping.md)
+
+- [Container Reuse](./reuse.md)
+
+- [Failure Diagnostics](./diagnostics.md)
+
+- [Isolation Requirement](./isolation.md)
+
+- [Checkpoint / Restore](./checkpoints.md)
+
 - [Modules](./modules/index.md)
   - [RedisContainer](./modules/redis.md)
   - [MemcachedContainer](./modules/memcached.md)
@@ -35,3 +47,5 @@
 - [Troubleshooting](./troubleshooting.md)
 
 - [How It Works](./how-it-works.md)
+
+- [Roadmap](./roadmap.md)

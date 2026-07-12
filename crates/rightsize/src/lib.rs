@@ -12,19 +12,28 @@
 
 pub mod backend;
 pub mod backends;
+pub mod cache_dir;
+mod checkpoint;
 mod cleanup;
 mod container;
+mod diagnostics;
 pub mod error;
 mod free_ports;
 mod futures;
 pub mod model;
 pub mod mountable_file;
 pub mod network;
+mod reaper;
+mod reuse;
 mod run_id;
 pub mod wait;
 
-pub use backend::{BackendProvider, FollowHandle, NetworkLink, SandboxBackend, SandboxHandle};
+pub use backend::{
+    BackendProvider, Capabilities, FollowHandle, NetworkLink, SandboxBackend, SandboxHandle,
+};
+pub use checkpoint::Checkpoint;
 pub use container::{Container, ContainerGuard};
+pub use diagnostics::{DiagnosticsGuard, diagnostics};
 pub use error::{Result, RightsizeError};
 pub use futures::BoxFuture;
 pub use model::{ContainerSpec, ExecResult, FileMount, PortBinding};

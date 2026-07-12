@@ -34,6 +34,9 @@ async-trait = { workspace = true }
 rightsize-msb = { path = "../rightsize-msb" }
 rightsize-docker = { path = "../rightsize-docker" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Parses the reaping ledger's run record in the contract suite instead of
+# substring-matching its (pretty-printed) JSON.
+serde_json = { workspace = true }
 # Real-client round-trip proof for the Postgres/MySQL module ITs — test-only, does
 # not enter the runtime dependency budget (the four shipped crates' own runtime deps
 # are what that budget covers).

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::{SandboxBackend, SandboxHandle};
 use crate::backends;
+use crate::checkpoint::{self, Checkpoint};
 use crate::cleanup::{self, CleanupJob};
 use crate::error::{Result, RightsizeError};
 use crate::free_ports::FreePorts;
@@ -70,6 +71,11 @@ pub struct Container {
     backend_override: Option<Arc<dyn SandboxBackend>>,
     spec_customizer: Option<Arc<SpecCustomizer>>,
     post_start: Option<Arc<PostStartHook>>,
+    reuse: bool,
+    cache_dir_override: Option<std::path::PathBuf>,
+    reuse_env_override: Option<bool>,
+    require_isolation: bool,
+    reaper_cache_dir_override: Option<std::path::PathBuf>,
 }
 
 impl Container {
@@ -90,7 +96,36 @@ impl Container {
             backend_override: None,
             spec_customizer: None,
             post_start: None,
+            reuse: false,
+            cache_dir_override: None,
+            reuse_env_override: None,
+            require_isolation: false,
+            reaper_cache_dir_override: None,
         }
+    }
+
+    /// Builds a normal `Container` from a [`Checkpoint`]'s image and the source
+    /// container's env, command, exposed ports (guest side only — a restored
+    /// container gets fresh host ports, chosen by the core allocator exactly like
+    /// any other `start()`), and memory limit. Every other field starts at its
+    /// ordinary default and can still be overridden with the usual builders before
+    /// `start()` (e.g. a different `.waiting_for(...)` wait strategy) — the value
+    /// returned here is a plain `Container`, indistinguishable from one built by
+    /// [`Container::new`]. A container started from it is ordinary in every other
+    /// respect too: a fresh name, fresh host ports, normal reaping, normal `stop()`.
+    ///
+    /// Deliberately does NOT carry over the checkpoint's `mounts`, `network_id`, or
+    /// `aliases` — the checkpoint image already has whatever those mounts wrote,
+    /// baked directly into its filesystem (see [`Checkpoint`]'s own doc for the
+    /// "filesystem capture, not memory" semantics), and network topology has no
+    /// well-defined meaning to carry across a restore.
+    pub fn from_checkpoint(cp: &Checkpoint) -> Container {
+        let mut c = Container::new(&cp.image_ref);
+        c.env = cp.spec.env.clone();
+        c.command = cp.spec.command.clone();
+        c.exposed_ports = cp.spec.ports.iter().map(|p| p.guest_port).collect();
+        c.memory_limit_mb = cp.spec.memory_limit_mb;
+        c
     }
 
     /// Sets a single environment variable for the container process. Call again with
@@ -178,6 +213,35 @@ impl Container {
         self
     }
 
+    /// Marks this container for reuse: a container built from an identical
+    /// image/env/command/exposed-ports/memory-limit/mounted-files spec survives
+    /// process exit and is ADOPTED — not re-created — by a later `start()`, in this
+    /// process or a later one; `stop()` then leaves the sandbox running instead of
+    /// tearing it down. Requires a double opt-in: `RIGHTSIZE_REUSE` must ALSO be
+    /// set to `"true"` or `"1"` in the real process environment, or `start()`
+    /// behaves exactly as an ordinary ephemeral container (with a single stderr
+    /// note that reuse was requested but not enabled). Reuse cannot be combined
+    /// with [`Self::with_network`] — `start()` returns
+    /// [`RightsizeError::ReuseNetworkConflict`] up front. Defaults to `false`.
+    pub fn reuse(mut self, enabled: bool) -> Self {
+        self.reuse = enabled;
+        self
+    }
+
+    /// Requires the active backend to provide hardware isolation — its own kernel per
+    /// sandbox, see [`crate::backend::Capabilities::hardware_isolated`] — before this
+    /// container is allowed to start. Checked in [`Self::start`], before any
+    /// create/network work: if the active backend does not provide it (the docker
+    /// backend, which shares the host kernel), `start()` returns
+    /// [`RightsizeError::IsolationRequired`] and no sandbox is created. Use this for
+    /// workloads that genuinely need microVM-strength isolation (untrusted code),
+    /// rather than trusting every backend a caller might resolve to. Defaults to
+    /// `false`.
+    pub fn require_isolation(mut self, enabled: bool) -> Self {
+        self.require_isolation = enabled;
+        self
+    }
+
     /// Test/module seam: overrides the backend this container starts on, instead of the
     /// process-wide active backend. Every current caller is a unit test in this crate —
     /// `#[cfg_attr(not(test), allow(dead_code))]` reflects that precisely instead of
@@ -185,6 +249,53 @@ impl Container {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_backend(mut self, b: Arc<dyn SandboxBackend>) -> Self {
         self.backend_override = Some(b);
+        self
+    }
+
+    /// Test/module seam: overrides the reuse registry's cache dir instead of the
+    /// real `crate::cache_dir::dir()` (which reads `RIGHTSIZE_CACHE_DIR` from the
+    /// real process environment) — every current caller is a unit test exercising
+    /// the reuse flow's registry file, which must never touch a real machine's
+    /// `~/.cache/rightsize/reuse/` directory.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_cache_dir_override(mut self, dir: std::path::PathBuf) -> Self {
+        self.cache_dir_override = Some(dir);
+        self
+    }
+
+    /// Test/module seam: overrides the `RIGHTSIZE_REUSE` double-opt-in check instead
+    /// of reading the real process environment (`crate::reuse::env_enabled`) — lets
+    /// unit tests exercise both gating outcomes deterministically, without mutating
+    /// real process env (racy across the parallel test threads `cargo test` uses
+    /// within one binary) or needing `unsafe` (`std::env::set_var` requires it as of
+    /// the 2024 edition, and this crate forbids unsafe code entirely).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_reuse_env_override(mut self, enabled: bool) -> Self {
+        self.reuse_env_override = Some(enabled);
+        self
+    }
+
+    /// Test/module seam: overrides the REAPING ledger's cache dir instead of the
+    /// real `crate::cache_dir::dir()` — distinct from [`Self::with_cache_dir_override`],
+    /// which only redirects the REUSE registry. Every current caller is a unit
+    /// test in this module that asserts against `.sandboxes`/`.networks`
+    /// directly (`crate::reaper::Ledger`); without this, those tests read/write
+    /// the real, process-wide ledger under this developer machine's actual
+    /// `~/.cache/rightsize/runs/` and are inherently coupled to every other
+    /// concurrently-running test in the same binary sharing that same file (see
+    /// `crate::reaper::ledger`'s module doc — one `WRITE_LOCK`-guarded ledger per
+    /// process, keyed only by run id, not by test). Threaded down to every
+    /// `crate::reaper::before_create`/`after_stop`/`before_ensure_network`/
+    /// `after_remove_network` call this container's own lifecycle makes (see
+    /// [`crate::reaper::ledger_for`]'s doc for exactly what does and doesn't
+    /// change under the override) — but NOT to the watchdog-spawn-once gate or
+    /// this process's `RIGHTSIZE_REAPER` mode, which stay tied to the real,
+    /// process-wide reaper state regardless, matching every other test in this
+    /// binary. Production never sets this field, so `None` (the real cache dir)
+    /// is always what a real caller gets.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_reaper_cache_dir_override(mut self, dir: std::path::PathBuf) -> Self {
+        self.reaper_cache_dir_override = Some(dir);
         self
     }
 
@@ -231,8 +342,58 @@ impl Container {
     pub async fn start(self) -> Result<ContainerGuard> {
         let backend = self.active_backend();
 
+        if self.require_isolation && !backend.capabilities().hardware_isolated {
+            // Checked before any create/network work — reuse's own registry lookup,
+            // ensure_network, and create_started_container all come after this, so a
+            // non-isolated backend never gets far enough to create anything.
+            return Err(RightsizeError::IsolationRequired {
+                backend: backend.name().to_string(),
+            });
+        }
+
+        if self.reuse {
+            let reuse_env_enabled = self
+                .reuse_env_override
+                .unwrap_or_else(crate::reuse::env_enabled);
+            if reuse_env_enabled {
+                if let Some(net) = &self.network {
+                    return Err(RightsizeError::ReuseNetworkConflict {
+                        network_id: net.id().to_string(),
+                    });
+                }
+                return start_reuse(self, backend).await;
+            }
+            // API-marked but env-disabled: the double opt-in requires both, so this
+            // container runs as an ordinary ephemeral one — Testcontainers
+            // semantics — falling straight through to the unchanged path below,
+            // with a single note so a caller who forgot to set RIGHTSIZE_REUSE
+            // notices why nothing was adopted.
+            eprintln!(
+                "rightsize: .reuse(true) was requested but RIGHTSIZE_REUSE is not enabled (set \
+                 it to \"true\" or \"1\") — starting an ordinary, non-reused container instead."
+            );
+        }
+
         if let Some(net) = &self.network {
-            backend.ensure_network(net.id()).await?;
+            // Append-before-create, same discipline as a sandbox name (see
+            // `crate::reaper`'s module doc) — dedupes across repeat joiners of the
+            // same network, since `Ledger::append_network` is itself idempotent.
+            crate::reaper::before_ensure_network(
+                net.id(),
+                self.reaper_cache_dir_override.as_deref(),
+            );
+            if let Err(e) = backend.ensure_network(net.id()).await {
+                // This attempt never produced a usable network — undo the ledger
+                // append above so a discarded id doesn't sit in `.networks` forever
+                // and block the clean-shutdown deletion trigger for the rest of this
+                // process. Mirrors `create_started_container`'s `after_stop` cleanup
+                // on its own `create`/`start` failure branches.
+                crate::reaper::after_remove_network(
+                    net.id(),
+                    self.reaper_cache_dir_override.as_deref(),
+                );
+                return Err(e);
+            }
         }
 
         let (handle, mapped_ports) = create_started_container(
@@ -246,10 +407,24 @@ impl Container {
             &self.aliases,
             self.memory_limit_mb,
             self.spec_customizer.as_deref(),
+            self.reaper_cache_dir_override.as_deref(),
         )
         .await?;
 
         let name = handle.id().to_string();
+        // The reaping ledger tracks `ContainerSpec::name` (`rz-<run_id>-<seq>`), not
+        // `SandboxHandle::id()` — the two coincide for msb but NOT for docker, whose
+        // `id()` is the daemon-assigned container id. Captured here, before `handle`
+        // moves into the guard, for `stop_inner`/`Drop` to hand to
+        // `crate::reaper::after_stop`.
+        let ledger_name = handle.spec().name.clone();
+        let keep_alive = handle.spec().keep_alive;
+        // Captured before `handle` moves into the guard below — the diagnostics
+        // registry owns its own copy of the handle id/spec, independent of the
+        // guard's lifetime (see `crate::diagnostics`'s module doc).
+        let diagnostics_handle_id = handle.id().to_string();
+        let diagnostics_spec = handle.spec().clone();
+        let diagnostics_ports = mapped_ports.clone();
         let guard = ContainerGuard {
             handle: Some(handle),
             backend: backend.clone(),
@@ -258,6 +433,9 @@ impl Container {
             image: self.image.clone(),
             exposed_ports: self.exposed_ports.clone(),
             name,
+            ledger_name,
+            keep_alive,
+            reaper_cache_dir_override: self.reaper_cache_dir_override.clone(),
         };
 
         // Guarded block: install_network_links -> register -> wait. On ANY error here,
@@ -276,6 +454,21 @@ impl Container {
             let _ = guard.stop().await;
             return Err(e);
         }
+
+        // Registered only once the readiness wait has fully succeeded — mirrors the
+        // Kotlin port's resolution of this same finding (adopt path registers after
+        // its own wait re-run). A container that boots but never becomes ready must
+        // never appear in the report, so a mid-wait `diagnostics()` call cannot list
+        // it, and the wait-failure branch above has nothing to deregister.
+        crate::diagnostics::register(
+            &guard.ledger_name,
+            &guard.image,
+            guard.host(),
+            diagnostics_ports,
+            backend.clone(),
+            &diagnostics_handle_id,
+            diagnostics_spec,
+        );
 
         if let Some(post_start) = &self.post_start {
             if let Err(e) = post_start(&guard).await {
@@ -300,6 +493,7 @@ async fn create_started_container(
     aliases: &[String],
     memory_limit_mb: Option<u64>,
     spec_customizer: Option<&SpecCustomizer>,
+    reaper_cache_dir_override: Option<&std::path::Path>,
 ) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
 
@@ -325,6 +519,7 @@ async fn create_started_container(
             aliases: aliases.to_vec(),
             run_id: RunId::value().to_string(),
             memory_limit_mb,
+            keep_alive: false,
         };
 
         if let Some(customizer) = spec_customizer {
@@ -344,13 +539,46 @@ async fn create_started_container(
         // earlier.
         spec.env = dedup_env_last_wins(spec.env);
 
-        let handle = backend.create(spec).await?;
+        // The reaping ledger's own append-before-create discipline: the name must be
+        // recorded as a superset BEFORE the backend actually creates it, so a crash
+        // between this line and `backend.create` still leaves a (harmlessly
+        // not-found-on-remove) name in the ledger rather than a live sandbox with no
+        // record at all. See `crate::reaper`'s module doc.
+        crate::reaper::before_create(
+            backend,
+            &spec.name,
+            spec.keep_alive,
+            reaper_cache_dir_override,
+        );
+        let attempt_name = spec.name.clone();
+        let attempt_keep_alive = spec.keep_alive;
+
+        let handle = match backend.create(spec).await {
+            Ok(h) => h,
+            Err(e) => {
+                // This attempt never produced a live sandbox — undo the ledger append
+                // above so a discarded name doesn't sit in `.sandboxes` forever.
+                crate::reaper::after_stop(
+                    &attempt_name,
+                    attempt_keep_alive,
+                    reaper_cache_dir_override,
+                );
+                return Err(e);
+            }
+        };
         match backend.start(handle.as_ref()).await {
             Ok(()) => return Ok((handle, mapped_ports)),
             Err(e) => {
                 let _ = backend.stop(handle.as_ref()).await;
                 let _ = backend.remove(handle.as_ref()).await;
                 release_ports(&mapped_ports);
+                // Same rationale as the `create` failure branch above: this attempt's
+                // container was just torn down, so its ledger line must go too.
+                crate::reaper::after_stop(
+                    &attempt_name,
+                    attempt_keep_alive,
+                    reaper_cache_dir_override,
+                );
                 if is_port_bind_conflict(&e) {
                     last_conflict = Some(e);
                     continue;
@@ -494,6 +722,427 @@ impl WaitTarget for GuardWaitTarget<'_> {
     }
 }
 
+/// The same [`WaitTarget`] adapter [`GuardWaitTarget`] provides, but usable BEFORE a
+/// [`ContainerGuard`] exists — the reuse flow's fresh-create and adopt-verify steps
+/// both need to run a wait strategy against a raw handle/mapped-ports pair, and a
+/// failed wait there must tear the sandbox down for real (not through a keep_alive
+/// guard's own `stop()`, which would leave it running by design). See
+/// [`create_fresh_reuse`] and [`try_adopt`].
+struct RawWaitTarget<'a> {
+    host: &'a str,
+    mapped_ports: &'a [(u16, u16)],
+    exposed_ports: &'a [u16],
+    backend: &'a Arc<dyn SandboxBackend>,
+    handle: &'a dyn SandboxHandle,
+    name: &'a str,
+    image: &'a str,
+}
+
+#[async_trait::async_trait]
+impl WaitTarget for RawWaitTarget<'_> {
+    fn host(&self) -> &str {
+        self.host
+    }
+    fn mapped_port(&self, guest_port: u16) -> u16 {
+        self.mapped_ports
+            .iter()
+            .find(|&&(g, _)| g == guest_port)
+            .map(|&(_, h)| h)
+            .unwrap_or(guest_port)
+    }
+    fn exposed_guest_ports(&self) -> Vec<u16> {
+        self.exposed_ports.to_vec()
+    }
+    async fn current_logs(&self) -> String {
+        self.backend.logs(self.handle).await.unwrap_or_default()
+    }
+    fn describe(&self) -> String {
+        Container::describe(self.name, self.image)
+    }
+}
+
+/// Orchestrates a reuse-active `start()` once both opt-ins are confirmed and any
+/// custom network has already been rejected by the caller (see `Container::start`).
+/// Registry lookup miss/corrupt/stale all fall through to [`create_fresh_reuse`];
+/// a name-collision on that create (`crate::reuse::is_name_conflict`) gets exactly
+/// one retry back into [`try_adopt`], on the theory that the process that won the
+/// race is (or is about to be) the one that wrote the registry entry this retry
+/// reads.
+async fn start_reuse(
+    container: Container,
+    backend: Arc<dyn SandboxBackend>,
+) -> Result<ContainerGuard> {
+    let env = dedup_env_last_wins(container.env.clone());
+    let identity = crate::reuse::compute_identity(
+        &container.image,
+        &env,
+        &container.command,
+        &container.exposed_ports,
+        container.memory_limit_mb,
+        &container.mounts,
+    )?;
+
+    let cache_dir = container
+        .cache_dir_override
+        .clone()
+        .unwrap_or_else(crate::cache_dir::dir);
+    let registry = crate::reuse::Registry::new(&cache_dir, &identity.hash_hex);
+
+    if registry.exists() {
+        match registry.read() {
+            Some(entry) => {
+                if let Some(guard) = try_adopt(&container, &backend, &identity, &entry).await {
+                    return Ok(guard);
+                }
+                // Not adoptable (not running, wait failed, or a port this call's
+                // own exposed_ports needs was missing from the entry): best-effort
+                // remove whatever's actually there and the stale registry file,
+                // then fall through to a fresh create below.
+                backend.remove_by_name(&entry.name);
+                registry.delete();
+            }
+            None => {
+                // The file exists but didn't parse — we don't know what name it
+                // recorded, but the identity-derived name is deterministic
+                // regardless of registry content, so best-effort removal still has
+                // a target.
+                backend.remove_by_name(&identity.name);
+                registry.delete();
+            }
+        }
+    }
+
+    // Crash-mid-boot orphan recovery: by this point the adopt path has concluded
+    // there is no usable registry entry at all — missing, corrupt, or stale/failed
+    // verification (each branch above already best-effort removed what IT knew
+    // about). But a sandbox under this identity's FIXED name can still be RUNNING
+    // regardless: a process that crashed (or failed its own wait strategy) after
+    // `create_and_start_reuse_sandbox` but before `create_fresh_reuse` ever reached
+    // its registry write leaves exactly this state, and `keep_alive` hides it from
+    // every reaping/sweep path by design (see `crate::reaper`'s module doc and
+    // `docs/reuse.md`'s crash-mid-boot orphan section) — this is the only place left
+    // that can ever notice and clean it up. Ask the backend directly rather than
+    // trusting the registry's absence, and only remove when it actually reports one
+    // running: an unconditional remove_by_name here would be a wasted backend call
+    // on the overwhelmingly common genuinely-fresh-identity path, and — more
+    // importantly — this check must stay a strict subset of "is a sandbox already
+    // there right now," never "assume the identity is ours to clear": the
+    // name-collision-retry branch below is what handles a LIVE concurrent creator,
+    // and it deliberately never calls remove_by_name.
+    if find_running_by_name(&backend, &identity.name, &container.image)
+        .await
+        .is_some()
+    {
+        backend.remove_by_name(&identity.name);
+    }
+
+    match create_fresh_reuse(&container, &backend, &identity, &env, &registry).await {
+        Ok(guard) => Ok(guard),
+        Err(e) if crate::reuse::is_name_conflict(&e) => {
+            // Another process won the create race. Re-enter the adopt path once,
+            // reading whatever the winner has (or hasn't yet) written — if that
+            // doesn't pan out either, surface the ORIGINAL collision error rather
+            // than inventing a new one, and critically do NOT best-effort-remove
+            // anything here: unlike the stale-registry branch above, a name
+            // collision means a sandbox some OTHER live process just legitimately
+            // created is sitting there, and removing it out from under that
+            // process would defeat the entire point of reuse.
+            match registry.read() {
+                Some(entry) => match try_adopt(&container, &backend, &identity, &entry).await {
+                    Some(guard) => Ok(guard),
+                    None => Err(e),
+                },
+                None => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Best-effort query for whether a sandbox is already running under `name` —
+/// [`start_reuse`]'s own crash-mid-boot orphan check, built around the minimal
+/// [`ContainerSpec`] [`SandboxBackend::find_running`] actually needs (both real
+/// backends' implementations key only on `spec.name`; see `rightsize-msb` and
+/// `rightsize-docker`'s own `find_running`). `None` on any failure or "not
+/// running" — same fold as [`SandboxBackend::find_running`]'s own contract, since
+/// this is a pure best-effort probe, never a fatal error in its own right.
+async fn find_running_by_name(
+    backend: &Arc<dyn SandboxBackend>,
+    name: &str,
+    image: &str,
+) -> Option<Box<dyn SandboxHandle>> {
+    let probe = ContainerSpec::new(name, image, RunId::value());
+    backend.find_running(&probe).await.ok().flatten()
+}
+
+/// Attempts to adopt an already-running reuse sandbox recorded in `entry`: verifies
+/// it's actually running (via [`SandboxBackend::find_running`]), then re-runs the
+/// container's own wait strategy against the registry's recorded ports. `None` for
+/// any failure along the way (not running, a currently-exposed port missing from the
+/// registry, or the wait strategy failing) — every failure mode here is the caller's
+/// cue to fall back to a fresh create, never a fatal error in its own right.
+async fn try_adopt(
+    container: &Container,
+    backend: &Arc<dyn SandboxBackend>,
+    identity: &crate::reuse::Identity,
+    entry: &crate::reuse::RegistryEntry,
+) -> Option<ContainerGuard> {
+    let mut mapped_ports = Vec::with_capacity(container.exposed_ports.len());
+    for &guest_port in &container.exposed_ports {
+        let host_port = *entry.ports.get(&guest_port.to_string())?;
+        mapped_ports.push((guest_port, host_port));
+    }
+
+    let adopted_spec = ContainerSpec {
+        name: identity.name.clone(),
+        image: container.image.clone(),
+        env: dedup_env_last_wins(container.env.clone()),
+        command: container.command.clone(),
+        ports: mapped_ports
+            .iter()
+            .map(|&(guest_port, host_port)| crate::model::PortBinding {
+                host_port,
+                guest_port,
+            })
+            .collect(),
+        mounts: container.mounts.clone(),
+        network_id: None,
+        aliases: container.aliases.clone(),
+        run_id: RunId::value().to_string(),
+        memory_limit_mb: container.memory_limit_mb,
+        keep_alive: true,
+    };
+
+    let handle = match backend.find_running(&adopted_spec).await {
+        Ok(Some(h)) => h,
+        Ok(None) | Err(_) => return None,
+    };
+
+    let raw = RawWaitTarget {
+        host: "127.0.0.1",
+        mapped_ports: &mapped_ports,
+        exposed_ports: &container.exposed_ports,
+        backend,
+        handle: handle.as_ref(),
+        name: &identity.name,
+        image: &container.image,
+    };
+    if container
+        .wait_strategy
+        .wait_until_ready(&raw)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+
+    let diagnostics_handle_id = handle.id().to_string();
+    let diagnostics_spec = handle.spec().clone();
+    let diagnostics_ports = mapped_ports.clone();
+    let guard = ContainerGuard {
+        handle: Some(handle),
+        backend: backend.clone(),
+        mapped_ports: Mutex::new(mapped_ports),
+        network: None,
+        image: container.image.clone(),
+        exposed_ports: container.exposed_ports.clone(),
+        name: identity.name.clone(),
+        ledger_name: identity.name.clone(),
+        keep_alive: true,
+        reaper_cache_dir_override: container.reaper_cache_dir_override.clone(),
+    };
+    crate::diagnostics::register(
+        &guard.ledger_name,
+        &guard.image,
+        guard.host(),
+        diagnostics_ports,
+        backend.clone(),
+        &diagnostics_handle_id,
+        diagnostics_spec,
+    );
+    Some(guard)
+}
+
+/// Creates and starts a reuse sandbox under the identity-derived, FIXED
+/// `rz-reuse-<12hex>` name, retrying with freshly allocated ports on a host-port
+/// bind conflict — the same retry discipline [`create_started_container`] uses for
+/// an ordinary container. Ported here as its own helper (rather than inlined
+/// straight-line code) because a reuse sandbox's name is deterministic
+/// (identity-derived) instead of a fresh name-per-attempt, so only the ports (and
+/// the spec built from them) change between attempts; everything else about the
+/// retry — release ports, stop+remove the failed attempt, `is_port_bind_conflict`
+/// as the sole retry trigger, the same exhausted-attempts error — mirrors
+/// [`create_started_container`] exactly.
+async fn create_and_start_reuse_sandbox(
+    backend: &Arc<dyn SandboxBackend>,
+    container: &Container,
+    identity: &crate::reuse::Identity,
+    env: &[(String, String)],
+) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
+    let mut last_conflict: Option<RightsizeError> = None;
+
+    for _ in 0..PORT_BIND_ATTEMPTS {
+        let mapped_ports = allocate_ports(&container.exposed_ports)?;
+
+        let mut spec = ContainerSpec {
+            name: identity.name.clone(),
+            image: container.image.clone(),
+            env: env.to_vec(),
+            command: container.command.clone(),
+            ports: mapped_ports
+                .iter()
+                .map(|&(guest_port, host_port)| crate::model::PortBinding {
+                    host_port,
+                    guest_port,
+                })
+                .collect(),
+            mounts: container.mounts.clone(),
+            network_id: None,
+            aliases: container.aliases.clone(),
+            run_id: RunId::value().to_string(),
+            memory_limit_mb: container.memory_limit_mb,
+            keep_alive: true,
+        };
+        if let Some(customizer) = &container.spec_customizer {
+            let lookup: std::collections::HashMap<u16, u16> =
+                mapped_ports.iter().copied().collect();
+            let mapped_fn = move |guest: u16| -> u16 {
+                *lookup
+                    .get(&guest)
+                    .expect("customizer looked up an unexposed port")
+            };
+            spec = customizer(spec, &mapped_fn);
+        }
+        spec.env = dedup_env_last_wins(spec.env);
+
+        let handle = match backend.create(spec).await {
+            Ok(h) => h,
+            Err(e) => {
+                release_ports(&mapped_ports);
+                return Err(e);
+            }
+        };
+        match backend.start(handle.as_ref()).await {
+            Ok(()) => return Ok((handle, mapped_ports)),
+            Err(e) => {
+                let _ = backend.stop(handle.as_ref()).await;
+                let _ = backend.remove(handle.as_ref()).await;
+                release_ports(&mapped_ports);
+                if is_port_bind_conflict(&e) {
+                    last_conflict = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Err(RightsizeError::Backend(format!(
+        "Could not bind free host ports for {} after {PORT_BIND_ATTEMPTS} attempts — another \
+         process kept grabbing the allocated ports first; if this persists, check for a port \
+         scanner/leaked process racing the allocator on this host{}",
+        Container::describe(&identity.name, &container.image),
+        last_conflict
+            .map(|c| format!(" (last conflict: {c})"))
+            .unwrap_or_default(),
+    )))
+}
+
+/// Creates a brand-new reuse sandbox: allocates ports, creates+starts it under the
+/// identity-derived `rz-reuse-<12hex>` name with `keep_alive: true` (retrying on a
+/// host-port bind conflict — see [`create_and_start_reuse_sandbox`]), runs the wait
+/// strategy, and — only on success — writes the registry file. Any failure after
+/// resources are allocated tears the sandbox down for real (never through a
+/// keep_alive guard's own `stop()`, which would leave a possibly-broken sandbox
+/// running with no registry entry pointing at it — an actual leak, not a feature).
+async fn create_fresh_reuse(
+    container: &Container,
+    backend: &Arc<dyn SandboxBackend>,
+    identity: &crate::reuse::Identity,
+    env: &[(String, String)],
+    registry: &crate::reuse::Registry,
+) -> Result<ContainerGuard> {
+    let (handle, mapped_ports) =
+        create_and_start_reuse_sandbox(backend, container, identity, env).await?;
+
+    let raw = RawWaitTarget {
+        host: "127.0.0.1",
+        mapped_ports: &mapped_ports,
+        exposed_ports: &container.exposed_ports,
+        backend,
+        handle: handle.as_ref(),
+        name: &identity.name,
+        image: &container.image,
+    };
+    if let Err(e) = container.wait_strategy.wait_until_ready(&raw).await {
+        let _ = backend.stop(handle.as_ref()).await;
+        let _ = backend.remove(handle.as_ref()).await;
+        release_ports(&mapped_ports);
+        return Err(e);
+    }
+
+    // Success: write the registry BEFORE handing back the guard — best-effort; a
+    // write failure here shouldn't fail a boot that already succeeded (the next
+    // start() attempt just won't find a registry and will create fresh again,
+    // which is safe, just not the reuse win this call almost delivered).
+    let entry = crate::reuse::RegistryEntry {
+        name: identity.name.clone(),
+        image: container.image.clone(),
+        ports: mapped_ports
+            .iter()
+            .map(|&(guest_port, host_port)| (guest_port.to_string(), host_port))
+            .collect(),
+        created_iso: crate::reuse::now_iso8601(),
+        backend: backend.name().to_string(),
+    };
+    let _ = registry.write_atomic(&entry);
+
+    let diagnostics_handle_id = handle.id().to_string();
+    let diagnostics_spec = handle.spec().clone();
+    let diagnostics_ports = mapped_ports.clone();
+    let guard = ContainerGuard {
+        handle: Some(handle),
+        backend: backend.clone(),
+        mapped_ports: Mutex::new(mapped_ports),
+        network: None,
+        image: container.image.clone(),
+        exposed_ports: container.exposed_ports.clone(),
+        name: identity.name.clone(),
+        ledger_name: identity.name.clone(),
+        keep_alive: true,
+        reaper_cache_dir_override: container.reaper_cache_dir_override.clone(),
+    };
+    crate::diagnostics::register(
+        &guard.ledger_name,
+        &guard.image,
+        guard.host(),
+        diagnostics_ports,
+        backend.clone(),
+        &diagnostics_handle_id,
+        diagnostics_spec,
+    );
+
+    if let Some(post_start) = &container.post_start {
+        if let Err(e) = post_start(&guard).await {
+            let handle_ref = guard.handle_ref();
+            let _ = backend.stop(handle_ref).await;
+            let _ = backend.remove(handle_ref).await;
+            registry.delete();
+            for &(_, host_port) in guard
+                .mapped_ports
+                .lock()
+                .expect("mapped_ports mutex poisoned")
+                .iter()
+            {
+                free_ports().release(host_port);
+            }
+            return Err(e);
+        }
+    }
+
+    Ok(guard)
+}
+
 /// The RAII guard for a running container. Dropping it without calling
 /// [`ContainerGuard::stop`] still tears the container down — see the module docs for
 /// the two-tier cleanup story.
@@ -504,7 +1153,24 @@ pub struct ContainerGuard {
     network: Option<Arc<Network>>,
     image: String,
     exposed_ports: Vec<u16>,
+    /// `SandboxHandle::id()` at creation time — the backend-native id (msb: the
+    /// same as `ledger_name`; docker: the daemon-assigned container id). Used only
+    /// for internal error text ([`Self::describe`]); the public [`Self::name`]
+    /// accessor and the diagnostics report both use `ledger_name` instead, since
+    /// that's the name a caller can actually act on (e.g. `docker logs <name>`).
     name: String,
+    /// The reaping ledger's own name for this sandbox (`ContainerSpec::name`,
+    /// e.g. `rz-<run-id>-<seq>`) — see [`Container::start`]'s doc at the capture
+    /// site for why this differs from `name` (the raw `SandboxHandle::id()`) on
+    /// the docker backend.
+    ledger_name: String,
+    /// Mirrors `ContainerSpec::keep_alive` — a reuse sandbox is kept out of every
+    /// own-process automatic cleanup path (see [`Drop`]'s impl below).
+    keep_alive: bool,
+    /// Carries [`Container::with_reaper_cache_dir_override`]'s value across into
+    /// `stop_inner`/`Drop`'s own `crate::reaper::after_stop` calls — see that
+    /// builder's doc. `None` (the real cache dir) for every real caller.
+    reaper_cache_dir_override: Option<std::path::PathBuf>,
 }
 
 impl ContainerGuard {
@@ -534,6 +1200,20 @@ impl ContainerGuard {
     /// The host address published ports are reachable on — always loopback.
     pub fn host(&self) -> &str {
         "127.0.0.1"
+    }
+
+    /// The backend-facing sandbox name (e.g. `rz-<run-id>-<seq>`, or
+    /// `rz-reuse-<12hex>` for a reuse container — see [`Container::reuse`]). This
+    /// is always the human-readable ledger/reaping name, on every backend — never
+    /// the docker daemon's opaque container id — matching what the diagnostics
+    /// report and the reaping ledger both name this sandbox.
+    // Deliberately returns `ledger_name`, not the field literally called `name`
+    // (which holds the raw `SandboxHandle::id()` — see that field's own doc):
+    // the ledger/human name is the one a caller can act on, and is what this
+    // accessor has always been documented to return.
+    #[allow(clippy::misnamed_getters)]
+    pub fn name(&self) -> &str {
+        &self.ledger_name
     }
 
     /// The host port `guest_port` is published on.
@@ -574,6 +1254,32 @@ impl ContainerGuard {
     pub async fn exec(&self, cmd: &[&str]) -> Result<ExecResult> {
         let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
         self.backend.exec(self.require_handle()?, &cmd).await
+    }
+
+    /// Checkpoints this RUNNING container: commits its current filesystem state into
+    /// a new image via the active backend's `commit_to_image`, and returns a
+    /// [`Checkpoint`] carrying that image's ref plus this container's full spec (see
+    /// [`Checkpoint`]'s own doc for the "filesystem capture, not memory" semantics
+    /// and [`Container::from_checkpoint`] for restoring from the result).
+    ///
+    /// Gated on [`crate::backend::Capabilities::checkpoint`] BEFORE any backend
+    /// call: on a backend that doesn't support it (microsandbox today), this returns
+    /// [`RightsizeError::CheckpointUnsupported`] without ever reaching
+    /// `commit_to_image`. Requires this guard to currently be running — a state
+    /// error otherwise, same shape as [`Self::exec`]/[`Self::logs`].
+    pub async fn checkpoint(&self) -> Result<Checkpoint> {
+        if !self.backend.capabilities().checkpoint {
+            return Err(RightsizeError::CheckpointUnsupported {
+                backend: self.backend.name().to_string(),
+            });
+        }
+        let handle = self.require_handle()?;
+        let image_ref = checkpoint::generate_image_ref();
+        self.backend.commit_to_image(handle, &image_ref).await?;
+        Ok(Checkpoint {
+            image_ref,
+            spec: handle.spec().clone(),
+        })
     }
 
     /// Streams log lines to `consumer` as they're produced. Closing (or dropping) the
@@ -626,8 +1332,37 @@ impl ContainerGuard {
         let Some(handle) = self.handle.take() else {
             return; // already stopped (or never started): no-op, no backend call.
         };
+        // The diagnostics registry's own "no longer live" moment — mirrors
+        // `crate::reaper::after_stop` below, but applies to BOTH branches (keep_alive
+        // or not): a reuse sandbox stays alive on the backend, but this guard no
+        // longer holds a live handle for it, so it drops out of "what THIS process
+        // can currently report on" either way.
+        crate::diagnostics::deregister(&self.ledger_name);
+        if self.keep_alive {
+            // Reuse containers: stop() is the feature's own contract — the sandbox
+            // is LEFT RUNNING, and only in-process bookkeeping is cleared. No
+            // backend.stop/remove call (that's the whole point), no ledger touch
+            // (never listed there in the first place), and no port release: the
+            // sandbox is still bound to those host ports for real, and releasing
+            // them here would let an unrelated container in this same process grab
+            // one out from under it. Mirrors `Drop`'s own keep_alive short-circuit
+            // below. `mapped_ports` itself IS in-process bookkeeping, though, so it
+            // still gets cleared — `get_mapped_port` must agree with `is_running()`
+            // that this guard is no longer live, not keep resolving a port for a
+            // handle it no longer holds.
+            self.mapped_ports
+                .lock()
+                .expect("mapped_ports mutex poisoned")
+                .clear();
+            return;
+        }
         let _ = self.backend.stop(handle.as_ref()).await;
         let _ = self.backend.remove(handle.as_ref()).await;
+        crate::reaper::after_stop(
+            &self.ledger_name,
+            self.keep_alive,
+            self.reaper_cache_dir_override.as_deref(),
+        );
         let mut mapped = self
             .mapped_ports
             .lock()
@@ -658,6 +1393,22 @@ impl Drop for ContainerGuard {
         let Some(handle) = self.handle.take() else {
             return; // already stopped via stop(self): nothing to do.
         };
+        // Synchronous, unlike the ledger update below — the diagnostics registry is
+        // an in-memory `Mutex<Vec<_>>`, not a file, so there's no reason to defer
+        // this to the cleanup thread the way `crate::reaper::after_stop` is: this
+        // guard is done being "live" the moment Drop starts, regardless of whether
+        // the async backend teardown below has run yet.
+        crate::diagnostics::deregister(&self.ledger_name);
+        if self.keep_alive {
+            // A reuse sandbox must survive this guard's own automatic teardown
+            // entirely — no port release (the container keeps running bound to
+            // them; releasing here would let an unrelated container grab the same
+            // host port out from under it) and no cleanup-thread enqueue (which
+            // would stop+remove a container meant to outlive this process). See
+            // `ContainerSpec::keep_alive`'s doc — every own-run cleanup path leaves
+            // a keep_alive sandbox alone, and this is core's own piece of that.
+            return;
+        }
         // Release ports synchronously here — FreePorts is a plain std Mutex, no runtime
         // needed — so a dropped-not-stopped guard doesn't leak its ports even if the
         // cleanup thread is slow or (in a crash) never runs at all.
@@ -667,9 +1418,26 @@ impl Drop for ContainerGuard {
             }
             mapped.clear();
         }
+        // The Drop-path's own update to the reaping ledger — mirrors `stop_inner`'s
+        // `crate::reaper::after_stop` call, but deferred to run on the cleanup thread,
+        // AFTER `cleanup_sync` has actually been attempted (see `crate::cleanup`'s
+        // `after_teardown` doc), not here in `Drop` itself. Without this, a sandbox
+        // torn down only via this fallback path (never an explicit `.stop()`) stays
+        // listed in `.sandboxes` for the rest of THIS process's life — reachable only
+        // by a future sweep/watchdog, never by this run's own clean-shutdown deletion
+        // trigger — even though it's already gone.
+        let ledger_name = self.ledger_name.clone();
+        let reaper_cache_dir_override = self.reaper_cache_dir_override.clone();
         cleanup::enqueue(CleanupJob {
             backend: self.backend.clone(),
             container_id: handle.id().to_string(),
+            after_teardown: Some(Box::new(move || {
+                crate::reaper::after_stop(
+                    &ledger_name,
+                    false,
+                    reaper_cache_dir_override.as_deref(),
+                );
+            })),
         });
     }
 }
@@ -740,23 +1508,67 @@ mod tests {
         started: Vec<String>,
         stopped: Vec<String>,
         installed_links: Vec<(String, Vec<crate::backend::NetworkLink>)>,
+        /// `(handle id, image_ref)` for every `commit_to_image` call this backend
+        /// actually received — the checkpoint gating tests' proof that a capability
+        /// refusal never reaches the backend at all.
+        committed: Vec<(String, String)>,
     }
 
     struct FakeBackend {
         state: StdMutex<FakeBackendState>,
         fail_install_network_links: bool,
+        fail_ensure_network: bool,
+        hardware_isolated: bool,
+        checkpoint_capable: bool,
     }
     impl FakeBackend {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: StdMutex::new(FakeBackendState::default()),
                 fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: false,
             })
         }
         fn failing_install_network_links() -> Arc<Self> {
             Arc::new(Self {
                 state: StdMutex::new(FakeBackendState::default()),
                 fail_install_network_links: true,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: false,
+            })
+        }
+        fn failing_ensure_network() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: true,
+                hardware_isolated: false,
+                checkpoint_capable: false,
+            })
+        }
+        /// A fake backend that reports `capabilities().hardware_isolated == true` —
+        /// the require_isolation happy path's fixture.
+        fn hardware_isolated() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: true,
+                checkpoint_capable: false,
+            })
+        }
+        /// A fake backend that reports `capabilities().checkpoint == true` — the
+        /// checkpoint happy-path fixture.
+        fn checkpoint_capable() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: true,
             })
         }
     }
@@ -767,6 +1579,12 @@ mod tests {
         }
         fn supports_native_networks(&self) -> bool {
             false
+        }
+        fn capabilities(&self) -> crate::backend::Capabilities {
+            crate::backend::Capabilities {
+                hardware_isolated: self.hardware_isolated,
+                checkpoint: self.checkpoint_capable,
+            }
         }
         async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
             self.state.lock().unwrap().created.push(spec.clone());
@@ -812,6 +1630,9 @@ mod tests {
             unimplemented!("not exercised by this test suite")
         }
         async fn ensure_network(&self, _network_id: &str) -> Result<()> {
+            if self.fail_ensure_network {
+                return Err(RightsizeError::Backend("ensure_network failed".to_string()));
+            }
             Ok(())
         }
         async fn remove_network(&self, _network_id: &str) -> Result<()> {
@@ -839,6 +1660,18 @@ mod tests {
             Ok(())
         }
         fn cleanup_sync(&self, _container_id: &str) {}
+        fn remove_by_name(&self, _name: &str) {}
+        fn watchdog_kill_command(&self) -> Vec<String> {
+            vec!["true".to_string()]
+        }
+        async fn commit_to_image(&self, handle: &dyn SandboxHandle, image_ref: &str) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .committed
+                .push((handle.id().to_string(), image_ref.to_string()));
+            Ok(())
+        }
     }
 
     fn container_on(backend: &Arc<FakeBackend>) -> Container {
@@ -873,6 +1706,343 @@ mod tests {
         assert!(guard.is_running());
 
         guard.stop().await.unwrap();
+    }
+
+    // require_isolation: a non-isolated backend refuses to start, before any
+    // create/network work.
+    #[tokio::test]
+    async fn require_isolation_on_a_non_isolated_backend_errors_before_any_create() {
+        let backend = FakeBackend::new(); // capabilities().hardware_isolated == false
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .require_isolation(true);
+
+        let err = expect_start_err(c.start().await, "require_isolation must refuse to start");
+        assert!(
+            matches!(err, RightsizeError::IsolationRequired { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("fake"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=microsandbox"), "{msg}");
+        assert!(
+            backend.state.lock().unwrap().created.is_empty(),
+            "no sandbox may be created when isolation is required and unavailable"
+        );
+    }
+
+    // require_isolation: a hardware-isolated backend starts normally.
+    #[tokio::test]
+    async fn require_isolation_on_a_hardware_isolated_backend_starts_normally() {
+        let backend = FakeBackend::hardware_isolated();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .require_isolation(true);
+
+        let guard = c.start().await.expect("start must succeed");
+        assert!(guard.is_running());
+        assert_eq!(backend.state.lock().unwrap().created.len(), 1);
+
+        guard.stop().await.unwrap();
+    }
+
+    // require_isolation(false) (the default) never consults capabilities — a
+    // non-isolated backend is fine.
+    #[tokio::test]
+    async fn require_isolation_defaults_to_false_and_does_not_gate_a_normal_start() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.expect("start must succeed");
+        guard.stop().await.unwrap();
+    }
+
+    // =========================== checkpoint / restore ==============================
+
+    // Capability gating: a backend with checkpoint == false refuses before any
+    // backend call — the typed error, and `commit_to_image` is never invoked.
+    #[tokio::test]
+    async fn checkpoint_refuses_before_any_backend_call_when_capability_is_false() {
+        let backend = FakeBackend::new(); // capabilities().checkpoint == false
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.expect("start must succeed");
+
+        let err = guard
+            .checkpoint()
+            .await
+            .expect_err("checkpoint must refuse on a non-checkpoint-capable backend");
+        assert!(
+            matches!(err, RightsizeError::CheckpointUnsupported { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("fake"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=docker"), "{msg}");
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "commit_to_image must never be called once capability gating refuses"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // A non-running container: state error, same shape as exec/logs.
+    #[tokio::test]
+    async fn checkpoint_on_a_non_running_container_is_a_state_error() {
+        let backend = FakeBackend::checkpoint_capable();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let mut guard = c.start().await.unwrap();
+        guard.stop_inner().await; // stops it in place, without consuming the guard.
+
+        let err = guard
+            .checkpoint()
+            .await
+            .expect_err("checkpoint must refuse on a stopped guard");
+        assert!(err.to_string().contains("not running"), "{err}");
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "commit_to_image must never be called on a non-running guard"
+        );
+    }
+
+    // The returned Checkpoint carries a well-formed imageRef and the full source
+    // spec — env, command, exposed ports, memory limit and all.
+    #[tokio::test]
+    async fn checkpoint_returns_the_image_ref_and_the_full_source_spec() {
+        let backend = FakeBackend::checkpoint_capable();
+        let c = container_on(&backend)
+            .with_env("A", "1")
+            .with_exposed_ports(&[6379])
+            .with_command(&["redis-server"])
+            .with_memory_limit(256);
+        let guard = c.start().await.unwrap();
+
+        let cp = guard.checkpoint().await.expect("checkpoint must succeed");
+
+        let tag = cp
+            .image_ref
+            .strip_prefix("rightsize/checkpoint:")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the rightsize/checkpoint: prefix, got {}",
+                    cp.image_ref
+                )
+            });
+        assert_eq!(tag.len(), 12, "{}", cp.image_ref);
+        assert!(
+            tag.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{}",
+            cp.image_ref
+        );
+
+        assert_eq!(cp.spec.env, vec![("A".to_string(), "1".to_string())]);
+        assert_eq!(cp.spec.command, Some(vec!["redis-server".to_string()]));
+        assert_eq!(cp.spec.ports.len(), 1);
+        assert_eq!(cp.spec.ports[0].guest_port, 6379);
+        assert_eq!(cp.spec.memory_limit_mb, Some(256));
+
+        let committed = backend.state.lock().unwrap().committed.clone();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].0, guard.name());
+        assert_eq!(committed[0].1, cp.image_ref);
+
+        guard.stop().await.unwrap();
+    }
+
+    // `Container::from_checkpoint` applies the checkpoint's image/env/command/
+    // exposed-ports/memory-limit as defaults, and an ordinary builder call after it
+    // still overrides (command, here — with_command *replaces* rather than appends).
+    #[tokio::test]
+    async fn from_checkpoint_applies_the_spec_defaults_and_allows_overrides() {
+        let source_backend = FakeBackend::checkpoint_capable();
+        let source = container_on(&source_backend)
+            .with_env("A", "1")
+            .with_exposed_ports(&[6379])
+            .with_command(&["redis-server"])
+            .with_memory_limit(256);
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        // Defaults applied, no override.
+        let restore_backend = FakeBackend::new();
+        let restored = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .waiting_for(ReadyImmediately);
+        let restored_guard = restored.start().await.expect("restore must start");
+        let created = restore_backend.state.lock().unwrap().created[0].clone();
+        assert_eq!(created.image, cp.image_ref);
+        assert_eq!(created.env, vec![("A".to_string(), "1".to_string())]);
+        assert_eq!(created.command, Some(vec!["redis-server".to_string()]));
+        assert_eq!(created.ports.len(), 1);
+        assert_eq!(created.ports[0].guest_port, 6379);
+        assert_eq!(created.memory_limit_mb, Some(256));
+        restored_guard.stop().await.unwrap();
+
+        // Override: a caller's own `.with_command(...)` after `from_checkpoint`
+        // replaces the checkpoint spec's command rather than being ignored.
+        let override_backend = FakeBackend::new();
+        let overridden = Container::from_checkpoint(&cp)
+            .with_backend(override_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .with_command(&["redis-server", "--appendonly", "yes"]);
+        let overridden_guard = overridden.start().await.expect("restore must start");
+        let created = override_backend.state.lock().unwrap().created[0].clone();
+        assert_eq!(
+            created.command,
+            Some(vec![
+                "redis-server".to_string(),
+                "--appendonly".to_string(),
+                "yes".to_string()
+            ])
+        );
+        overridden_guard.stop().await.unwrap();
+    }
+
+    // Interlock with the reaping ledger: a restored container is registered and
+    // reaped exactly like any other — its name appears in `.sandboxes` while
+    // running, same as `dropping_a_guard_without_stop_removes_it_from_the_reaping_ledger`
+    // proves for an ordinary container.
+    #[tokio::test]
+    async fn restored_container_is_registered_in_the_reaping_ledger_like_any_other() {
+        // Test isolation seam: a per-test scratch cache dir for the reaping
+        // ledger (see `Container::with_reaper_cache_dir_override`'s doc) — without
+        // it, this test's assertion reads the real, process-wide ledger every
+        // OTHER concurrently-running test in this binary also writes to.
+        let cache_dir = temp_cache_dir("restored-ledger");
+
+        let source_backend = FakeBackend::checkpoint_capable();
+        let source = container_on(&source_backend)
+            .with_exposed_ports(&[6379])
+            .with_reaper_cache_dir_override(cache_dir.clone());
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        let restore_backend = FakeBackend::new();
+        let restored = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .with_reaper_cache_dir_override(cache_dir.clone())
+            .waiting_for(ReadyImmediately);
+        let restored_guard = restored.start().await.expect("restore must start");
+        let ledger_name = restore_backend.state.lock().unwrap().created[0]
+            .name
+            .clone();
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        assert!(
+            ledger.sandbox_names().contains(&ledger_name),
+            "a restored container must be listed in the reaping ledger like any other"
+        );
+
+        restored_guard.stop().await.unwrap();
+    }
+
+    // Diagnostics registration: a running container is reachable through the report
+    // by its unique name (`rz-<run-id>-<seq>`, unique regardless of concurrently
+    // running tests sharing the process-wide registry); stop() removes it again.
+    #[tokio::test]
+    async fn a_started_container_is_registered_for_diagnostics_and_deregistered_on_stop() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+        let name = guard.name().to_string();
+        // The report's own header delimiter — plain `report.contains(&name)` would be
+        // a substring false-positive against another concurrently-running test's
+        // longer name sharing this one as a numeric prefix (e.g. name `..-42` is a
+        // substring of a sibling test's `..-420`); the header's trailing `" ("` rules
+        // that out, since a longer name's next character there is never `(`.
+        let header = format!("-- {name} (");
+
+        let report = crate::diagnostics().await;
+        assert!(report.contains(&header), "{report}");
+
+        guard.stop().await.unwrap();
+        let report_after_stop = crate::diagnostics().await;
+        assert!(
+            !report_after_stop.contains(&header),
+            "stop() must deregister this container from the diagnostics report"
+        );
+    }
+
+    /// A wait strategy that captures a `diagnostics()` snapshot from mid-wait (before
+    /// deciding readiness), then always succeeds — proves registration happens only
+    /// AFTER the wait passes, not as soon as the guard exists.
+    struct CaptureDiagnosticsThenReady {
+        mid_wait_report: Arc<StdMutex<Option<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl WaitStrategy for CaptureDiagnosticsThenReady {
+        async fn wait_until_ready(&self, _target: &dyn WaitTarget) -> Result<()> {
+            *self.mid_wait_report.lock().unwrap() = Some(crate::diagnostics().await);
+            Ok(())
+        }
+        fn with_startup_timeout(self: Box<Self>, _timeout: Duration) -> Box<dyn WaitStrategy> {
+            self
+        }
+    }
+
+    // Registration timing: a container must never be diagnosable while its readiness
+    // wait is still running — only a FULLY-successful start (wait passed) makes it
+    // reachable through the report. Mirrors the Kotlin port's resolution of the same
+    // finding (register only after the wait succeeds).
+    #[tokio::test]
+    async fn a_container_is_not_diagnosable_until_its_readiness_wait_succeeds() {
+        let backend = FakeBackend::new();
+        let mid_wait_report = Arc::new(StdMutex::new(None));
+        let c = Container::new("redis:8.6-alpine")
+            .with_backend(backend.clone())
+            .waiting_for(CaptureDiagnosticsThenReady {
+                mid_wait_report: mid_wait_report.clone(),
+            })
+            .with_exposed_ports(&[6379]);
+
+        let guard = c.start().await.expect("this wait strategy always succeeds");
+        let name = guard.name().to_string();
+        let header = format!("-- {name} (");
+
+        let captured = mid_wait_report
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("wait strategy must have run");
+        assert!(
+            !captured.contains(&header),
+            "a container must not be diagnosable while its readiness wait is still \
+             running: {captured}"
+        );
+
+        let report_after_start = crate::diagnostics().await;
+        assert!(report_after_start.contains(&header), "{report_after_start}");
+
+        guard.stop().await.unwrap();
+    }
+
+    // Registration timing, failure branch: when the wait never succeeds, the
+    // container must never become diagnosable at all — there is nothing for the
+    // failure path's teardown to deregister.
+    #[tokio::test]
+    async fn a_container_that_never_becomes_ready_is_never_diagnosable() {
+        let backend = FakeBackend::new();
+        let precaptured_port = Arc::new(StdMutex::new(None));
+        let c = Container::new("redis:8.6-alpine")
+            .with_backend(backend.clone())
+            .waiting_for(NeverReady {
+                precaptured_port: precaptured_port.clone(),
+            })
+            .with_exposed_ports(&[6379]);
+
+        let err = expect_start_err(c.start().await, "wait strategy must fail start()");
+        assert!(err.to_string().contains("never ready"), "{err}");
+
+        let name = backend.state.lock().unwrap().created[0].name.clone();
+        let header = format!("-- {name} (");
+        let report = crate::diagnostics().await;
+        assert!(
+            !report.contains(&header),
+            "a container that never became ready must never appear in the \
+             diagnostics report: {report}"
+        );
     }
 
     // Not-running vs not-exposed disambiguation.
@@ -1069,6 +2239,35 @@ mod tests {
         );
     }
 
+    // `before_ensure_network` appends to the reaping ledger's `.networks` file BEFORE
+    // `backend.ensure_network` is even called, mirroring the sandbox-name discipline in
+    // `create_started_container`. Unlike that path, a failed `ensure_network` used to
+    // have no matching cleanup — this proves the fix: a failed ensure_network must not
+    // leave a phantom `.networks` entry behind (which would otherwise block this run's
+    // own clean-shutdown deletion trigger for the rest of the process).
+    #[tokio::test]
+    async fn ensure_network_failure_does_not_leave_a_phantom_networks_ledger_entry() {
+        // Test isolation seam: see `restored_container_is_registered_in_the_
+        // reaping_ledger_like_any_other`'s own comment.
+        let cache_dir = temp_cache_dir("ensure-network-failure-ledger");
+
+        let backend = FakeBackend::failing_ensure_network();
+        let net = Arc::new(Network::new_network());
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_network(&net)
+            .with_reaper_cache_dir_override(cache_dir.clone());
+
+        let err = expect_start_err(c.start().await, "ensure_network failure must propagate");
+        assert!(err.to_string().contains("ensure_network failed"), "{err}");
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        assert!(
+            !ledger.network_ids().contains(&net.id().to_string()),
+            "a failed ensure_network must not leave a phantom .networks entry behind"
+        );
+    }
+
     // U7: stop is a no-op before start, and Drop after an explicit stop() doesn't
     // double-release ports or double-call the backend (stop() itself can't be called
     // twice in Rust: it consumes the guard by value, so "calling stop() twice" is a
@@ -1228,6 +2427,10 @@ mod tests {
             Ok(())
         }
         fn cleanup_sync(&self, _container_id: &str) {}
+        fn remove_by_name(&self, _name: &str) {}
+        fn watchdog_kill_command(&self) -> Vec<String> {
+            vec!["true".to_string()]
+        }
     }
 
     #[tokio::test]
@@ -1238,6 +2441,44 @@ mod tests {
             .waiting_for(ReadyImmediately)
             .with_exposed_ports(&[6379]);
         let guard = c.start().await.expect("must eventually succeed");
+        assert!(guard.is_running());
+        assert_eq!(
+            backend.create_count(),
+            3,
+            "each attempt recreates the container"
+        );
+        let started_ports = backend.started_ports.lock().unwrap().clone();
+        assert_eq!(started_ports.len(), 3, "start attempted three times");
+        let distinct: std::collections::HashSet<u16> = started_ports.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            started_ports.len(),
+            "ports are reallocated per attempt, not reused after a conflict"
+        );
+        guard.stop().await.unwrap();
+    }
+
+    /// A reuse fresh-create (no registry entry yet) must retry with fresh host
+    /// ports on a bind conflict exactly like an ordinary container's `start()`
+    /// does (see [`u6_start_retries_with_fresh_host_ports_on_a_bind_conflict`]) —
+    /// the sibling ports use the same retry discipline for their own reuse
+    /// fresh-create path, and this crate must not silently fail-fast instead on
+    /// the very first transient port collision a reuse boot happens to hit.
+    #[tokio::test]
+    async fn u6_reuse_fresh_create_retries_with_fresh_host_ports_on_a_bind_conflict() {
+        let backend = PortConflictBackend::new(2);
+        let cache_dir = temp_cache_dir("fresh-create-port-conflict");
+        let c = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .waiting_for(ReadyImmediately)
+            .with_exposed_ports(&[6379])
+            .reuse(true);
+        let guard = c
+            .start()
+            .await
+            .expect("reuse fresh-create must retry and eventually succeed");
         assert!(guard.is_running());
         assert_eq!(
             backend.create_count(),
@@ -1536,5 +2777,656 @@ mod tests {
             !free_ports().issued_view().contains(&port),
             "Drop must release mapped ports synchronously even without an explicit stop()"
         );
+    }
+
+    // The Drop-path's own opportunity to update the reaping ledger (see
+    // `crate::cleanup`'s `after_teardown` doc) — without this, a sandbox torn down
+    // only via `Drop` (never an explicit `.stop()`) stays listed in `.sandboxes` for
+    // the rest of this process's life even though it's already gone, and this run's
+    // own clean-shutdown deletion trigger never fires for it.
+    #[tokio::test]
+    async fn dropping_a_guard_without_stop_removes_it_from_the_reaping_ledger() {
+        // Test isolation seam: see `restored_container_is_registered_in_the_
+        // reaping_ledger_like_any_other`'s own comment — this test's ledger file
+        // is now exclusive to it, not the real, process-wide one every other test
+        // in this binary also writes to.
+        let cache_dir = temp_cache_dir("dropping-guard-ledger");
+
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_reaper_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+        let ledger_name = backend.state.lock().unwrap().created[0].name.clone();
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        assert!(
+            ledger.sandbox_names().contains(&ledger_name),
+            "before_create must have listed the sandbox in the reaping ledger"
+        );
+
+        drop(guard); // no explicit stop(): the cleanup thread's fallback path runs instead.
+
+        // The cleanup thread updates the ledger on a background thread, genuinely
+        // asynchronously relative to this test (not a cross-test race — this
+        // ledger file is exclusive to this test now) — poll until this entry is
+        // gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ledger.sandbox_names().contains(&ledger_name) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !ledger.sandbox_names().contains(&ledger_name),
+            "Drop's cleanup-thread fallback must remove the sandbox from the reaping ledger \
+             too, not just tear it down on the backend"
+        );
+    }
+
+    // ======================================================================
+    // Container reuse
+    // ======================================================================
+
+    fn temp_cache_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rz-reuse-container-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[derive(Default)]
+    struct ReuseFakeState {
+        created: Vec<ContainerSpec>,
+        started: Vec<String>,
+        stopped: Vec<String>,
+        removed: Vec<String>,
+        removed_by_name: Vec<String>,
+        running: std::collections::HashSet<String>,
+        find_running_calls: usize,
+    }
+
+    /// A fake backend for the reuse flow's own tests: unlike [`FakeBackend`] (which
+    /// has no notion of "currently running by name" at all), this tracks a
+    /// `running` name set directly, so [`SandboxBackend::find_running`] and
+    /// [`SandboxBackend::remove_by_name`] behave like a real backend's would —
+    /// exactly what the adopt/stale/collision scenarios below need to drive.
+    struct ReuseFakeBackend {
+        state: StdMutex<ReuseFakeState>,
+        conflict_once_for_name: StdMutex<Option<String>>,
+        on_conflict: StdMutex<Option<Box<dyn FnMut() + Send>>>,
+    }
+
+    impl ReuseFakeBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(ReuseFakeState::default()),
+                conflict_once_for_name: StdMutex::new(None),
+                on_conflict: StdMutex::new(None),
+            })
+        }
+
+        /// Marks `name` as already running, as if some other (or earlier, same-
+        /// process) call had already created and started it.
+        fn mark_running(&self, name: &str) {
+            self.state.lock().unwrap().running.insert(name.to_string());
+        }
+
+        /// The NEXT `create()` call for a spec named `name` fails with a typed
+        /// [`RightsizeError::NameConflict`] instead of succeeding (armed once,
+        /// consumed on that call), running `on_conflict` right before returning the
+        /// error — the test's chance to simulate the concurrent winner's own
+        /// side effects (marking itself running, writing the registry) landing
+        /// right as this call loses the race.
+        fn fail_next_create_with_conflict(
+            &self,
+            name: &str,
+            on_conflict: impl FnMut() + Send + 'static,
+        ) {
+            *self.conflict_once_for_name.lock().unwrap() = Some(name.to_string());
+            *self.on_conflict.lock().unwrap() = Some(Box::new(on_conflict));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for ReuseFakeBackend {
+        fn name(&self) -> &str {
+            "reuse-fake"
+        }
+        fn supports_native_networks(&self) -> bool {
+            false
+        }
+        async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
+            {
+                let mut conflict = self.conflict_once_for_name.lock().unwrap();
+                if conflict.as_deref() == Some(spec.name.as_str()) {
+                    *conflict = None;
+                    drop(conflict);
+                    if let Some(cb) = self.on_conflict.lock().unwrap().as_mut() {
+                        cb();
+                    }
+                    return Err(RightsizeError::NameConflict {
+                        message: format!("sandbox '{}' already exists", spec.name),
+                        source: None,
+                    });
+                }
+            }
+            self.state.lock().unwrap().created.push(spec.clone());
+            Ok(Box::new(FakeHandle {
+                id: spec.name.clone(),
+                spec,
+            }))
+        }
+        async fn start(&self, handle: &dyn SandboxHandle) -> Result<()> {
+            let id = handle.id().to_string();
+            let mut state = self.state.lock().unwrap();
+            state.started.push(id.clone());
+            state.running.insert(id);
+            Ok(())
+        }
+        async fn stop(&self, handle: &dyn SandboxHandle) -> Result<()> {
+            let id = handle.id().to_string();
+            let mut state = self.state.lock().unwrap();
+            state.stopped.push(id.clone());
+            state.running.remove(&id);
+            Ok(())
+        }
+        async fn remove(&self, handle: &dyn SandboxHandle) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .removed
+                .push(handle.id().to_string());
+            Ok(())
+        }
+        async fn exec(&self, _handle: &dyn SandboxHandle, cmd: &[String]) -> Result<ExecResult> {
+            Ok(ExecResult {
+                exit_code: 0,
+                stdout: cmd.join(" "),
+                stderr: String::new(),
+            })
+        }
+        async fn logs(&self, _handle: &dyn SandboxHandle) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn follow_logs(
+            &self,
+            _handle: &dyn SandboxHandle,
+            _consumer: Box<dyn Fn(String) + Send + Sync>,
+        ) -> Result<crate::backend::FollowHandle> {
+            unimplemented!("not exercised by the reuse test suite")
+        }
+        async fn ensure_network(&self, _network_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_network(&self, _network_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn cleanup_sync(&self, _container_id: &str) {}
+        fn remove_by_name(&self, name: &str) {
+            let mut state = self.state.lock().unwrap();
+            state.removed_by_name.push(name.to_string());
+            state.running.remove(name);
+        }
+        fn watchdog_kill_command(&self) -> Vec<String> {
+            vec!["true".to_string()]
+        }
+        async fn find_running(
+            &self,
+            spec: &ContainerSpec,
+        ) -> Result<Option<Box<dyn SandboxHandle>>> {
+            let mut state = self.state.lock().unwrap();
+            state.find_running_calls += 1;
+            if state.running.contains(&spec.name) {
+                Ok(Some(Box::new(FakeHandle {
+                    id: spec.name.clone(),
+                    spec: spec.clone(),
+                })))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    fn sample_registry_entry(
+        identity: &crate::reuse::Identity,
+        host_port: u16,
+    ) -> crate::reuse::RegistryEntry {
+        crate::reuse::RegistryEntry {
+            name: identity.name.clone(),
+            image: "redis:7-alpine".to_string(),
+            ports: std::collections::BTreeMap::from([("6379".to_string(), host_port)]),
+            created_iso: "2025-01-01T00:00:00Z".to_string(),
+            backend: "reuse-fake".to_string(),
+        }
+    }
+
+    // Double opt-in: only the marker-AND-env-both-on combination produces a reuse
+    // (`rz-reuse-<hash>`-named, `keep_alive`) sandbox; every other combination
+    // behaves exactly like an ordinary ephemeral container.
+    #[tokio::test]
+    async fn reuse_double_opt_in_gating_all_four_combinations() {
+        async fn is_reuse_name(marker: bool, env_enabled: bool) -> bool {
+            let backend = ReuseFakeBackend::new();
+            let cache_dir = temp_cache_dir("gating");
+            let guard = Container::new("redis:7-alpine")
+                .with_backend(backend)
+                .with_cache_dir_override(cache_dir)
+                .with_reuse_env_override(env_enabled)
+                .with_exposed_ports(&[6379])
+                .waiting_for(ReadyImmediately)
+                .reuse(marker)
+                .start()
+                .await
+                .expect("start must succeed regardless of the gating outcome");
+            let reused = guard.name().starts_with("rz-reuse-");
+            guard.stop().await.unwrap();
+            reused
+        }
+
+        assert!(
+            is_reuse_name(true, true).await,
+            "marker on + env on must produce a reuse name"
+        );
+        assert!(
+            !is_reuse_name(true, false).await,
+            "marker on, env off: ordinary container"
+        );
+        assert!(
+            !is_reuse_name(false, true).await,
+            "env on, marker off: reuse never considered"
+        );
+        assert!(
+            !is_reuse_name(false, false).await,
+            "both off: ordinary container"
+        );
+    }
+
+    // Adopt path: a registry hit whose sandbox the backend reports running, and
+    // whose re-run wait strategy succeeds, adopts — no create() call, and the
+    // guard's mapped port comes straight from the registry, not a fresh allocation.
+    #[tokio::test]
+    async fn adopt_path_registry_hit_running_and_wait_ok_skips_create_and_uses_registry_ports() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("adopt-hit");
+        let identity =
+            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
+                .unwrap();
+
+        // A previous process already created, started, and registered this
+        // sandbox, then exited cleanly (reuse containers are never torn down by
+        // clean exit) — this process's first start() should adopt it.
+        backend.mark_running(&identity.name);
+        crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+            .write_atomic(&sample_registry_entry(&identity, 40321))
+            .unwrap();
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("adopt must succeed");
+
+        assert_eq!(guard.name(), identity.name);
+        assert_eq!(
+            guard.get_mapped_port(6379).unwrap(),
+            40321,
+            "must use the REGISTRY's port, not a freshly allocated one"
+        );
+        {
+            let state = backend.state.lock().unwrap();
+            assert!(
+                state.created.is_empty(),
+                "adopt must not call backend.create"
+            );
+            assert!(state.find_running_calls >= 1);
+        }
+        guard.stop().await.unwrap();
+    }
+
+    // Stale registry: the backend reports the recorded sandbox is NOT running ->
+    // best-effort remove-by-name + delete the registry file, then fall through to a
+    // fresh create that rewrites the registry.
+    #[tokio::test]
+    async fn stale_registry_not_running_removes_and_creates_fresh_and_rewrites_registry() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("adopt-stale");
+        let identity =
+            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
+                .unwrap();
+
+        crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+            .write_atomic(&sample_registry_entry(&identity, 40321))
+            .unwrap();
+        // Deliberately NOT marked running: find_running must report `None`.
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir.clone())
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("a stale registry must fall back to a fresh create");
+
+        assert_eq!(guard.name(), identity.name);
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.created.len(), 1, "must create exactly once");
+            assert_eq!(
+                state.removed_by_name,
+                vec![identity.name.clone()],
+                "the stale sandbox must be best-effort removed by name"
+            );
+        }
+
+        let rewritten = crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+            .read()
+            .expect("the registry must be rewritten after the fresh create");
+        let new_port = *rewritten.ports.get("6379").unwrap();
+        assert_eq!(guard.get_mapped_port(6379).unwrap(), new_port);
+
+        guard.stop().await.unwrap();
+    }
+
+    // Corrupted registry JSON: unparseable, but still on disk — best-effort remove
+    // the identity-derived name (the only name we can know without parsing the
+    // file) and the file itself, then fall through to a fresh create.
+    #[tokio::test]
+    async fn corrupted_registry_json_falls_back_to_fresh_create() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("adopt-corrupt");
+        let identity =
+            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
+                .unwrap();
+
+        let reuse_dir = cache_dir.join("reuse");
+        std::fs::create_dir_all(&reuse_dir).unwrap();
+        std::fs::write(
+            reuse_dir.join(format!("{}.json", identity.hash_hex)),
+            b"not json",
+        )
+        .unwrap();
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir.clone())
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("corrupt registry JSON must fall back to a fresh create, not fail start()");
+
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.created.len(), 1);
+            assert_eq!(state.removed_by_name, vec![identity.name.clone()]);
+        }
+        assert!(
+            crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+                .read()
+                .is_some(),
+            "a valid registry must exist after the fresh create"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Stop semantics: stop() on a reuse-active guard clears only in-process
+    // bookkeeping — no backend.stop/remove call, and the sandbox never appears in
+    // the reaping ledger (never listed there in the first place).
+    #[tokio::test]
+    async fn stop_on_a_reuse_container_leaves_the_sandbox_running_and_never_touches_the_ledger() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("stop-semantics");
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir.clone())
+            .with_reuse_env_override(true)
+            // Test isolation seam: see `restored_container_is_registered_in_the_
+            // reaping_ledger_like_any_other`'s own comment. Shares the same scratch
+            // dir as the reuse registry override above — the reuse registry lives
+            // under `<dir>/reuse/`, the reaper ledger under `<dir>/runs/`, so the
+            // two don't collide.
+            .with_reaper_cache_dir_override(cache_dir.clone())
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .unwrap();
+        let name = guard.name().to_string();
+        assert!(name.starts_with("rz-reuse-"));
+
+        guard.stop().await.unwrap();
+
+        {
+            let state = backend.state.lock().unwrap();
+            assert!(
+                state.stopped.is_empty(),
+                "stop() must not call backend.stop for a reuse container"
+            );
+            assert!(
+                state.removed.is_empty(),
+                "stop() must not call backend.remove for a reuse container"
+            );
+        }
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        assert!(
+            !ledger.sandbox_names().contains(&name),
+            "a reuse container must never appear in the reaping ledger, before or after stop()"
+        );
+    }
+
+    // Reuse + a custom network is a typed, fail-fast error — never reaches create().
+    #[tokio::test]
+    async fn reuse_plus_custom_network_is_a_typed_error() {
+        let backend = ReuseFakeBackend::new();
+        let net = Arc::new(Network::new_network());
+        let start_result = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_reuse_env_override(true)
+            .with_network(&net)
+            .reuse(true)
+            .start()
+            .await;
+        let err = expect_start_err(start_result, "reuse + a custom network must fail fast");
+        assert!(
+            matches!(err, RightsizeError::ReuseNetworkConflict { .. }),
+            "{err}"
+        );
+        assert!(
+            backend.state.lock().unwrap().created.is_empty(),
+            "must fail before any create() call"
+        );
+    }
+
+    // Name collision on create (another process won the race): exactly one retry
+    // back into the adopt path, using whatever the winner has by then written.
+    #[tokio::test]
+    async fn name_collision_on_create_retries_the_adopt_path_once() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("collision");
+        let identity =
+            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
+                .unwrap();
+
+        // Deliberately NOT marked running yet: this call's own crash-mid-boot
+        // orphan check (find_running, right before create) must see nothing and
+        // must not remove anything — the concurrent winner only actually starts
+        // (and registers) its sandbox at the exact moment THIS call's create()
+        // loses the race, simulated below inside `on_conflict`, not before it.
+        let entry = sample_registry_entry(&identity, 41111);
+        let winner_cache_dir = cache_dir.clone();
+        let winner_hash = identity.hash_hex.clone();
+        let winner_backend = backend.clone();
+        let winner_name = identity.name.clone();
+        backend.fail_next_create_with_conflict(&identity.name, move || {
+            // Simulate the concurrent winner's own create+start landing (marking
+            // itself running) and its registry write, right as this call loses
+            // the create race.
+            winner_backend.mark_running(&winner_name);
+            let _ =
+                crate::reuse::Registry::new(&winner_cache_dir, &winner_hash).write_atomic(&entry);
+        });
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("a name collision must retry the adopt path and succeed");
+
+        assert_eq!(guard.name(), identity.name);
+        assert_eq!(guard.get_mapped_port(6379).unwrap(), 41111);
+        assert_eq!(
+            backend.state.lock().unwrap().created.len(),
+            0,
+            "the losing create() attempt must not count as a successful create"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // ======================================================================
+    // Crash-mid-boot orphan recovery (fresh-create's own find_running/remove
+    // check, run once the adopt path has already concluded there is no usable
+    // registry entry) — see docs/reuse.md's own section on this.
+    // ======================================================================
+
+    // (a) A sandbox is running under the identity's fixed name, but NO registry
+    // entry points at it at all — exactly what a process that crashed (or failed
+    // its own wait strategy) between `create` and the registry write leaves
+    // behind. The next start() for the same identity must find it via
+    // find_running and best-effort remove it BEFORE attempting a fresh create.
+    #[tokio::test]
+    async fn fresh_create_removes_a_running_but_unregistered_orphan_before_creating() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("orphan-recovery");
+        let identity =
+            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
+                .unwrap();
+
+        // No registry file at all — but a sandbox under the identity's name is
+        // already running, exactly as a crash-mid-boot orphan would leave it.
+        backend.mark_running(&identity.name);
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("an orphaned running sandbox must not fail start(), just be replaced");
+
+        assert_eq!(guard.name(), identity.name);
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(
+                state.removed_by_name,
+                vec![identity.name.clone()],
+                "the orphaned sandbox must be best-effort removed before the fresh create"
+            );
+            assert_eq!(state.created.len(), 1, "must still create exactly once");
+            assert!(state.find_running_calls >= 1);
+        }
+
+        guard.stop().await.unwrap();
+    }
+
+    // (b) A registry entry IS present and verifies (adopt succeeds) — the
+    // orphan-recovery find_running/remove step must never even run: adopt
+    // short-circuits before `start_reuse` ever reaches it, so no remove_by_name
+    // call happens.
+    #[tokio::test]
+    async fn adopt_with_a_verified_registry_never_calls_remove_by_name() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("orphan-recovery-adopt");
+        let identity =
+            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
+                .unwrap();
+
+        backend.mark_running(&identity.name);
+        crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+            .write_atomic(&sample_registry_entry(&identity, 40321))
+            .unwrap();
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("a verified registry entry must adopt");
+
+        assert_eq!(guard.name(), identity.name);
+        assert!(
+            backend.state.lock().unwrap().removed_by_name.is_empty(),
+            "adopting a verified registry entry must never call remove_by_name"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // (c) No registry AND nothing running under the identity's name —
+    // find_running reports None, so remove_by_name must never be called; the
+    // fresh create proceeds exactly as it always has for a genuinely first-time
+    // identity.
+    #[tokio::test]
+    async fn fresh_create_with_nothing_running_never_calls_remove_by_name() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("orphan-recovery-clean");
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("a genuinely fresh identity must create normally");
+
+        {
+            let state = backend.state.lock().unwrap();
+            assert!(
+                state.removed_by_name.is_empty(),
+                "nothing was running, so remove_by_name must never be called"
+            );
+            assert!(
+                state.find_running_calls >= 1,
+                "the orphan-recovery check must still run"
+            );
+            assert_eq!(state.created.len(), 1);
+        }
+
+        guard.stop().await.unwrap();
     }
 }

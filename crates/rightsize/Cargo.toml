@@ -16,3 +16,12 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 regex-lite = { workspace = true }
+# The reaping ledger's `runs/<run-id>.json` — a small, cross-language-contract JSON
+# shape (see `reaper::ledger::RunRecord`). Same versions already pinned workspace-wide
+# for rightsize-msb/rightsize-docker's own JSON layers.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The container-reuse identity hash (see `reuse::compute_identity`) — a
+# cross-language-contract sha256 over a canonical spec serialization. Same version
+# already pinned workspace-wide for rightsize-msb's checksum verification.
+sha2 = { workspace = true }

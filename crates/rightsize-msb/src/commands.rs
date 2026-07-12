@@ -145,6 +145,7 @@ mod tests {
             aliases: vec!["redis".to_string()],
             run_id: "abc".to_string(),
             memory_limit_mb: None,
+            keep_alive: false,
         }
     }
 

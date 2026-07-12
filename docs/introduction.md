@@ -79,7 +79,8 @@ Both backends satisfy one behavioral contract (`SandboxBackend`), verified by a
 shared contract test suite — tests you write run unchanged on either. A handful of
 edges are backend-specific rather than behavioral divergences; see
 [Backend differences](./backends.md#backend-differences) before you hit one in the
-wild.
+wild. That same contract is verified identically in the Kotlin and TypeScript
+ports of this library — see [Cross-Language Parity](./parity.md).
 
 ## Honest limits, up front
 

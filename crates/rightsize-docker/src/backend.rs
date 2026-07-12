@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rightsize::backend::{FollowHandle, SandboxBackend, SandboxHandle};
+use rightsize::backend::{Capabilities, FollowHandle, SandboxBackend, SandboxHandle};
 use rightsize::error::{Result, RightsizeError};
 use rightsize::model::{ContainerSpec, ExecResult};
 
@@ -28,11 +28,17 @@ use crate::json::{
 /// daemon SIGKILLs it.
 const STOP_TIMEOUT_SECS: u64 = 10;
 
-/// The label every container this backend creates carries, so `close()`/the reaper
-/// can find exactly this run's containers without touching anyone else's. This is
-/// a cross-process wire format, not Rust API surface, so it doesn't need to match
-/// this crate's own naming conventions.
+/// The label every non-`keep_alive` container this backend creates carries, so
+/// `close()`/the reaper can find exactly this run's containers without touching
+/// anyone else's. This is a cross-process wire format, not Rust API surface, so it
+/// doesn't need to match this crate's own naming conventions.
 const RUN_ID_LABEL_KEY: &str = "dev.rightsize.run_id";
+
+/// The label a `keep_alive` (reuse) container carries INSTEAD of
+/// [`RUN_ID_LABEL_KEY`] — deliberately a different key, so `close()`'s run-id label
+/// filter (and any run-id-scoped listing) structurally never matches a reuse
+/// container. See `ContainerSpec::keep_alive`'s doc.
+const REUSE_LABEL_KEY: &str = "dev.rightsize.reuse";
 
 /// A Docker container reference: the daemon-assigned id plus the spec that created
 /// it. No mutable per-container state (see the module docs) — every operation is a
@@ -209,6 +215,27 @@ impl DockerBackend {
             .insert(network_id.to_string(), id.clone());
         Ok(id)
     }
+
+    /// A live `GET /networks?filters={"name":[name]}` lookup, independent of the
+    /// in-memory `network_ids` cache — [`Self::remove_network`]'s cache-miss
+    /// fallback, so removing a network created by a DIFFERENT process (the reaping
+    /// sweep's whole purpose) doesn't silently no-op just because THIS backend
+    /// instance never itself called [`Self::ensure_network_get_id`] for it.
+    /// Best-effort: `None` on any failure (request error, non-200, no match,
+    /// unparseable body), matching `remove_network`'s own best-effort contract.
+    async fn lookup_network_id_by_name(&self, name: &str) -> Option<String> {
+        let filters = NameFilter {
+            name: vec![name.to_string()],
+        };
+        let filters = serde_json::to_string(&filters).ok()?;
+        let list_path = format!("/networks?filters={}", encode_query_value(&filters));
+        let list = self.client.request("GET", &list_path, None).await.ok()?;
+        if list.status != 200 {
+            return None;
+        }
+        let entries: Vec<ListedEntry> = serde_json::from_slice(&list.body).ok()?;
+        entries.into_iter().next().map(|e| e.id)
+    }
 }
 
 /// Builds the `POST /containers/create` JSON body: `Image`, `Env[]`, `Cmd[]?`,
@@ -249,12 +276,18 @@ fn build_create_body(spec: &ContainerSpec) -> CreateContainerBody {
         })
         .collect();
 
+    let labels = if spec.keep_alive {
+        BTreeMap::from([(REUSE_LABEL_KEY.to_string(), reuse_label_value(spec))])
+    } else {
+        BTreeMap::from([(RUN_ID_LABEL_KEY.to_string(), spec.run_id.clone())])
+    };
+
     CreateContainerBody {
         image: spec.image.clone(),
         env,
         cmd: spec.command.clone(),
         exposed_ports,
-        labels: BTreeMap::from([(RUN_ID_LABEL_KEY.to_string(), spec.run_id.clone())]),
+        labels,
         host_config: HostConfig {
             port_bindings,
             binds,
@@ -262,6 +295,30 @@ fn build_create_body(spec: &ContainerSpec) -> CreateContainerBody {
             memory: spec.memory_limit_mb.map(|mb| mb * 1024 * 1024),
         },
     }
+}
+
+/// The 12-hex-char value a `keep_alive` container's [`REUSE_LABEL_KEY`] label
+/// carries. Every real reuse container `rightsize::container`'s reuse flow builds
+/// always carries the exact `rz-reuse-<12hex>` name that hash is derived from (see
+/// `rightsize::reuse::compute_identity`) — this extracts that suffix directly,
+/// rather than re-deriving the hash itself, so the label always agrees with the
+/// name regardless of which language built the spec. Falls back to a cheap,
+/// dependency-free FNV-1a-style hash of `spec.name` for a `keep_alive` spec built
+/// directly with some OTHER name shape (only ever a unit test constructing
+/// `ContainerSpec` by hand) — deterministic, just not meaningfully tied to any
+/// cross-language identity.
+fn reuse_label_value(spec: &ContainerSpec) -> String {
+    if let Some(hex) = spec.name.strip_prefix("rz-reuse-") {
+        if hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return hex.to_string();
+        }
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in spec.name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    format!("{:012x}", hash & 0xFFFF_FFFF_FFFF)
 }
 
 /// True if `message` (a daemon error body/exception message) names a host-port bind
@@ -335,6 +392,14 @@ impl SandboxBackend for DockerBackend {
         true
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            // Containers share the host kernel — no per-sandbox microVM boundary.
+            hardware_isolated: false,
+            checkpoint: true,
+        }
+    }
+
     async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
         self.pull_if_missing(&spec.image).await?;
 
@@ -343,6 +408,16 @@ impl SandboxBackend for DockerBackend {
             .expect("CreateContainerBody has no non-serializable fields");
         let path = format!("/containers/create?name={}", encode_query_value(&spec.name));
         let resp = self.client.request("POST", &path, Some(&body)).await?;
+        if resp.status == 409 {
+            let message = String::from_utf8_lossy(&resp.body).into_owned();
+            return Err(RightsizeError::NameConflict {
+                message: format!(
+                    "docker container name '{}' is already in use (HTTP 409): {message}",
+                    spec.name
+                ),
+                source: None,
+            });
+        }
         if resp.status >= 400 {
             let message = String::from_utf8_lossy(&resp.body).into_owned();
             return Err(RightsizeError::Backend(format!(
@@ -573,11 +648,22 @@ impl SandboxBackend for DockerBackend {
     }
 
     async fn remove_network(&self, network_id: &str) -> Result<()> {
-        let daemon_id = self
+        let cached = self
             .network_ids
             .lock()
             .expect("network_ids mutex poisoned")
             .remove(network_id);
+        // Cache miss: this backend instance never itself called `ensure_network` for
+        // `network_id` — the reaping sweep's whole point is removing resources a
+        // DIFFERENT (dead) process created, so `network_ids` (populated only by THIS
+        // instance's own `ensure_network_get_id` calls) is empty for it. Fall back to
+        // a live daemon lookup by name — the same "must not depend on in-process
+        // state" requirement `remove_by_name`'s container-level lookup already
+        // satisfies (`blocking_find_container_id_by_name`).
+        let daemon_id = match cached {
+            Some(id) => Some(id),
+            None => self.lookup_network_id_by_name(network_id).await,
+        };
         if let Some(id) = daemon_id {
             let path = format!("/networks/{id}");
             let _ = self.client.request("DELETE", &path, None).await; // best-effort
@@ -613,6 +699,82 @@ impl SandboxBackend for DockerBackend {
         // (see rightsize::cleanup), never in async context (decision 1).
         let _ = blocking_force_remove(self.client.socket_path(), container_id, STOP_TIMEOUT_SECS);
     }
+
+    fn remove_by_name(&self, name: &str) {
+        // The reaping ledger persists NAMES, but every other call on this backend is
+        // keyed by the daemon-assigned id already carried on a `Handle` — so this
+        // resolves name -> id first (a list-by-name-filter GET), then force-removes
+        // that id. SYNCHRONOUS, blocking std I/O only (see
+        // `SandboxBackend::remove_by_name`'s doc for why) — the same transport shape
+        // `cleanup_sync`/`blocking_force_remove` already use, extended with a body
+        // read since this call needs the list response, not just a status code.
+        let socket = self.client.socket_path();
+        let Some(id) = blocking_find_container_id_by_name(socket, name) else {
+            return; // not found (or the lookup itself failed): silently fine.
+        };
+        let _ = blocking_force_remove(socket, &id, STOP_TIMEOUT_SECS);
+    }
+
+    /// `GET /containers/json?filters={"name":["^/<name>$"],"status":["running"]}` —
+    /// the reuse adopt path's own query (`rightsize::reuse`). The `name` filter is
+    /// anchored the same way `blocking_find_container_id_by_name` anchors it
+    /// (Docker's `name` filter is substring-by-default); `status` is explicit
+    /// rather than relying on the daemon's own "no `all=true`" default meaning
+    /// running-only, so the intent reads directly off the request. `Ok(None)` for
+    /// no match OR a non-200 response — matching this backend's other best-effort
+    /// list-then-not-found reads (e.g. `lookup_network_id_by_name`).
+    async fn find_running(&self, spec: &ContainerSpec) -> Result<Option<Box<dyn SandboxHandle>>> {
+        let filters = format!(r#"{{"name":["^/{}$"],"status":["running"]}}"#, spec.name);
+        let path = format!("/containers/json?filters={}", encode_query_value(&filters));
+        let resp = self.client.request("GET", &path, None).await?;
+        if resp.status != 200 {
+            return Ok(None);
+        }
+        let entries: Vec<ListedEntry> = serde_json::from_slice(&resp.body).unwrap_or_default();
+        Ok(entries.into_iter().next().map(|entry| {
+            Box::new(Handle {
+                id: entry.id,
+                spec: spec.clone(),
+            }) as Box<dyn SandboxHandle>
+        }))
+    }
+
+    /// `POST /commit?container=&repo=&tag=` — the checkpoint feature's own backend
+    /// primitive (`rightsize::ContainerGuard::checkpoint`). `image_ref` is already
+    /// the full `rightsize/checkpoint:<12hex>` reference the core allocator chose;
+    /// this only needs to split it into the `repo`/`tag` pair the endpoint wants
+    /// (the same split `split_repo_tag` already does for image pulls).
+    async fn commit_to_image(&self, handle: &dyn SandboxHandle, image_ref: &str) -> Result<()> {
+        let (repo, tag) = split_repo_tag(image_ref);
+        let path = format!(
+            "/commit?container={}&repo={}&tag={}",
+            encode_query_value(handle.id()),
+            encode_query_value(&repo),
+            encode_query_value(&tag)
+        );
+        let resp = self.client.request("POST", &path, None).await?;
+        if resp.status >= 400 {
+            return Err(RightsizeError::Backend(format!(
+                "docker could not commit container {} to image '{image_ref}' (HTTP {}): {}",
+                handle.id(),
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            )));
+        }
+        Ok(())
+    }
+
+    fn watchdog_kill_command(&self) -> Vec<String> {
+        vec!["docker".to_string(), "rm".to_string(), "-f".to_string()]
+    }
+
+    fn watchdog_network_kill_command(&self) -> Vec<String> {
+        vec![
+            "docker".to_string(),
+            "network".to_string(),
+            "rm".to_string(),
+        ]
+    }
 }
 
 /// The `cleanup_sync` path's blocking counterpart to `stop`+`remove`: issues a plain
@@ -637,6 +799,130 @@ fn blocking_force_remove(
         &format!("/containers/{container_id}?force=true"),
     )
     .map(|_| ())
+}
+
+/// Resolves `name` to a daemon-assigned container id via a blocking
+/// `GET /containers/json?all=true&filters={"name":["^/<name>$"]}` — the `^/...$`
+/// anchoring matches Docker's own convention for an exact-name filter (Docker's
+/// `name` filter is substring-by-default; anchoring is what makes it exact). Returns
+/// `None` on any failure (lookup error, no match, unparseable body) — the caller
+/// treats that as "nothing to remove", matching `remove_by_name`'s best-effort,
+/// not-found-is-fine contract.
+fn blocking_find_container_id_by_name(socket_path: &std::path::Path, name: &str) -> Option<String> {
+    let filters = format!(r#"{{"name":["^/{name}$"]}}"#);
+    let path = format!(
+        "/containers/json?all=true&filters={}",
+        encode_query_value(&filters)
+    );
+    let body = blocking_get_body(socket_path, &path).ok()?;
+    let entries: Vec<ListedEntry> = serde_json::from_slice(&body).ok()?;
+    entries.into_iter().next().map(|e| e.id)
+}
+
+/// A minimal blocking HTTP GET over a blocking unix socket, returning the response
+/// body — the read-the-body counterpart to [`blocking_request`] (which discards it),
+/// needed by [`blocking_find_container_id_by_name`]. Honors `Content-Length` when
+/// present, dechunks a `Transfer-Encoding: chunked` response (`GET
+/// /containers/json` — this call's only caller — comes back chunked on every
+/// dockerd/Docker Desktop build observed; empirically NOT the "Content-Length in
+/// practice" case an earlier version of this function assumed, which made
+/// `blocking_find_container_id_by_name` silently find nothing on every real
+/// daemon), and otherwise falls back to reading until the peer closes (this client
+/// always sends `Connection: close`, matching [`blocking_request`]'s own
+/// assumption).
+fn blocking_get_body(socket_path: &std::path::Path, path: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(stop_timeout_budget())))?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse::<usize>().ok();
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = value.to_ascii_lowercase().contains("chunked");
+            }
+        }
+    }
+
+    if chunked {
+        return blocking_read_chunked_body(&mut reader);
+    }
+
+    let mut body = Vec::new();
+    match content_length {
+        Some(len) => {
+            body.resize(len, 0);
+            reader.read_exact(&mut body)?;
+        }
+        None => {
+            reader.read_to_end(&mut body)?;
+        }
+    }
+    Ok(body)
+}
+
+/// Dechunks an HTTP `Transfer-Encoding: chunked` body from `reader` — the blocking
+/// counterpart to `client::read_chunked_body`, needed because [`blocking_get_body`]
+/// runs on a plain OS thread with no Tokio runtime available. Same framing: a hex
+/// chunk-size line, that many bytes, a trailing `\r\n`, repeated until a zero-size
+/// chunk (optionally followed by trailer headers, drained and discarded) ends the
+/// body.
+fn blocking_read_chunked_body(
+    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{BufRead, Read};
+
+    let mut out = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line)?;
+        let size_str = size_line.trim().split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "could not parse a chunk size from the Docker daemon's response: \
+                     {size_line:?}"
+                ),
+            )
+        })?;
+        if size == 0 {
+            // Drain trailer headers up to the final blank line, then stop.
+            loop {
+                let mut trailer = String::new();
+                let n = reader.read_line(&mut trailer)?;
+                if n == 0 || trailer == "\r\n" || trailer == "\n" {
+                    break;
+                }
+            }
+            break;
+        }
+        let mut chunk = vec![0u8; size];
+        reader.read_exact(&mut chunk)?;
+        out.extend_from_slice(&chunk);
+        // Each chunk is followed by a trailing \r\n that isn't part of the payload.
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+    }
+    Ok(out)
 }
 
 /// A minimal blocking HTTP/1.1 request over a blocking unix socket — the Drop-path
@@ -675,6 +961,109 @@ fn stop_timeout_budget() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_report_no_hardware_isolation_but_checkpoint_support() {
+        let backend = DockerBackend::connecting_to_env();
+        let caps = backend.capabilities();
+        assert!(!caps.hardware_isolated, "containers share the host kernel");
+        assert!(caps.checkpoint);
+    }
+
+    /// A minimal, dependency-free temp-directory helper for the blocking-socket
+    /// tests below — see the async test module's own `tempdir_shim` for why this
+    /// crate hand-rolls one per test module rather than sharing it.
+    mod blocking_tempdir_shim {
+        use std::path::{Path, PathBuf};
+
+        pub(super) struct TempDir(PathBuf);
+
+        impl TempDir {
+            pub(super) fn new() -> Self {
+                static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let unique = format!("rzdbb-{:x}-{:x}", std::process::id() as u16, seq);
+                let path = Path::new("/tmp").join(unique);
+                std::fs::create_dir_all(&path).expect("create temp dir");
+                TempDir(path)
+            }
+
+            pub(super) fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    /// `blocking_get_body` must dechunk a `Transfer-Encoding: chunked` response —
+    /// this is the real shape `GET /containers/json` comes back in on every
+    /// dockerd/Docker Desktop build observed, not the `Content-Length` shape an
+    /// earlier version of this function assumed, which made
+    /// `blocking_find_container_id_by_name` (and therefore `remove_by_name`) find
+    /// nothing on every real daemon.
+    #[test]
+    fn blocking_get_body_dechunks_a_transfer_encoding_chunked_response() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = blocking_tempdir_shim::TempDir::new();
+        let sock_path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fixture socket");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture connection");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf); // drain the request line/headers.
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/json\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      \r\n\
+                      5\r\nhello\r\n\
+                      6\r\n world\r\n\
+                      0\r\n\r\n",
+                )
+                .expect("write fixture response");
+        });
+
+        let body =
+            blocking_get_body(&sock_path, "/containers/json").expect("dechunking must succeed");
+        assert_eq!(body, b"hello world");
+        server.join().expect("fixture server thread must not panic");
+    }
+
+    /// The `Content-Length`-framed shape must keep working too — the dechunking
+    /// addition must be additive, not a regression on the framing that already
+    /// worked.
+    #[test]
+    fn blocking_get_body_honors_content_length_when_present() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = blocking_tempdir_shim::TempDir::new();
+        let sock_path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fixture socket");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture connection");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nhello world!!")
+                .expect("write fixture response");
+        });
+
+        let body = blocking_get_body(&sock_path, "/containers/json")
+            .expect("Content-Length read must succeed");
+        assert_eq!(body, b"hello world!!");
+        server.join().expect("fixture server thread must not panic");
+    }
 
     #[test]
     fn is_port_bind_conflict_message_matches_known_phrasings() {
@@ -820,6 +1209,357 @@ mod tests {
             !fallback_path.to_string_lossy().contains("2375"),
             "a tcp:// DOCKER_HOST must not leak a TCP port into this backend's transport — \
              got {fallback_path:?}"
+        );
+    }
+
+    #[test]
+    fn keep_alive_spec_gets_the_reuse_label_instead_of_the_run_id_label() {
+        let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        spec.keep_alive = true;
+        let body = serialize(&spec);
+        assert!(body.contains("\"dev.rightsize.reuse\""), "{body}");
+        assert!(!body.contains("\"dev.rightsize.run_id\""), "{body}");
+    }
+
+    #[test]
+    fn non_keep_alive_spec_still_gets_the_run_id_label_only() {
+        let spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        let body = serialize(&spec);
+        assert!(
+            body.contains("\"dev.rightsize.run_id\":\"deadbeef\""),
+            "{body}"
+        );
+        assert!(!body.contains("\"dev.rightsize.reuse\""), "{body}");
+    }
+
+    #[test]
+    fn watchdog_kill_command_is_a_plain_docker_rm_dash_f() {
+        let backend = DockerBackend::new(DockerClient::from_docker_host(None));
+        assert_eq!(
+            backend.watchdog_kill_command(),
+            vec!["docker".to_string(), "rm".to_string(), "-f".to_string()]
+        );
+    }
+
+    #[test]
+    fn watchdog_network_kill_command_is_docker_network_rm() {
+        let backend = DockerBackend::new(DockerClient::from_docker_host(None));
+        assert_eq!(
+            backend.watchdog_network_kill_command(),
+            vec![
+                "docker".to_string(),
+                "network".to_string(),
+                "rm".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn reuse_label_value_extracts_the_hash_straight_from_an_rz_reuse_name() {
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+        assert_eq!(reuse_label_value(&spec), "799aad5a3338");
+    }
+
+    #[test]
+    fn reuse_label_value_is_twelve_hex_chars_and_deterministic() {
+        let spec_a = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        let spec_b = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        let spec_c = ContainerSpec::new("rz-x-1", "redis:8.6-alpine", "deadbeef");
+        let a = reuse_label_value(&spec_a);
+        let b = reuse_label_value(&spec_b);
+        let c = reuse_label_value(&spec_c);
+        assert_eq!(a.len(), 12);
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(a, b, "same spec.name must hash the same every time");
+        assert_ne!(a, c, "a different spec.name must hash differently");
+    }
+
+    // --- remove_network's cache-miss fallback -------------------------------------
+    //
+    // The reaping sweep's whole point is removing resources a DIFFERENT (dead)
+    // process created — a network this backend INSTANCE never itself called
+    // `ensure_network` for, so `network_ids` (populated only by THIS instance's own
+    // `ensure_network_get_id` calls) has nothing cached for it. These tests drive
+    // `DockerBackend` against a real (fixture) unix socket rather than a fake
+    // `SandboxBackend`, since the bug lives in the daemon-call sequence itself, not
+    // in anything a fake could stand in for.
+
+    use std::sync::Arc;
+    use tokio::net::UnixListener;
+
+    /// A minimal, dependency-free temp-directory helper — duplicated from
+    /// `crate::client`'s own test-only `tempdir_shim` rather than shared, since that
+    /// one is nested inside a private `#[cfg(test)] mod tests` in a different file
+    /// and this crate's own convention is small hand-rolled scaffolding per test
+    /// module over an extra dependency or cross-module test plumbing.
+    mod tempdir_shim {
+        use std::path::{Path, PathBuf};
+
+        pub(super) struct TempDir(PathBuf);
+
+        impl TempDir {
+            /// Rooted at `/tmp`, not `std::env::temp_dir()` — see
+            /// `crate::client`'s `tempdir_shim` for why (`AF_UNIX`'s `SUN_LEN` cap).
+            pub(super) fn new() -> Self {
+                static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let unique = format!("rzdb-{:x}-{:x}", std::process::id() as u16, seq);
+                let path = Path::new("/tmp").join(unique);
+                std::fs::create_dir_all(&path).expect("create temp dir");
+                TempDir(path)
+            }
+
+            pub(super) fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    /// Spawns a fixture unix-socket "server" that accepts connections IN SEQUENCE —
+    /// one per entry in `responses` — replying with the given canned bytes and
+    /// recording each request's status line, so a test can drive (and assert on) a
+    /// `DockerBackend` method that makes more than one sequential HTTP call. Unlike
+    /// `crate::client`'s own single-request fixture, this one is needed because
+    /// `remove_network`'s cache-miss fallback issues a `GET` lookup THEN a `DELETE`
+    /// — two separate connections, since this client never keeps one alive across
+    /// calls (see `crate::client`'s module doc).
+    async fn multi_request_fixture(
+        responses: Vec<Vec<u8>>,
+    ) -> (DockerClient, tempdir_shim::TempDir, Arc<Mutex<Vec<String>>>) {
+        let dir = tempdir_shim::TempDir::new();
+        let sock_path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fixture socket");
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                if let Ok((mut conn, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 4096];
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        conn.read(&mut buf),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or(0);
+                    let request_line = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    received_clone.lock().unwrap().push(request_line);
+                    let _ = conn.write_all(&response).await;
+                    let _ = conn.shutdown().await;
+                }
+            }
+        });
+        (DockerClient::at_socket(sock_path), dir, received)
+    }
+
+    /// A canned `200 OK` response listing exactly one network whose daemon id is
+    /// `id` — the shape `GET /networks?filters=...` returns.
+    fn network_list_response(id: &str) -> Vec<u8> {
+        let payload = format!(r#"[{{"Id":"{id}"}}]"#);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        )
+        .into_bytes()
+    }
+
+    /// A canned `200 OK` response listing exactly one container whose daemon id is
+    /// `id` — the shape `GET /containers/json?filters=...` returns (same `[{"Id":
+    /// "..."}]` shape as [`network_list_response`], reused as-is by
+    /// [`ListedEntry`], but named separately since it stands for a different
+    /// daemon resource at each call site).
+    fn container_list_response(id: &str) -> Vec<u8> {
+        network_list_response(id)
+    }
+
+    /// A canned `200 OK` empty-array response — "nothing matched this filter."
+    fn empty_list_response() -> Vec<u8> {
+        let payload = "[]";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn find_running_returns_a_handle_when_the_daemon_lists_a_running_match() {
+        let (client, _dir, received) =
+            multi_request_fixture(vec![container_list_response("daemon-c-1")]).await;
+        let backend = DockerBackend::new(client);
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let found = backend
+            .find_running(&spec)
+            .await
+            .unwrap()
+            .expect("must find the running container");
+        assert_eq!(found.id(), "daemon-c-1");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].starts_with("GET /containers/json?filters="),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_running_returns_none_when_nothing_matches() {
+        let (client, _dir, _received) = multi_request_fixture(vec![empty_list_response()]).await;
+        let backend = DockerBackend::new(client);
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        assert!(backend.find_running(&spec).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn create_maps_a_409_conflict_to_the_typed_name_conflict_error() {
+        // Two canned responses: `create()` first checks the image is present
+        // (`pull_if_missing`'s `GET /images/{name}/json`, answered `200 OK` so it
+        // never attempts a pull), THEN issues the actual `POST /containers/create`
+        // that this test cares about, answered with the 409 conflict.
+        let (client, _dir, _received) = multi_request_fixture(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 44\r\n\r\n{\"message\":\"Conflict. Name already in use.\"}".to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let err = match backend.create(spec).await {
+            Ok(_) => panic!("a 409 must surface as an error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, rightsize::error::RightsizeError::NameConflict { .. }),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_network_falls_back_to_a_live_lookup_when_the_in_memory_cache_never_saw_it() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            network_list_response("daemon-net-9"),
+            b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+
+        // No prior `ensure_network` call on THIS instance — `network_ids` starts
+        // empty, exactly as it would for a process reaping a DIFFERENT (dead)
+        // process's leftover network.
+        backend.remove_network("rz-net-deadrun").await.unwrap();
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a cache miss must fall back to a live GET lookup, then DELETE the id it \
+             finds — got: {requests:?}"
+        );
+        assert!(
+            requests[0].starts_with("GET /networks?filters="),
+            "{requests:?}"
+        );
+        assert!(
+            requests[1].starts_with("DELETE /networks/daemon-net-9 "),
+            "the DELETE must target the id the live lookup resolved, not the \
+             rightsize-side network name: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_network_uses_the_cached_id_without_a_lookup_when_this_instance_created_it() {
+        // Only ONE canned response: if this test needed a second connection (a GET
+        // lookup it shouldn't be making), the fixture would have nothing left to
+        // accept and the DELETE call would hang until the client's own timeout —
+        // a real failure signal, not a false pass.
+        let (client, _dir, received) =
+            multi_request_fixture(vec![b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()]).await;
+        let backend = DockerBackend::new(client);
+        backend
+            .network_ids
+            .lock()
+            .unwrap()
+            .insert("rz-net-ownrun".to_string(), "daemon-net-owned".to_string());
+
+        backend.remove_network("rz-net-ownrun").await.unwrap();
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("DELETE /networks/daemon-net-owned "),
+            "{requests:?}"
+        );
+    }
+
+    // --- commit_to_image (checkpoint) -----------------------------------------
+
+    #[tokio::test]
+    async fn commit_to_image_posts_commit_with_the_split_repo_and_tag() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+        let handle = Handle {
+            id: "daemon-c-checkpoint".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+
+        backend
+            .commit_to_image(&handle, "rightsize/checkpoint:abc123def456")
+            .await
+            .expect("commit must succeed on a 201");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("POST /commit?container=daemon-c-checkpoint"),
+            "{requests:?}"
+        );
+        assert!(
+            requests[0].contains("repo=rightsize%2Fcheckpoint"),
+            "{requests:?}"
+        );
+        assert!(requests[0].contains("tag=abc123def456"), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn commit_to_image_surfaces_a_daemon_error_as_a_backend_error() {
+        let (client, _dir, _received) = multi_request_fixture(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 23\r\n\r\n{\"message\":\"no such\"}"
+                .to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+        let handle = Handle {
+            id: "missing-container".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+
+        let err = backend
+            .commit_to_image(&handle, "rightsize/checkpoint:abc123def456")
+            .await
+            .expect_err("a 404 must surface as an error");
+        assert!(
+            matches!(err, rightsize::error::RightsizeError::Backend(_)),
+            "{err}"
         );
     }
 }

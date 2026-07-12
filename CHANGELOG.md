@@ -7,6 +7,102 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+### Added
+
+- **Orphan reaping** (`rightsize`, `rightsize-msb`, `rightsize-docker`): a run-record
+  ledger (`runs/<run-id>.json`/`.sandboxes`/`.networks` under the rightsize cache
+  dir) tracks every sandbox/network this process creates, appended before create and
+  removed after a successful stop — a crashed process (`SIGKILL`, OOM-kill, a killed
+  CI step) leaves the ledger in place instead of silently losing track. An init-time
+  sweep, run once per process right after backend resolution, reaps any OTHER run's
+  ledger that is dead (a liveness check on the recorded pid + process start time,
+  cross-language and cross-process by construction) and whose recorded backend
+  matches its own. A per-run watchdog (default on) — a small detached script blocking
+  on a non-inherited stdin pipe — reaps within seconds of a crash instead of waiting
+  for the next process's sweep. `RIGHTSIZE_REAPER=on|sweep|off` controls both layers;
+  see [Orphan Reaping](docs/reaping.md). The docker backend gets orphan-crash coverage
+  for the first time — previously only msb had any sweep at all, and even that one was
+  liveness-blind (unsafe for concurrent runs); the former `MsbCliBackend::sweep_orphans`
+  is gone, replaced by this ledger-based sweep, which is liveness-aware and covers both
+  backends uniformly. `ContainerSpec` gains a `keep_alive` field (defaults to `false`),
+  excluding a `keep_alive` sandbox from every own-run cleanup path (the ledger, msb's
+  `started_names`, docker's run-id label, the `Drop`-path cleanup thread) — see the
+  container-reuse entry below for the feature that actually sets it. `SandboxBackend`
+  gains `remove_by_name`, `watchdog_kill_command`, `watchdog_network_kill_command`, and
+  `backend_binary_path` — the SPI surface this feature needs: a synchronous, name-keyed
+  best-effort remove (the ledger persists names, not backend-native ids) and the
+  external CLI commands the standalone watchdog script uses; msb promotes its former
+  internal `silently_remove` helper. The rightsize cache dir helper moved to core
+  (`rightsize::cache_dir`, same behavior — `RIGHTSIZE_CACHE_DIR` override, else the
+  per-OS default) since the reaping ledger needs it even in docker-only processes,
+  which never link `rightsize-msb` at all; `rightsize-msb`'s provisioner now delegates
+  to it.
+- **Container reuse** (`rightsize`, `rightsize-msb`, `rightsize-docker`):
+  `Container::reuse(true)` marks a container to survive process exit and be ADOPTED
+  — not re-created — by a later, spec-identical `start()`, in this process or a
+  later one; `stop()` on a reuse-active guard then leaves the sandbox running
+  instead of tearing it down. Gated by a double opt-in: the `.reuse(true)` marker
+  AND `RIGHTSIZE_REUSE=true`/`1` in the process environment both required, or the
+  container behaves exactly like an ordinary ephemeral one. Identity is a `sha256`
+  over a canonical JSON serialization of the reuse-relevant spec
+  (image/env/command/exposedPorts/memoryLimitMb/copied-file-contents) — a
+  cross-language contract pinned by a fixed test vector, so the same logical spec
+  hashes identically here and in the Kotlin/Node ports. The sandbox name is
+  `rz-reuse-<first 12 hex chars of the hash>`; the registry lives at
+  `<cacheDir>/reuse/<hash>.json`, written atomically once the reused container
+  first starts and passes its wait strategy. `.reuse(true)` combined with
+  `.with_network(...)` fails fast with a typed `RightsizeError::ReuseNetworkConflict`
+  — reuse identity has no concept of network topology. `SandboxBackend` gains
+  `find_running`, a best-effort "is a sandbox named X already running, and if so
+  hand me a handle for it" query — the adopt path's own primitive, distinct from
+  `remove_by_name`'s "make it gone" contract; both real backends implement it for
+  real. `RightsizeError` gains a typed `NameConflict` variant (msb: an "already
+  exists" `msb run` failure; docker: an HTTP 409 on `POST /containers/create`) for
+  the reuse start flow's "another process won the create race" retry. See
+  [Container Reuse](docs/reuse.md).
+- **Failure diagnostics** (`rightsize`, `rightsize-msb`, `rightsize-docker`):
+  `rightsize::diagnostics()` returns a human-readable snapshot of every container
+  this process currently has running — image, state, host, mapped ports, and each
+  one's last 50 log lines — built from a process-local registry updated on every
+  successful `start()`/`stop()`. A failing `logs` call degrades that container's
+  section to `logs: unavailable (<reason>)` instead of failing the whole report. The
+  exact report format is a cross-language contract, pinned by a golden-fixture test.
+  `DiagnosticsGuard` is the automatic hook: construct one at the top of a test, and
+  its `Drop` prints the report to stderr iff the thread is unwinding from a panic —
+  a passing test prints nothing. See [Failure Diagnostics](docs/diagnostics.md).
+- **Isolation requirement** (`rightsize`, `rightsize-msb`, `rightsize-docker`):
+  `SandboxBackend` gains `capabilities()`, a small `Capabilities { hardware_isolated,
+  checkpoint }` struct (msb: `true`/`false`; docker: `false`/`true`) — deliberately
+  separate from the existing `supports_native_networks` flag. `.require_isolation(true)`
+  on a `Container` is checked in `start()`, before any create/network work: if the
+  active backend's `capabilities().hardware_isolated` is `false`, `start()` returns a
+  typed `RightsizeError::IsolationRequired` naming the active backend and the remedy
+  (`RIGHTSIZE_BACKEND=microsandbox`) — no sandbox is created. See
+  [Isolation Requirement](docs/isolation.md).
+- **Checkpoint / restore** (`rightsize`, `rightsize-docker`): `SandboxBackend` gains
+  `commit_to_image(handle, imageRef)`, defensively unsupported by default; the docker
+  backend implements it via the engine's `POST /commit` endpoint. `ContainerGuard::
+  checkpoint()` checks `capabilities().checkpoint` before any backend call — a typed
+  `RightsizeError::CheckpointUnsupported` on microsandbox (no commit primitive; the
+  generic layer never reaches the backend), naming the docker backend as the remedy
+  — and requires the guard to currently be running. On success it returns a
+  `Checkpoint { image_ref: "rightsize/checkpoint:<12 hex>", spec }` carrying the
+  source container's full spec. `Container::from_checkpoint(&cp)` builds a normal
+  container from the checkpoint's image plus its env/command/exposed-ports/memory-
+  limit (mounts, network, and aliases are deliberately not carried over — the
+  checkpoint image already has whatever those mounts wrote baked in), with every
+  ordinary builder still available to override before `start()`. A restored
+  container is ordinary in every respect: fresh host ports, normal reaping-ledger
+  registration, normal `stop()`. Checkpoint images are never auto-reaped (they're
+  images, not containers) — see the cleanup one-liner in the docs. See
+  [Checkpoint / Restore](docs/checkpoints.md).
+- **Cross-language parity page**: a documented artifact for the claim that the same
+  container spec produces the same observable behavior in the Kotlin, Rust, and
+  TypeScript ports, on both backends — the verified behavior areas as a table, the
+  pinned cross-language identity-hash vector, and a pointer at the contract suite
+  (`crates/rightsize-modules/tests/contract.rs`) that enforces it. See
+  [Cross-Language Parity](docs/parity.md).
+
 ## [0.1.2] - 2026-07-09
 
 ### Changed

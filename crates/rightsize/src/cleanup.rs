@@ -29,6 +29,14 @@ use crate::backend::SandboxBackend;
 pub(crate) struct CleanupJob {
     pub(crate) backend: Arc<dyn SandboxBackend>,
     pub(crate) container_id: String,
+    /// Runs on the cleanup thread immediately after `cleanup_sync` returns —
+    /// `Drop`'s own opportunity to update the reaping ledger (see
+    /// `crate::reaper::after_stop`) once the teardown this job represents has
+    /// actually been attempted. Kept as a generic callback rather than importing
+    /// `crate::reaper` directly into this module, so this thread's own contract
+    /// ("blocking std I/O only, must never panic") stays independent of whatever the
+    /// callback happens to do; `None` for callers with nothing to run afterward.
+    pub(crate) after_teardown: Option<Box<dyn FnOnce() + Send>>,
 }
 
 static SENDER: OnceLock<Sender<CleanupJob>> = OnceLock::new();
@@ -48,6 +56,14 @@ fn sender() -> &'static Sender<CleanupJob> {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         job.backend.cleanup_sync(&job.container_id);
                     }));
+                    // Runs AFTER cleanup_sync has been attempted, never before — a
+                    // caller wiring the reaping ledger's `after_stop` into this must
+                    // see the teardown attempt happen first. Isolated the same way,
+                    // for the same reason.
+                    if let Some(after_teardown) = job.after_teardown {
+                        let _ =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_teardown));
+                    }
                 }
             })
             .expect("failed to start the rightsize cleanup thread");
@@ -136,6 +152,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.cleaned.lock().unwrap().push(container_id.to_string());
         }
+        fn remove_by_name(&self, _name: &str) {}
+        fn watchdog_kill_command(&self) -> Vec<String> {
+            vec!["true".to_string()]
+        }
     }
 
     #[test]
@@ -150,6 +170,7 @@ mod tests {
         enqueue(CleanupJob {
             backend: backend.clone(),
             container_id: "container-under-test".to_string(),
+            after_teardown: None,
         });
 
         // The cleanup thread is asynchronous relative to this test; poll briefly rather
@@ -162,5 +183,85 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(cleaned.lock().unwrap().as_slice(), ["container-under-test"]);
+    }
+
+    #[test]
+    fn after_teardown_runs_on_the_background_thread_only_once_cleanup_sync_has_returned() {
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn SandboxBackend> = Arc::new(RecordingBackend {
+            cleaned: cleaned.clone(),
+            calls: calls.clone(),
+        });
+
+        // Records, at the moment `after_teardown` runs, how many `cleanup_sync` calls
+        // had already completed — proving ordering, not just eventual invocation.
+        let cleanup_sync_calls_seen_by_after_teardown = Arc::new(AtomicUsize::new(usize::MAX));
+        let seen = cleanup_sync_calls_seen_by_after_teardown.clone();
+        let calls_for_closure = calls.clone();
+        let after_teardown_ran = Arc::new(AtomicUsize::new(0));
+        let after_teardown_ran_writer = after_teardown_ran.clone();
+
+        enqueue(CleanupJob {
+            backend: backend.clone(),
+            container_id: "container-under-test".to_string(),
+            after_teardown: Some(Box::new(move || {
+                seen.store(calls_for_closure.load(Ordering::SeqCst), Ordering::SeqCst);
+                after_teardown_ran_writer.fetch_add(1, Ordering::SeqCst);
+            })),
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while after_teardown_ran.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            after_teardown_ran.load(Ordering::SeqCst),
+            1,
+            "after_teardown must run exactly once"
+        );
+        assert_eq!(
+            cleanup_sync_calls_seen_by_after_teardown.load(Ordering::SeqCst),
+            1,
+            "after_teardown must observe cleanup_sync as already having run"
+        );
+    }
+
+    #[test]
+    fn a_missing_after_teardown_is_a_harmless_no_op() {
+        // `enqueue_runs_cleanup_sync_on_the_background_thread` above already proves
+        // `after_teardown: None` doesn't stop `cleanup_sync` from running; this test
+        // is the flip side, proving a job with a `None` callback doesn't panic the
+        // cleanup thread (which would silently break every job queued after it).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn SandboxBackend> = Arc::new(RecordingBackend {
+            cleaned: Arc::new(Mutex::new(Vec::new())),
+            calls: calls.clone(),
+        });
+        enqueue(CleanupJob {
+            backend: backend.clone(),
+            container_id: "no-after-teardown".to_string(),
+            after_teardown: None,
+        });
+
+        // A second job on the same thread proves the thread survived the first.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let backend2: Arc<dyn SandboxBackend> = Arc::new(RecordingBackend {
+            cleaned: Arc::new(Mutex::new(Vec::new())),
+            calls: calls2.clone(),
+        });
+        enqueue(CleanupJob {
+            backend: backend2.clone(),
+            container_id: "after-the-none-job".to_string(),
+            after_teardown: None,
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls2.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(calls2.load(Ordering::SeqCst), 1);
     }
 }

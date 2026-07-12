@@ -4,7 +4,8 @@ rightsize-rust picks a backend automatically; override with
 `RIGHTSIZE_BACKEND=microsandbox|docker`. Both satisfy the same `SandboxBackend`
 contract (verified by a shared contract test suite in
 `crates/rightsize-modules/tests/contract.rs`) — code you write against `Container`
-runs unchanged on either.
+runs unchanged on either. That same contract is also what the Kotlin and
+TypeScript ports are held to — see [Cross-Language Parity](./parity.md).
 
 ## Selection
 
@@ -50,6 +51,8 @@ at the first `Container::start()`/module `start()` call.
 | `MSB_PATH` | Use a pre-installed `msb` binary; skip downloads. |
 | `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`, `%LOCALAPPDATA%\rightsize` on Windows). |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail instead of downloading (air-gapped CI). |
+| `RIGHTSIZE_REAPER` | `on` (default) / `sweep` / `off` — see [Orphan Reaping](./reaping.md). |
+| `RIGHTSIZE_REUSE` | `true` or `1` (exact string) enables the reuse half of `.reuse(true)`'s double opt-in — see [Container Reuse](./reuse.md). |
 
 ## microsandbox deep-dive
 
@@ -122,12 +125,16 @@ container-list ids).
 
 ### Cleanup by label
 
-Containers are labeled `dev.rightsize.run_id=<RunId>`; the orphan reaper lists and
-force-removes this run's labeled leftovers on `close()`, and a separate reaper at
-startup cleans up labeled containers from a *crashed prior run*. Networks are created
-and removed explicitly. `host.docker.internal:host-gateway` is added as an extra host
-entry on every container, so containers can reach services on the host uniformly
-across platforms.
+Containers are labeled `dev.rightsize.run_id=<RunId>` (or, for a `keep_alive`/reuse
+sandbox, `dev.rightsize.reuse=<hash>` instead — never both); `close()` lists and
+force-removes this run's own labeled leftovers. Orphan reaping itself — the sweep that
+cleans up a *crashed prior run*'s leftovers, and the per-run watchdog — is not
+docker-specific: it's the same ledger-based mechanism described in
+[Orphan Reaping](./reaping.md), and it covers docker uniformly with msb (this is the
+first release where it does; docker previously had no such coverage at all). Networks
+are created and removed explicitly. `host.docker.internal:host-gateway` is added as an
+extra host entry on every container, so containers can reach services on the host
+uniformly across platforms.
 
 ### Port-bind-conflict detection
 
@@ -164,6 +171,11 @@ but a few edges are real, not just timing quirks:
   [Wait Strategies](./core-concepts/wait-strategies.md#the-read-probe-story). A
   userland proxy/forwarder on *either* backend can accept a connection before the
   guest process is actually listening.
+- **Isolation strength differs by design, not by gap.** microsandbox gives each
+  sandbox its own kernel; Docker's containers share the host's. See
+  [Isolation Requirement](./isolation.md) for the guarantees table and
+  `.require_isolation(true)`, the API for a test that needs to depend on this rather
+  than just note it.
 
 ## Wiring a backend
 

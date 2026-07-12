@@ -47,10 +47,10 @@ impl BackendProvider for MsbBackendProvider {
     fn create(&self) -> Result<Box<dyn SandboxBackend>> {
         let msb_path = provisioner::ensure_installed()?;
         let backend = MsbCliBackend::new(msb_path);
-        // Best-effort: a sweep failure (e.g. msb itself unreachable) shouldn't prevent
-        // handing back a usable backend — the next real call will surface any actual
-        // problem with msb loudly instead.
-        let _ = backend.sweep_orphans();
+        // The orphan sweep used to happen here (this provider's own liveness-blind
+        // `msb ls`-diffing sweep). It's gone: `rightsize::backends::active()` now runs
+        // a ledger-based sweep once per process, right after resolution succeeds,
+        // covering every backend uniformly — see `rightsize::reaper`.
         Ok(Box::new(backend))
     }
 }

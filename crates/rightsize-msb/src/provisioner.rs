@@ -51,42 +51,12 @@ const MAX_ASSET_SIZE: u64 = 256 * 1024 * 1024;
 /// Locates (installing if necessary) the pinned `msb` binary, using the real process
 /// environment and the default cache root (or `RIGHTSIZE_CACHE_DIR` if set):
 /// `~/.cache/rightsize` on macOS/Linux, `%LOCALAPPDATA%\rightsize` on Windows (see
-/// [`default_cache_dir`]). Blocking — call this before spinning up any async runtime
-/// work.
+/// [`rightsize::cache_dir::default_dir`]). Blocking — call this before spinning up
+/// any async runtime work.
 pub fn ensure_installed() -> Result<PathBuf> {
     let env: HashMap<String, String> = std::env::vars().collect();
-    let cache_dir = std::env::var("RIGHTSIZE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_cache_dir(&env));
+    let cache_dir = rightsize::cache_dir::resolve(&env);
     ensure_installed_at(DEFAULT_BASE, &cache_dir, &env)
-}
-
-/// The default cache root when `RIGHTSIZE_CACHE_DIR` is unset: `~/.cache/rightsize` on
-/// macOS/Linux (via `HOME`), `%LOCALAPPDATA%\rightsize` on Windows (via `LOCALAPPDATA`,
-/// falling back to `%USERPROFILE%\AppData\Local` if unset, matching install.ps1's own
-/// `%USERPROFILE%`-rooted default install root). The cache holds a downloaded native
-/// toolchain (`.exe`+`.dll` on Windows) — machine-local, non-roaming data, which is
-/// exactly what `%LOCALAPPDATA%` is for; the roaming profile (`%USERPROFILE%\.cache`)
-/// would risk sync in roaming-profile setups and mixes a Unix dotfile convention into
-/// a Windows home directory. Exposed as a seam so the provisioner's unit tests can
-/// verify the Windows branch without actually running on Windows.
-pub(crate) fn default_cache_dir(env: &HashMap<String, String>) -> PathBuf {
-    if std::env::consts::OS == "windows" {
-        let local_app_data = env.get("LOCALAPPDATA").cloned().unwrap_or_else(|| {
-            let user_profile = env
-                .get("USERPROFILE")
-                .cloned()
-                .unwrap_or_else(|| ".".to_string());
-            Path::new(&user_profile)
-                .join("AppData")
-                .join("Local")
-                .to_string_lossy()
-                .to_string()
-        });
-        return Path::new(&local_app_data).join("rightsize");
-    }
-    let home = env.get("HOME").cloned().unwrap_or_else(|| ".".to_string());
-    Path::new(&home).join(".cache").join("rightsize")
 }
 
 /// The seam [`ensure_installed`] delegates to, parameterized over the release base URL,
@@ -934,21 +904,25 @@ mod tests {
 
     #[test]
     fn default_cache_dir_on_this_runners_platform_uses_the_expected_root() {
-        // Exercises the real (non-Windows, on this dev/CI matrix) branch end-to-end
-        // against the injected-env seam.
+        // The cache-dir default itself now lives in `rightsize::cache_dir` (moved
+        // there so the reaping ledger can resolve it in docker-only processes too —
+        // see that crate's module doc) — this pins that this crate's provisioner
+        // still resolves through the exact same function, end-to-end against the
+        // injected-env seam, rather than re-testing `default_dir`'s own logic (that's
+        // `rightsize::cache_dir`'s own test's job).
         let mut env = HashMap::new();
         env.insert("HOME".to_string(), "/home/testuser".to_string());
         if std::env::consts::OS != "windows" {
-            let dir = default_cache_dir(&env);
+            let dir = rightsize::cache_dir::default_dir(&env);
             assert_eq!(dir, PathBuf::from("/home/testuser/.cache/rightsize"));
         }
     }
 
     #[test]
     fn default_cache_dir_windows_branch_prefers_localappdata() {
-        // The Windows branch of default_cache_dir is only reachable when
-        // std::env::consts::OS == "windows", which this dev/CI matrix never is — so
-        // this test documents and pins the *intended* shape of the join logic (the
+        // The Windows branch of rightsize::cache_dir::default_dir is only reachable
+        // when std::env::consts::OS == "windows", which this dev/CI matrix never is —
+        // so this test documents and pins the *intended* shape of the join logic (the
         // same string-joining code path, exercised directly) rather than the
         // unreachable-on-this-host `if` branch itself. See the module docs: the
         // Windows default is `%LOCALAPPDATA%\rightsize`. Compared component-wise
