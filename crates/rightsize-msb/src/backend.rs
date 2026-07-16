@@ -41,6 +41,13 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACHED_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// `msb copy` can move an arbitrarily large directory tree — generous headroom
+/// over [`EXEC_TIMEOUT`], which only ever runs a single guest command.
+const COPY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Each step of the checkpoint stop/snapshot/start cycle — a snapshot write is disk
+/// I/O over a (typically sparse, small) rootfs, but generous headroom matters more
+/// than tightness here since a slow step must not spuriously fail a checkpoint.
+const CHECKPOINT_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An immutable `msb` sandbox reference: its `ContainerSpec` and the name `msb` knows
 /// it by (always `spec.name` for this backend). All mutable per-container state lives
@@ -128,15 +135,17 @@ impl MsbCliBackend {
     /// joined **without a bound** after the process exits (not a fixed cap) so a
     /// large-output command's tail is never truncated by a join deadline.
     fn invoke(&self, args: &[String], timeout: Duration) -> Result<ExecResult> {
-        let mut child = Command::new(&self.msb)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                RightsizeError::Backend(format!("failed to spawn msb {}: {e}", args.join(" ")))
-            })?;
+        let mut child = spawn_msb_command(|| {
+            let mut cmd = Command::new(&self.msb);
+            cmd.args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        })
+        .map_err(|e| {
+            RightsizeError::Backend(format!("failed to spawn msb {}: {e}", args.join(" ")))
+        })?;
 
         let stdout_pipe = child.stdout.take().expect("piped stdout");
         let stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -296,6 +305,19 @@ fn is_name_conflict(output: &str) -> bool {
     output.to_lowercase().contains("already exists")
 }
 
+/// True if `output` (an `msb snapshot inspect` child's combined stdout/stderr) names
+/// a missing snapshot — msb's own "not found" wording, following the same `error:
+/// <noun> not found: <ref>` convention already confirmed for images (see the
+/// captured `"error: image not found: <ref>"` wording this backend's `image remove`
+/// heal path negatively tests against). This is the ONLY signal
+/// [`MsbCliBackend::has_checkpoint`] treats as "definitely absent" (`Ok(false)`) —
+/// every other nonzero exit (a transient daemon problem, a malformed ref, anything
+/// else) surfaces as an error, per `SandboxBackend::has_checkpoint`'s contract: a
+/// probe failure must never masquerade as "not there."
+fn is_snapshot_not_found(output: &str) -> bool {
+    output.to_lowercase().contains("snapshot not found")
+}
+
 /// Before retrying a boot that hit msb's state-database error — enough for a winning
 /// concurrent invocation's migration transaction to commit; the retry's own `msb run`
 /// startup dwarfs this either way.
@@ -317,7 +339,11 @@ impl SandboxBackend for MsbCliBackend {
         Capabilities {
             // Every microsandbox sandbox is its own microVM with its own kernel.
             hardware_isolated: true,
-            checkpoint: false,
+            // Disk-snapshot checkpointing: see `create_checkpoint` below.
+            checkpoint: true,
+            // The stop/snapshot/start cycle reboots the guest — the workload
+            // restarts, unlike docker's undisturbed image commit.
+            checkpoint_restarts_workload: true,
         }
     }
 
@@ -384,19 +410,7 @@ impl SandboxBackend for MsbCliBackend {
             drop(resources);
             let _ = invoke_standalone(&msb, &commands::stop(&name), STOP_TIMEOUT);
             if let Some(mut child) = attached {
-                let deadline = Instant::now() + ATTACHED_STOP_TIMEOUT;
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) if Instant::now() >= deadline => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break;
-                        }
-                        Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                        Err(_) => break,
-                    }
-                }
+                reap_attached_child(&mut child);
             }
         })
         .await;
@@ -567,6 +581,162 @@ impl SandboxBackend for MsbCliBackend {
     fn backend_binary_path(&self) -> Option<PathBuf> {
         Some(self.msb.clone())
     }
+
+    /// `msb copy -q <host_path> <name>:<container_path>` — through the same
+    /// `invoke_standalone` plumbing every other one-shot subcommand in this backend
+    /// uses. A non-zero exit surfaces as a backend error carrying msb's stderr,
+    /// never a silent success.
+    async fn copy_to_container(
+        &self,
+        handle: &dyn SandboxHandle,
+        host_path: &Path,
+        container_path: &str,
+    ) -> Result<()> {
+        let argv = commands::copy_in(host_path, handle.id(), container_path);
+        let name = handle.id().to_string();
+        let msb = self.msb.clone();
+        let result =
+            tokio::task::spawn_blocking(move || invoke_standalone(&msb, &argv, COPY_TIMEOUT))
+                .await
+                .map_err(|e| RightsizeError::Backend(format!("copy task panicked: {e}")))??;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "msb copy into sandbox {name} failed (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `msb copy -q <name>:<container_path> <host_path>` — the reverse direction of
+    /// [`Self::copy_to_container`], same plumbing and error-surfacing.
+    async fn copy_from_container(
+        &self,
+        handle: &dyn SandboxHandle,
+        container_path: &str,
+        host_path: &Path,
+    ) -> Result<()> {
+        let argv = commands::copy_out(handle.id(), container_path, host_path);
+        let name = handle.id().to_string();
+        let msb = self.msb.clone();
+        let result =
+            tokio::task::spawn_blocking(move || invoke_standalone(&msb, &argv, COPY_TIMEOUT))
+                .await
+                .map_err(|e| RightsizeError::Backend(format!("copy task panicked: {e}")))??;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "msb copy out of sandbox {name} failed (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Disk-snapshot checkpointing: `msb stop <name>` → `msb snapshot create --from
+    /// <name> rz-ckpt-<nonce>` → `msb rm <name>` → a fresh ATTACHED `msb run
+    /// --snapshot <ref>` re-boot under the same name/ports/env/memory — see
+    /// `msb_checkpoint_cycle` for the orchestration and its own unit tests for the
+    /// failure paths. Runs on a blocking thread, like every other multi-step msb
+    /// invocation in this backend. The re-boot reuses [`spawn_and_await_running`],
+    /// this backend's own normal boot path (already the shape `Container::
+    /// from_checkpoint`'s restores use) — see the module docs for why an msb
+    /// `start` resume is not used here. The handle's held attached child is
+    /// swapped to the new one on success; the ledger and this handle's identity
+    /// (name, spec) are untouched either way.
+    async fn create_checkpoint(&self, handle: &dyn SandboxHandle, nonce: &str) -> Result<String> {
+        let id = handle.id().to_string();
+        let snapshot_name = format!("rz-ckpt-{nonce}");
+        let msb = self.msb.clone();
+        let mut reboot_spec = handle.spec().clone();
+        reboot_spec.checkpoint_ref = Some(snapshot_name.clone());
+        let name_for_thread = id.clone();
+        let snapshot_for_thread = snapshot_name.clone();
+        // Taken now (not inside the blocking closure) so a panic there can't leave
+        // this handle's `HandleState` holding a stale reference to a child this
+        // method is already about to replace.
+        let previous_attached = self
+            .handles
+            .lock()
+            .expect("handles mutex poisoned")
+            .get_mut(&id)
+            .and_then(|state| state.attached.take());
+
+        let new_child = tokio::task::spawn_blocking(move || {
+            let mut invoke =
+                |args: &[String]| invoke_standalone(&msb, args, CHECKPOINT_STEP_TIMEOUT);
+            let mut reboot = || spawn_and_await_running(&msb, &reboot_spec);
+            let result = msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                &name_for_thread,
+                &snapshot_for_thread,
+            );
+            // The cycle's own `stop` step already halted the sandbox by the time
+            // this returns — reap the previously-attached child (this handle's
+            // old foreground `msb run` process) the same way `stop()` does,
+            // regardless of the cycle's outcome.
+            if let Some(mut child) = previous_attached {
+                reap_attached_child(&mut child);
+            }
+            result
+        })
+        .await
+        .map_err(|e| RightsizeError::Backend(format!("checkpoint task panicked: {e}")))??;
+
+        let mut handles = self.handles.lock().expect("handles mutex poisoned");
+        if let Some(state) = handles.get_mut(&id) {
+            state.attached = Some(new_child);
+        }
+        Ok(snapshot_name)
+    }
+
+    /// `msb snapshot rm <ref>` — best-effort, matching [`Self::remove_by_name`]'s
+    /// own "not found is fine" contract.
+    async fn remove_checkpoint(&self, checkpoint_ref: &str) -> Result<()> {
+        let msb = self.msb.clone();
+        let snapshot_ref = checkpoint_ref.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            invoke_standalone(&msb, &commands::snapshot_rm(&snapshot_ref), STOP_TIMEOUT)
+        })
+        .await;
+        Ok(())
+    }
+
+    /// `msb snapshot inspect <ref>` — the named-checkpoint existence probe
+    /// (`SandboxBackend::has_checkpoint`, `Checkpoint::find`'s staleness check).
+    /// Exit 0 -> `Ok(true)`. A nonzero exit whose output names msb's "not found"
+    /// wording (see [`is_snapshot_not_found`]) -> `Ok(false)`. Any other nonzero
+    /// exit, or the invocation itself failing to run, surfaces as a
+    /// `RightsizeError::Backend` — this SPI forbids a probe failure from resolving
+    /// to "absent."
+    async fn has_checkpoint(&self, checkpoint_ref: &str) -> Result<bool> {
+        let msb = self.msb.clone();
+        let snapshot_ref = checkpoint_ref.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            invoke_standalone(
+                &msb,
+                &commands::snapshot_inspect(&snapshot_ref),
+                STOP_TIMEOUT,
+            )
+        })
+        .await
+        .map_err(|e| RightsizeError::Backend(format!("checkpoint probe task panicked: {e}")))??;
+
+        if result.exit_code == 0 {
+            return Ok(true);
+        }
+        let combined = format!("{}\n{}", result.stdout, result.stderr);
+        if is_snapshot_not_found(&combined) {
+            return Ok(false);
+        }
+        Err(RightsizeError::Backend(format!(
+            "msb could not inspect checkpoint '{checkpoint_ref}' (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        )))
+    }
 }
 
 /// Builds the external, standalone-process kill command the reaping watchdog uses to
@@ -711,18 +881,20 @@ fn try_spawn_and_await_running(
     spec: &ContainerSpec,
 ) -> std::result::Result<Child, PreRunningFailure> {
     let argv = commands::run(spec);
-    let mut child = Command::new(msb)
-        .args(&argv)
-        .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            PreRunningFailure::Other(RightsizeError::Backend(format!(
-                "failed to spawn msb {}: {e}",
-                argv.join(" ")
-            )))
-        })?;
+    let mut child = spawn_msb_command(|| {
+        let mut cmd = Command::new(msb);
+        cmd.args(&argv)
+            .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    })
+    .map_err(|e| {
+        PreRunningFailure::Other(RightsizeError::Backend(format!(
+            "failed to spawn msb {}: {e}",
+            argv.join(" ")
+        )))
+    })?;
 
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -848,16 +1020,40 @@ fn describe_heal_result(result: &Result<ExecResult>) -> String {
 
 /// A standalone (non-`&self`) version of `invoke`, for call sites (the blocking `stop`
 /// task, `cleanup_sync`) that don't have easy access to `&MsbCliBackend`.
+/// Spawns an msb child, retrying briefly when `execve` refuses with `ETXTBSY`
+/// ("text file busy", os error 26 on unix): a fork from another thread can hold a
+/// short-lived copy of a write descriptor for a just-written executable — the msb
+/// binary right after the provisioner writes it, or a test's fake binary — and the
+/// kernel rejects executing any file someone holds open for write. The writer
+/// closes within microseconds, so a few paced attempts close the window; every
+/// other spawn failure surfaces unchanged on the first try. Windows has no
+/// `ETXTBSY`, so the retry arm never matches there. [`build`] must construct a
+/// fresh `Command` per call — `Command` is consumed by a failed spawn attempt.
+pub(crate) fn spawn_msb_command(build: impl Fn() -> Command) -> std::io::Result<Child> {
+    const ETXTBSY: i32 = 26;
+    let mut delay = Duration::from_millis(10);
+    for _ in 0..5 {
+        match build().spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            other => return other,
+        }
+    }
+    build().spawn()
+}
+
 fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<ExecResult> {
-    let mut child = Command::new(msb)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            RightsizeError::Backend(format!("failed to spawn msb {}: {e}", args.join(" ")))
-        })?;
+    let mut child = spawn_msb_command(|| {
+        let mut cmd = Command::new(msb);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    })
+    .map_err(|e| RightsizeError::Backend(format!("failed to spawn msb {}: {e}", args.join(" "))))?;
 
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -897,6 +1093,107 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
         stdout: stdout_buf.lock().expect("stdout mutex poisoned").clone(),
         stderr: stderr_buf.lock().expect("stderr mutex poisoned").clone(),
     })
+}
+
+/// Orchestrates the checkpoint feature's stop → snapshot → rm → re-boot cycle
+/// against `name` (a running sandbox), taking a snapshot named `snapshot_name`,
+/// via `invoke` (the plain one-shot `stop`/`snapshot create`/`rm` commands) and
+/// `reboot` (the actual re-boot of a fresh attached sandbox from that snapshot,
+/// under the same name). Both are injected rather than hardcoded — `invoke` as a
+/// pure argv-in/`ExecResult`-out closure, `reboot` generic over its success type
+/// `T` (production instantiates it with [`spawn_and_await_running`], returning the
+/// live [`Child`] this backend needs to hold; tests instantiate it with a bare
+/// `Result<()>`) — so this orchestration logic (the ordering, and which steps
+/// short-circuit which) is unit-testable without a real `msb` binary or child
+/// process.
+///
+/// This replaces the former `msb stop` → `msb snapshot create` → `msb start`
+/// cycle: `msb start` is `Sandbox::start_detached` in upstream microsandbox, whose
+/// detached spawn requests `CREATE_BREAKAWAY_FROM_JOB` on Windows — denied with
+/// `ERROR_ACCESS_DENIED` whenever msb runs inside a job object that doesn't grant
+/// breakaway rights, which is exactly a Gradle/cargo test process on a Windows CI
+/// runner. The denial is deterministic, not transient, so no retry fixes it.
+/// Attached `msb run` (this backend's normal boot, including `--snapshot` boots)
+/// has no such problem, so once the snapshot exists, the stopped sandbox is
+/// removed and this backend's own create/boot path re-creates it from that
+/// snapshot instead of resuming it.
+///
+/// Failure handling:
+/// - `msb stop` failing short-circuits before any snapshot/rm/reboot attempt.
+/// - `msb snapshot create` failing leaves the sandbox stopped (never removed) and
+///   surfaces an error naming `msb start <name>` as the by-hand remedy — no
+///   best-effort restart-for-the-caller here, since that restart would be exactly
+///   the broken `msb start` call this cycle no longer makes.
+/// - A failure to reboot after a successful snapshot (whether `rm` silently failed
+///   to free the name, or the reboot itself failed) surfaces an error naming
+///   `snapshot_name` and `Container::from_checkpoint(...)` as the recovery path —
+///   the sandbox is gone, but its state lives on in the snapshot.
+fn msb_checkpoint_cycle<T>(
+    invoke: &mut dyn FnMut(&[String]) -> Result<ExecResult>,
+    reboot: &mut dyn FnMut() -> Result<T>,
+    name: &str,
+    snapshot_name: &str,
+) -> Result<T> {
+    let stop = invoke(&commands::stop(name))?;
+    if stop.exit_code != 0 {
+        return Err(RightsizeError::Backend(format!(
+            "msb stop {name} failed before taking a checkpoint (exit {}): {}",
+            stop.exit_code,
+            stop.stderr.trim()
+        )));
+    }
+
+    match invoke(&commands::snapshot_create(name, snapshot_name)) {
+        Ok(r) if r.exit_code == 0 => {}
+        Ok(r) => {
+            return Err(RightsizeError::Backend(format!(
+                "msb snapshot create --from {name} {snapshot_name} failed (exit {}): {} — the \
+                 sandbox is left stopped; run `msb start {name}` by hand to bring it back up",
+                r.exit_code,
+                r.stderr.trim()
+            )));
+        }
+        Err(e) => {
+            return Err(RightsizeError::Backend(format!(
+                "msb snapshot create --from {name} {snapshot_name} failed: {e} — the sandbox is \
+                 left stopped; run `msb start {name}` by hand to bring it back up"
+            )));
+        }
+    }
+
+    // Disk state now lives in the snapshot — remove the stopped sandbox so the
+    // reboot below can recreate it under the same name. Best-effort: even if this
+    // itself fails, the reboot's own `msb run --name <name>` surfaces the
+    // consequence (a lingering sandbox collides on the name) as the error below.
+    let _ = invoke(&commands::rm(name));
+
+    reboot().map_err(|e| {
+        RightsizeError::Backend(format!(
+            "re-booting sandbox {name} from checkpoint {snapshot_name} failed ({e}) — the \
+             sandbox was removed but its state is preserved in checkpoint {snapshot_name}, \
+             restorable via Container::from_checkpoint(...)"
+        ))
+    })
+}
+
+/// Waits (bounded by [`ATTACHED_STOP_TIMEOUT`]) for an already-signalled-to-stop
+/// attached `msb run` child to exit on its own, force-killing it if the deadline
+/// passes first. Shared by [`MsbCliBackend::stop`] (after its own `msb stop`
+/// invocation) and `create_checkpoint` (after the checkpoint cycle's `stop` step
+/// halts the sandbox out from under its previously-held attached child).
+fn reap_attached_child(child: &mut Child) {
+    let deadline = Instant::now() + ATTACHED_STOP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 /// A standalone `running_sandbox_names()`, for the blocking `spawn_and_await_running`
@@ -1107,16 +1404,151 @@ async fn install_hosts_aliases(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
-    fn capabilities_report_hardware_isolation_and_no_checkpoint_support() {
+    fn capabilities_report_hardware_isolation_and_checkpoint_that_restarts_the_workload() {
         let backend = MsbCliBackend::new(PathBuf::from("/opt/msb/bin/msb"));
         let caps = backend.capabilities();
         assert!(
             caps.hardware_isolated,
             "each msb sandbox is its own microVM"
         );
-        assert!(!caps.checkpoint, "not supported yet");
+        assert!(caps.checkpoint, "disk-snapshot checkpointing is supported");
+        assert!(
+            caps.checkpoint_restarts_workload,
+            "the stop/snapshot/start cycle reboots the guest"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_happy_path_drives_stop_snapshot_rm_then_reboot_in_order() {
+        let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let result = {
+            let mut invoke = |args: &[String]| {
+                log.borrow_mut().push(args.join(" "));
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = || -> Result<()> {
+                log.borrow_mut().push("reboot".to_string());
+                Ok(())
+            };
+            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+        };
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                commands::stop("rz-abc-1").join(" "),
+                commands::snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe").join(" "),
+                commands::rm("rz-abc-1").join(" "),
+                "reboot".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_snapshot_failure_leaves_the_sandbox_stopped_and_skips_rm_and_reboot() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut reboot_called = false;
+        let result = {
+            let mut invoke = |args: &[String]| {
+                calls.push(args.to_vec());
+                if args[0] == "snapshot" {
+                    Ok(ExecResult {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "disk full".to_string(),
+                    })
+                } else {
+                    Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+            };
+            let mut reboot = || -> Result<()> {
+                reboot_called = true;
+                Ok(())
+            };
+            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+        };
+        let err = result.expect_err("a failed snapshot step must propagate as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("disk full"), "{msg}");
+        assert!(msg.contains("left stopped"), "{msg}");
+        assert!(msg.contains("msb start rz-abc-1"), "{msg}");
+        assert_eq!(
+            calls.len(),
+            2,
+            "a failed snapshot step must not be followed by rm: {calls:?}"
+        );
+        assert!(
+            !reboot_called,
+            "a failed snapshot step must not be followed by a reboot attempt"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_short_circuits_before_any_snapshot_rm_or_reboot_if_stop_itself_fails() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut reboot_called = false;
+        let result = {
+            let mut invoke = |args: &[String]| {
+                calls.push(args.to_vec());
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "boom".to_string(),
+                })
+            };
+            let mut reboot = || -> Result<()> {
+                reboot_called = true;
+                Ok(())
+            };
+            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+        };
+        assert!(result.is_err());
+        assert_eq!(
+            calls.len(),
+            1,
+            "a failed stop must short-circuit before any snapshot/rm/reboot attempt: {calls:?}"
+        );
+        assert!(!reboot_called);
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_reboot_failure_after_a_successful_snapshot_names_the_ref_and_the_recovery_path()
+     {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                calls.push(args.to_vec());
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = || -> Result<()> { Err(RightsizeError::Backend("boom".to_string())) };
+            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+        };
+        let err = result.expect_err("a failed reboot must surface, not be swallowed");
+        let msg = err.to_string();
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(msg.contains("rz-ckpt-deadbeefcafe"), "{msg}");
+        assert!(msg.contains("Container::from_checkpoint"), "{msg}");
+        assert_eq!(
+            calls.len(),
+            3,
+            "rm must still be attempted before a reboot failure surfaces: {calls:?}"
+        );
+        assert_eq!(calls[2], commands::rm("rz-abc-1"));
     }
 
     #[test]
@@ -1221,6 +1653,28 @@ mod tests {
         assert!(!is_name_conflict(""));
         assert!(!is_name_conflict("connection refused"));
         assert!(!is_name_conflict(
+            "error: database error: Execution Error: disk I/O error"
+        ));
+    }
+
+    #[test]
+    fn is_snapshot_not_found_matches_msbs_not_found_wording() {
+        assert!(is_snapshot_not_found(
+            "error: snapshot not found: rz-ckpt-deadbeefcafe"
+        ));
+        assert!(is_snapshot_not_found("Snapshot Not Found"));
+    }
+
+    #[test]
+    fn is_snapshot_not_found_negative_cases_do_not_match() {
+        assert!(!is_snapshot_not_found(""));
+        assert!(!is_snapshot_not_found("connection refused"));
+        // A generic sandbox/image not-found must not false-positive on the
+        // snapshot-specific classifier — each backend-noun gets its own signal.
+        assert!(!is_snapshot_not_found(
+            "error: image not found: floci/floci-az:0.8.0"
+        ));
+        assert!(!is_snapshot_not_found(
             "error: database error: Execution Error: disk I/O error"
         ));
     }
@@ -1381,6 +1835,60 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn spawn_msb_command_outlasts_a_transient_etxtbsy_writer() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("etxtbsy");
+        let script = dir.join("busy-script");
+        let mut writer = std::fs::File::create(&script).unwrap();
+        writer.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        writer.flush().unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Hold the write descriptor open — execve refuses with ETXTBSY while it
+        // lives — and release it shortly after the first attempts have failed,
+        // the same shape as another test thread finishing its own script write.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            drop(writer);
+        });
+
+        let mut child = spawn_msb_command(|| {
+            let mut cmd = Command::new(&script);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        })
+        .expect("a briefly-busy executable must still spawn once its writer closes");
+        assert!(child.wait().unwrap().success());
+        release.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_msb_command_fails_immediately_on_a_missing_binary() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let err = spawn_msb_command(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let mut cmd = Command::new("/definitely/not/a/real/msb");
+            cmd.stdin(Stdio::null());
+            cmd
+        })
+        .expect_err("a missing binary must not spawn");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "only ETXTBSY is transient; anything else must fail on the first attempt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn invoke_retrying_on_state_db_error_retries_exactly_once_on_a_db_error() {
         let dir = unique_test_dir("db-error");
         let script = write_state_db_stub_script(&dir, true);
@@ -1389,7 +1897,7 @@ mod tests {
 
         backend.invoke_retrying_on_state_db_error(
             &["stop".to_string(), state_file.display().to_string()],
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         );
 
         let calls = std::fs::read_to_string(&state_file).expect("stub must have run");
@@ -1412,7 +1920,7 @@ mod tests {
 
         backend.invoke_retrying_on_state_db_error(
             &["stop".to_string(), state_file.display().to_string()],
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         );
 
         let calls = std::fs::read_to_string(&state_file).expect("stub must have run");

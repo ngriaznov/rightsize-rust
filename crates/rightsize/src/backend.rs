@@ -11,17 +11,18 @@
 //! That one rule is what lets a module advertise its own mapped port at boot, and no
 //! backend implementation in this workspace may call the free-port allocator.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::error::Result;
+use crate::error::{Result, RightsizeError};
 use crate::model::{ContainerSpec, ExecResult};
 
 /// Capability flags a backend exposes about its own runtime — a small, growable
 /// struct rather than a single boolean (mirroring the existing
 /// [`SandboxBackend::supports_native_networks`] precedent, but deliberately NOT
 /// folded into it — that flag stays exactly as it is) so a later wave can add a
-/// field without another SPI break. This wave adds two:
+/// field without another SPI break. Fields so far:
 ///
 /// - `hardware_isolated`: `true` when each sandbox this backend creates gets its own
 ///   kernel (a microVM, e.g. microsandbox) rather than sharing the host's (e.g.
@@ -29,15 +30,22 @@ use crate::model::{ContainerSpec, ExecResult};
 ///   by [`SandboxBackend::capabilities`]'s caller in `Container::start()` for
 ///   `.require_isolation(true)`.
 /// - `checkpoint`: whether this backend supports checkpoint/restore of a running
-///   sandbox. Not consulted by anything yet — reserved so the next wave (warm
-///   restore) doesn't need another trait-level change to land it.
+///   sandbox. Both real backends have it: docker via image commit, microsandbox via
+///   disk snapshots.
+/// - `checkpoint_restarts_workload`: `true` when taking a checkpoint on this backend
+///   necessarily restarts the sandbox's workload (microsandbox: the stop/snapshot/
+///   start cycle reboots the guest) rather than leaving it undisturbed (docker: an
+///   image commit touches nothing running). `ContainerGuard::checkpoint` consults
+///   this to decide whether to re-run the configured wait strategy before returning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
     /// True for a backend whose sandboxes each run under their own kernel.
     pub hardware_isolated: bool,
-    /// True for a backend that supports checkpoint/restore. Unused before the
-    /// checkpoint-restore wave.
+    /// True for a backend that supports checkpoint/restore.
     pub checkpoint: bool,
+    /// True for a backend whose checkpoint mechanism restarts the sandbox's
+    /// workload (docker: `false`; microsandbox: `true`).
+    pub checkpoint_restarts_workload: bool,
 }
 
 /// A tunnel/alias route: inside the consumer container, `alias:guest_port` must reach
@@ -196,10 +204,18 @@ pub trait SandboxBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Commits `handle`'s current filesystem state as a new image tagged
-    /// `image_ref` — the checkpoint feature's own backend primitive
-    /// (`ContainerGuard::checkpoint`, `crate::checkpoint`). `handle` must currently
-    /// be running.
+    /// Captures `handle`'s current filesystem state as a checkpoint, formatting
+    /// `nonce` (a random 12-lowercase-hex string freshly generated per call by
+    /// `crate::checkpoint::generate_ref_nonce`) into this backend's own ref shape
+    /// and returning the resulting ref — the checkpoint feature's own backend
+    /// primitive (`ContainerGuard::checkpoint`, `crate::checkpoint`). `handle` must
+    /// currently be running.
+    ///
+    /// Each backend picks its own ref shape: docker tags an image
+    /// `rightsize/checkpoint:<nonce>` (the container is left undisturbed);
+    /// microsandbox names a disk snapshot `rz-ckpt-<nonce>` (the sandbox is
+    /// stopped, snapshotted, and started back up — see
+    /// [`Capabilities::checkpoint_restarts_workload`]).
     ///
     /// Gated by [`Capabilities::checkpoint`] at the CALLER (`ContainerGuard::checkpoint`
     /// checks `capabilities().checkpoint` before ever reaching this method) — this
@@ -207,12 +223,93 @@ pub trait SandboxBackend: Send + Sync {
     /// opted in (or a test double): it always errors with
     /// [`crate::error::RightsizeError::CheckpointUnsupported`], never called in
     /// practice because of the caller-side gate, but correct on its own if it ever
-    /// were. The docker backend overrides this with a real image-commit call; the
-    /// microsandbox backend has no commit primitive and relies on this default.
-    async fn commit_to_image(&self, _handle: &dyn SandboxHandle, _image_ref: &str) -> Result<()> {
+    /// were.
+    async fn create_checkpoint(&self, _handle: &dyn SandboxHandle, _nonce: &str) -> Result<String> {
         Err(crate::error::RightsizeError::CheckpointUnsupported {
             backend: self.name().to_string(),
         })
+    }
+
+    /// Best-effort removal of a checkpoint this backend created (see
+    /// [`Self::create_checkpoint`]): docker `DELETE`s the tagged image; microsandbox
+    /// runs `msb snapshot rm`. "Not found" is success, matching
+    /// [`Self::remove_by_name`]'s own contract.
+    ///
+    /// SPI-only — no [`crate::ContainerGuard`] method exposes this; the public API
+    /// documents a `docker rmi`/`msb snapshot rm` one-liner instead (checkpoint
+    /// artifacts are never auto-reaped, same explicit decision as reuse). This
+    /// exists so this crate's own tests can clean up a checkpoint they made without
+    /// shelling out to either CLI directly. Default: no-op — a test double that
+    /// never creates a checkpoint has nothing to remove.
+    async fn remove_checkpoint(&self, _checkpoint_ref: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Probes whether the backend-native artifact behind `checkpoint_ref` still
+    /// exists — the named-checkpoint feature's own primitive
+    /// (`crate::Checkpoint::find`'s staleness check): docker inspects the tagged
+    /// image (`GET /images/{ref}/json`), microsandbox inspects the disk snapshot
+    /// (`msb snapshot inspect <ref>`'s exit code).
+    ///
+    /// **Only a definite "not there" may return `Ok(false)`.** Any other failure
+    /// (a daemon unreachable, a malformed ref, a transient probe error) must
+    /// propagate as `Err` — a probe failure masquerading as "absent" would let
+    /// `find` silently delete a registry entry for a checkpoint that in fact
+    /// still exists, just because this call couldn't currently reach it.
+    ///
+    /// Default: like [`Self::copy_to_container`]'s default, this is
+    /// unsupported for a backend that hasn't opted in (test doubles only — both
+    /// real backends override it).
+    async fn has_checkpoint(&self, _checkpoint_ref: &str) -> Result<bool> {
+        Err(RightsizeError::unsupported(
+            "checkpoint existence probe",
+            self.name(),
+        ))
+    }
+
+    /// Copies `host_path` (a file or directory) into the running container at
+    /// `container_path` — the RUNTIME counterpart to a start-time
+    /// [`crate::model::FileMount`] (`Container::with_copy_file_to_container`, a
+    /// pre-boot mount). Called only after the generic layer
+    /// (`ContainerGuard::copy_file_to_container`) has already verified the
+    /// container is running, `container_path` is absolute, and the destination's
+    /// parent directory exists in the guest (via [`Self::exec`]) — this method does
+    /// ONLY the transfer, exactly like `cp -r`/`docker cp` themselves: copying a
+    /// directory to an absent destination produces the destination as a copy of
+    /// the source (contents under the destination, not nested one level deeper).
+    ///
+    /// Default: unsupported (test doubles/fakes don't need this); both real
+    /// backends override it.
+    async fn copy_to_container(
+        &self,
+        _handle: &dyn SandboxHandle,
+        _host_path: &Path,
+        _container_path: &str,
+    ) -> Result<()> {
+        Err(RightsizeError::unsupported(
+            "runtime file copy",
+            self.name(),
+        ))
+    }
+
+    /// The reverse direction of [`Self::copy_to_container`]: copies `container_path`
+    /// (a file or directory) out of the running container to `host_path`. Same
+    /// division of labor — the generic layer has already verified running/absolute/
+    /// host-parent-directory-exists before this is called; this method does ONLY
+    /// the transfer.
+    ///
+    /// Default: unsupported (test doubles/fakes don't need this); both real
+    /// backends override it.
+    async fn copy_from_container(
+        &self,
+        _handle: &dyn SandboxHandle,
+        _container_path: &str,
+        _host_path: &Path,
+    ) -> Result<()> {
+        Err(RightsizeError::unsupported(
+            "runtime file copy",
+            self.name(),
+        ))
     }
 }
 

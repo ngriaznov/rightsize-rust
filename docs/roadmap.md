@@ -5,11 +5,24 @@ Items graduate off this page when they ship; the CHANGELOG records what landed.
 
 ## Native microVM memory snapshots
 
-Filesystem-level checkpoint/restore shipped on the docker backend (see
-[Checkpoint / Restore](./checkpoints.md)) — boot once, seed once, restore per test
-instead of re-seeding. What's left: true microVM memory snapshots, which need
-upstream microsandbox support and would make both restore near-instant and a live
-process's in-memory state (not just its filesystem) survive the restore.
+Filesystem-level checkpoint/restore ships on both backends now (see
+[Checkpoint / Restore](./checkpoints.md)): docker via image commit, microsandbox
+via disk snapshots (stops the sandbox, snapshots its disk, and boots it back from
+that snapshot under the same name and ports) — boot once, seed once, restore per
+test instead of re-seeding. What's left: true MEMORY
+snapshots, which would resume a sandbox mid-execution — a near-instant restore
+where a live process's in-memory state (not just its filesystem) survives too.
+That still needs upstream microsandbox support.
+
+## Portable checkpoint archives
+
+[Named checkpoints](./checkpoints.md#reusing-checkpoints-across-runs) make a
+checkpoint rediscoverable across processes on the SAME machine, via the shared
+rightsize cache directory's registry. What's missing is moving one to a different
+machine or CI cache entirely: export/import via `msb snapshot export`/`docker
+save` (and their `import`/`load` counterparts), so a checkpoint seeded once in CI
+can be shipped as a build artifact and restored on a fresh runner instead of
+re-seeding there too.
 
 ## Module breadth
 
@@ -28,10 +41,11 @@ fixture story, Vitest/Jest global-setup helpers, Axum/sqlx examples.
 Define an ad-hoc image inline in the test (Dockerfile-from-code) instead of
 publishing one — for testing your own service, not just its dependencies.
 
-## Copy files out; host-directory mounts
+## Host-directory mounts
 
-Copy-out (`copyFileFromContainer`) for extracting generated artifacts and
-debug dumps; host-directory binds alongside the existing copy-in.
+Start-time host-directory binds (`with_copy_file_to_container` currently mounts
+individual files) alongside the existing copy-in. Runtime copy-out already shipped
+— see [Copying Files](./copy.md).
 
 ## Declarative multi-service groups
 

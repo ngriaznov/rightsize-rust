@@ -167,8 +167,9 @@ fn serve_one_connection(
     current: &Arc<Mutex<Option<Child>>>,
     current_target: &Arc<Mutex<Option<TcpStream>>>,
 ) -> std::io::Result<bool> {
-    let mut child = Command::new(msb)
-        .args(commands::exec_stream(
+    let mut child = crate::backend::spawn_msb_command(|| {
+        let mut cmd = Command::new(msb);
+        cmd.args(commands::exec_stream(
             sandbox,
             &[
                 "nc".to_string(),
@@ -178,8 +179,9 @@ fn serve_one_connection(
             ],
         ))
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+        .stdout(Stdio::piped());
+        cmd
+    })?;
 
     let mut guest_out = child.stdout.take().expect("piped stdout");
     let mut guest_in = child.stdin.take().expect("piped stdin");

@@ -148,6 +148,17 @@ ignoring one or the other: the identity hash has no concept of network topology,
 "which network is this adopted sandbox on" has no well-defined answer. Drop either
 `.reuse(true)` or `.with_network(...)`.
 
+## Interaction with runtime copy
+
+`copy_file_to_container`/`copy_content_to_container`/`copy_file_from_container`
+(see [Copying Files](./copy.md)) work against a reuse sandbox exactly like any
+other runtime operation — but they mutate SHARED reused state, and they are **not**
+part of the reuse identity hash. Two `Container`s with an identical spec still
+adopt the same sandbox even if one process has copied files into it that another
+adopting process never touched; if a workload's correctness depends on a copied-in
+file's presence or content, tracking that dependency is on the caller, not the
+identity hash.
+
 ## Interaction with reaping
 
 A reuse sandbox is `keep_alive` under the hood — see

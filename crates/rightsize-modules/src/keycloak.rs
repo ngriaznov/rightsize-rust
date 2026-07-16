@@ -69,7 +69,7 @@ impl KeycloakContainer {
             .waiting_for(
                 Wait::for_http("/health")
                     .for_port(MANAGEMENT_PORT)
-                    .with_startup_timeout(Duration::from_secs(120)),
+                    .with_startup_timeout(Duration::from_secs(180)),
             );
         Self {
             container,

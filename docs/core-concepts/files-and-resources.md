@@ -1,5 +1,8 @@
 # Files & Resources
 
+This page covers mounting files in at start time. To copy files into (or out of) an
+already-running container, see [Copying Files](../copy.md) instead.
+
 ## Mounting host files into a container
 
 `MountableFile` resolves a host path (or a bundled test resource) before you mount it

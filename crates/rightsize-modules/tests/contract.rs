@@ -47,11 +47,21 @@
 //!
 //! Plus two checkpoint/restore behaviors:
 //!
-//! - Gating: identical typed-error refusal on a non-checkpoint-capable backend,
-//!   success with a well-formed image ref on a capable one:
-//!   [`checkpoint_gating_matches_the_capability_per_backend`]
-//! - Restore (docker-only): a marker file written after boot survives
-//!   checkpoint -> stop -> restore: [`checkpoint_restore_round_trips_a_marker_file_written_after_boot`]
+//! - Both backends succeed with a well-formed, backend-specific ref:
+//!   [`checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specific_ref`]
+//! - Restore (docker-only — microsandbox has its own dedicated test in
+//!   `rightsize-msb/tests/checkpoint_it.rs`): a marker file written after boot
+//!   survives checkpoint -> stop -> restore:
+//!   [`checkpoint_restore_round_trips_a_marker_file_written_after_boot`]
+//!
+//! Plus five runtime-copy behaviors (`ContainerGuard::copy_file_to_container` /
+//! `copy_content_to_container` / `copy_file_from_container`):
+//!
+//! - Copy a host file in, to an absent parent: [`copy_file_to_container_round_trips_a_host_file_into_an_absent_parent`]
+//! - Copy in-memory content in: [`copy_content_to_container_round_trips_in_memory_bytes`]
+//! - Copy a directory in: [`copy_file_to_container_round_trips_a_directory`]
+//! - Copy a guest file out, to an absent parent: [`copy_file_from_container_round_trips_a_guest_file`]
+//! - Copy a guest directory out: [`copy_file_from_container_round_trips_a_guest_directory`]
 //!
 //! `read_only_mount_enforced` is a per-backend override: true on docker (enforced),
 //! false on msb (advisory only on 0.6.2).
@@ -722,10 +732,12 @@ async fn diagnostics_report_reflects_a_live_container_in_the_pinned_cross_langua
 }
 
 /// Capabilities contract: the ACTIVE backend's `capabilities()` reports the pinned
-/// per-backend values from the isolation feature spec — msb (`"microsandbox"`) is
-/// hardware-isolated (its own kernel per sandbox) but not checkpoint-capable; docker
-/// is not hardware-isolated (shared host kernel) but is checkpoint-capable. Proven
-/// against the real backend instance this contract suite is parameterized over.
+/// per-backend values — msb (`"microsandbox"`) is hardware-isolated (its own kernel
+/// per sandbox) AND checkpoint-capable via disk snapshots, whose mechanism restarts
+/// the sandbox's workload; docker is not hardware-isolated (shared host kernel) but
+/// is checkpoint-capable via image commit, which leaves the container undisturbed.
+/// Proven against the real backend instance this contract suite is parameterized
+/// over.
 #[tokio::test]
 async fn capabilities_report_the_pinned_per_backend_values() {
     require_backend!();
@@ -733,17 +745,21 @@ async fn capabilities_report_the_pinned_per_backend_values() {
     let backend = raw_backend_for(&backend_name);
     let caps = backend.capabilities();
 
+    assert!(caps.checkpoint, "both real backends support checkpointing");
     if backend_name == "docker" {
         assert!(
             !caps.hardware_isolated,
             "docker must not report hardware isolation"
         );
-        assert!(caps.checkpoint, "docker must report checkpoint support");
+        assert!(
+            !caps.checkpoint_restarts_workload,
+            "an image commit leaves the container undisturbed"
+        );
     } else {
         assert!(caps.hardware_isolated, "msb must report hardware isolation");
         assert!(
-            !caps.checkpoint,
-            "msb must not report checkpoint support (reserved for a later wave)"
+            caps.checkpoint_restarts_workload,
+            "the stop/snapshot/start cycle reboots the guest"
         );
     }
 }
@@ -790,26 +806,13 @@ async fn require_isolation_gates_start_per_backend_hardware_isolation() {
 
 // ============================ checkpoint / restore =================================
 
-/// Best-effort `docker rmi <image_ref>` cleanup for a checkpoint image a test
-/// committed — shells out to the `docker` CLI rather than the daemon HTTP API
-/// (which this external contract crate has no client for), matching how this
-/// crate's other IT cleanup steps are plain best-effort side calls.
-fn docker_rmi(image_ref: &str) {
-    let _ = Command::new("docker")
-        .args(["rmi", "-f", image_ref])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-/// checkpoint gating contract: identical typed-error behavior across languages — a
-/// backend without `capabilities().checkpoint` refuses `checkpoint()` with
-/// `RightsizeError::CheckpointUnsupported` (naming the backend and the
-/// `RIGHTSIZE_BACKEND=docker` remedy) BEFORE any backend call; a checkpoint-capable
-/// backend succeeds and returns a well-formed `rightsize/checkpoint:<12hex>` ref.
+/// checkpoint contract: both real backends succeed and return a well-formed,
+/// backend-specific ref — docker tags `rightsize/checkpoint:<12hex>`, microsandbox
+/// names a snapshot `rz-ckpt-<12hex>` — and `Checkpoint::backend` names the backend
+/// that created it. Cleans up via `SandboxBackend::remove_checkpoint` (SPI-only —
+/// no shelling out to either CLI directly), keeping shared CI backend state clean.
 #[tokio::test]
-async fn checkpoint_gating_matches_the_capability_per_backend() {
+async fn checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specific_ref() {
     require_backend!();
     let backend_name = rightsize::backends::active_name();
 
@@ -818,54 +821,64 @@ async fn checkpoint_gating_matches_the_capability_per_backend() {
         .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
     let guard = c.start().await.expect("container must start");
 
-    if backend_name == "docker" {
-        let cp = guard
-            .checkpoint()
-            .await
-            .expect("checkpoint must succeed on the docker backend");
-        assert!(
-            cp.image_ref.starts_with("rightsize/checkpoint:"),
-            "{}",
-            cp.image_ref
-        );
-        let tag = cp.image_ref.strip_prefix("rightsize/checkpoint:").unwrap();
-        assert_eq!(tag.len(), 12, "{}", cp.image_ref);
-        assert!(
-            tag.chars().all(|c| c.is_ascii_hexdigit()),
-            "{}",
-            cp.image_ref
-        );
-        docker_rmi(&cp.image_ref);
-    } else {
-        let err = match guard.checkpoint().await {
-            Ok(_) => panic!("checkpoint() must refuse on a non-checkpoint-capable backend"),
-            Err(e) => e,
-        };
-        assert!(
-            matches!(err, rightsize::RightsizeError::CheckpointUnsupported { .. }),
-            "{err}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("microsandbox"), "{msg}");
-        assert!(msg.contains("RIGHTSIZE_BACKEND=docker"), "{msg}");
-    }
+    let cp = guard
+        .checkpoint()
+        .await
+        .expect("checkpoint must succeed on both real backends");
+    assert_eq!(cp.backend, backend_name);
 
+    let prefix = if backend_name == "docker" {
+        "rightsize/checkpoint:"
+    } else {
+        "rz-ckpt-"
+    };
+    let tag = cp
+        .checkpoint_ref
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("expected the {prefix} prefix, got {}", cp.checkpoint_ref));
+    assert_eq!(tag.len(), 12, "{}", cp.checkpoint_ref);
+    assert!(
+        tag.chars().all(|c| c.is_ascii_hexdigit()),
+        "{}",
+        cp.checkpoint_ref
+    );
+
+    let backend = raw_backend_for(&backend_name);
+    let _ = backend.remove_checkpoint(&cp.checkpoint_ref).await;
     guard.stop().await.unwrap();
 }
 
-/// The dedicated checkpoint/restore integration test (docker-only — microsandbox has
-/// no image-commit primitive, see the gating contract test above): boot a small
-/// image, exec-write a marker file, checkpoint it, stop the original, restore a new
-/// container from the checkpoint via `Container::from_checkpoint`, and assert the
-/// marker file is present in the restored container's filesystem — proving the
-/// "filesystem capture, not memory" semantics end to end. Cleans up the committed
-/// image at the end (checkpoint images are never auto-reaped — see the checkpoints
-/// docs).
+/// checkpoint gating contract: a backend without `capabilities().checkpoint` (a
+/// test double only — both real backends have it) refuses `checkpoint()` with
+/// `RightsizeError::CheckpointUnsupported`, naming the backend, BEFORE any backend
+/// call. Proven at the unit level with a fake backend
+/// (`crates/rightsize/src/container.rs`'s own tests) — nothing left to prove here
+/// against a real backend, since both real ones now succeed (see the test above).
+///
+/// restoring under a different backend than the creator, and reuse combined with
+/// `from_checkpoint`, are also unit-tested with fakes — see
+/// `from_checkpoint_under_a_different_backend_refuses_before_any_backend_call` and
+/// `reuse_combined_with_from_checkpoint_is_a_config_error` in that same module; both
+/// checks run entirely before any backend call, so a real-backend contract test
+/// would add no further coverage.
+///
+/// The dedicated checkpoint/restore integration test (docker-only — microsandbox
+/// gets its own dedicated test in `rightsize-msb`, since its restore proves a
+/// different mechanism: the stop/snapshot/start cycle and the post-checkpoint
+/// wait-rerun, not merely a filesystem diff): boot a small image, exec-write a
+/// marker file, checkpoint it, stop the original, restore a new container from the
+/// checkpoint via `Container::from_checkpoint`, and assert the marker file is
+/// present in the restored container's filesystem — proving the "filesystem
+/// capture, not memory" semantics end to end. Cleans up the committed image at the
+/// end (checkpoint images are never auto-reaped — see the checkpoints docs).
 #[tokio::test]
 async fn checkpoint_restore_round_trips_a_marker_file_written_after_boot() {
     require_backend!();
     if rightsize::backends::active_name() != "docker" {
-        eprintln!("skipping: checkpoint/restore is docker-only (microsandbox is unsupported)");
+        eprintln!(
+            "skipping: this dedicated restore test is docker-only — microsandbox has its own \
+             equivalent in rightsize-msb/tests/checkpoint_it.rs"
+        );
         return;
     }
 
@@ -916,7 +929,174 @@ async fn checkpoint_restore_round_trips_a_marker_file_written_after_boot() {
         .stop()
         .await
         .expect("stop the restored container");
-    docker_rmi(&cp.image_ref);
+    let backend = raw_backend_for("docker");
+    let _ = backend.remove_checkpoint(&cp.checkpoint_ref).await;
+}
+
+// ================================ runtime copy =====================================
+
+/// Boots a plain alpine sandbox with a long-lived `sleep` workload — the shared
+/// fixture for every runtime-copy contract test below; a log-anchored wait would be
+/// pointless here (alpine's `sleep` prints nothing), so a listening-port wait would
+/// also be wrong (nothing listens either) — `exec`-based readiness (a successful
+/// `true`) is the honest fit, mirroring how the msb loopback forwarder's
+/// accept-before-listen quirk is a non-issue when nothing is ever dialed.
+async fn boot_alpine_sleep() -> rightsize::ContainerGuard {
+    Container::new("alpine:3.19")
+        .with_command(&["sleep", "120"])
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)))
+        .start()
+        .await
+        .expect("container must start")
+}
+
+/// copy host file in -> `exec cat` returns exact content; the destination's parent
+/// did not pre-exist, proving the generic layer's mkdir-p step.
+#[tokio::test]
+async fn copy_file_to_container_round_trips_a_host_file_into_an_absent_parent() {
+    require_backend!();
+    let guard = boot_alpine_sleep().await;
+
+    let host_file =
+        std::env::temp_dir().join(format!("rightsize-copyin-file-{}.txt", std::process::id()));
+    let payload = "rightsize-runtime-copy-file-payload\n";
+    std::fs::write(&host_file, payload).unwrap();
+
+    guard
+        .copy_file_to_container(&host_file, "/copyin-file/nested/dst.txt")
+        .await
+        .expect("copy in must succeed");
+
+    let read = guard
+        .exec(&["cat", "/copyin-file/nested/dst.txt"])
+        .await
+        .expect("exec must run");
+    assert_eq!(read.exit_code, 0, "{}", read.stderr);
+    assert_eq!(read.stdout, payload);
+
+    std::fs::remove_file(&host_file).ok();
+    guard.stop().await.unwrap();
+}
+
+/// copy in-memory content in -> the same exec-cat round trip, no host file involved.
+#[tokio::test]
+async fn copy_content_to_container_round_trips_in_memory_bytes() {
+    require_backend!();
+    let guard = boot_alpine_sleep().await;
+
+    let payload = "rightsize-runtime-copy-content-payload\n";
+    guard
+        .copy_content_to_container(payload.as_bytes(), "/copyin-content/nested/dst.txt")
+        .await
+        .expect("copy content must succeed");
+
+    let read = guard
+        .exec(&["cat", "/copyin-content/nested/dst.txt"])
+        .await
+        .expect("exec must run");
+    assert_eq!(read.exit_code, 0, "{}", read.stderr);
+    assert_eq!(read.stdout, payload);
+
+    guard.stop().await.unwrap();
+}
+
+/// copy directory in -> nested file readable at `<dst>/<nested>` — `cp -r`-style
+/// destination naming: an absent destination becomes a copy of the source, not a
+/// copy nested one level deeper under it.
+#[tokio::test]
+async fn copy_file_to_container_round_trips_a_directory() {
+    require_backend!();
+    let guard = boot_alpine_sleep().await;
+
+    let host_dir =
+        std::env::temp_dir().join(format!("rightsize-copyin-dir-{}", std::process::id()));
+    std::fs::create_dir_all(host_dir.join("nested")).unwrap();
+    let payload = "rightsize-runtime-copy-dir-payload\n";
+    std::fs::write(host_dir.join("nested").join("f.txt"), payload).unwrap();
+
+    guard
+        .copy_file_to_container(&host_dir, "/copyin-dir")
+        .await
+        .expect("directory copy in must succeed");
+
+    let read = guard
+        .exec(&["cat", "/copyin-dir/nested/f.txt"])
+        .await
+        .expect("exec must run");
+    assert_eq!(read.exit_code, 0, "{}", read.stderr);
+    assert_eq!(read.stdout, payload);
+
+    std::fs::remove_dir_all(&host_dir).ok();
+    guard.stop().await.unwrap();
+}
+
+/// exec-write a file in the guest -> copy it out -> host file content matches; the
+/// host destination's parent did not pre-exist, proving the stdlib
+/// `create_dir_all` step on the copy-out side.
+#[tokio::test]
+async fn copy_file_from_container_round_trips_a_guest_file() {
+    require_backend!();
+    let guard = boot_alpine_sleep().await;
+
+    let write = guard
+        .exec(&[
+            "sh",
+            "-c",
+            "echo rightsize-runtime-copy-out-payload > /copyout-src.txt",
+        ])
+        .await
+        .expect("exec must run");
+    assert_eq!(write.exit_code, 0, "{}", write.stderr);
+
+    let host_dest = std::env::temp_dir()
+        .join(format!("rightsize-copyout-{}", std::process::id()))
+        .join("nested")
+        .join("f.txt");
+
+    guard
+        .copy_file_from_container("/copyout-src.txt", &host_dest)
+        .await
+        .expect("copy out must succeed");
+
+    let content = std::fs::read_to_string(&host_dest).expect("host file must exist");
+    assert_eq!(content, "rightsize-runtime-copy-out-payload\n");
+
+    std::fs::remove_dir_all(host_dest.parent().unwrap().parent().unwrap()).ok();
+    guard.stop().await.unwrap();
+}
+
+/// exec-write a nested directory in the guest -> copy the directory out -> the
+/// nested host file matches, same `cp -r`-style naming as the copy-in direction.
+#[tokio::test]
+async fn copy_file_from_container_round_trips_a_guest_directory() {
+    require_backend!();
+    let guard = boot_alpine_sleep().await;
+
+    let write = guard
+        .exec(&[
+            "sh",
+            "-c",
+            "mkdir -p /copyout-dir/nested && echo rightsize-runtime-copy-out-dir-payload > \
+             /copyout-dir/nested/f.txt",
+        ])
+        .await
+        .expect("exec must run");
+    assert_eq!(write.exit_code, 0, "{}", write.stderr);
+
+    let host_dest =
+        std::env::temp_dir().join(format!("rightsize-copyout-dir-{}", std::process::id()));
+
+    guard
+        .copy_file_from_container("/copyout-dir", &host_dest)
+        .await
+        .expect("directory copy out must succeed");
+
+    let content = std::fs::read_to_string(host_dest.join("nested").join("f.txt"))
+        .expect("host file must exist");
+    assert_eq!(content, "rightsize-runtime-copy-out-dir-payload\n");
+
+    std::fs::remove_dir_all(&host_dest).ok();
+    guard.stop().await.unwrap();
 }
 
 // ======================= Container reuse (double opt-in) ==========================

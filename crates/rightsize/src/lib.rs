@@ -8,7 +8,11 @@
 //! This crate owns the public surface — the `Container` builder, the `ContainerGuard`
 //! it returns, `Network`, wait strategies, the in-process free-port allocator, and the
 //! `SandboxBackend` trait that lets `rightsize-msb` and `rightsize-docker` plug in
-//! without this crate ever depending on either.
+//! without this crate ever depending on either. It also owns everything about a
+//! container's lifecycle past boot: own-run reaping and cross-run reuse, checkpoint
+//! and restore (both ephemeral and named, durable ones any later process can
+//! rediscover), copying files into a running container, live diagnostics, and gating
+//! a start on hardware isolation via `.require_isolation(true)`.
 
 pub mod backend;
 pub mod backends;

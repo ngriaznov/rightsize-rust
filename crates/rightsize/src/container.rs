@@ -66,7 +66,7 @@ pub struct Container {
     network: Option<Arc<Network>>,
     aliases: Vec<String>,
     mounts: Vec<FileMount>,
-    wait_strategy: Box<dyn WaitStrategy>,
+    wait_strategy: Arc<dyn WaitStrategy>,
     memory_limit_mb: Option<u64>,
     backend_override: Option<Arc<dyn SandboxBackend>>,
     spec_customizer: Option<Arc<SpecCustomizer>>,
@@ -76,6 +76,17 @@ pub struct Container {
     reuse_env_override: Option<bool>,
     require_isolation: bool,
     reaper_cache_dir_override: Option<std::path::PathBuf>,
+    /// Set by [`Container::from_checkpoint`] to the source checkpoint's `ref` —
+    /// threaded into the started spec's `ContainerSpec::checkpoint_ref`. `None` for
+    /// every ordinarily-built `Container`.
+    checkpoint_ref: Option<String>,
+    /// Set by [`Container::from_checkpoint`] to the source checkpoint's `backend` —
+    /// `start()` refuses before any backend work if this doesn't match the active
+    /// backend's name (see `RightsizeError::CheckpointBackendMismatch`).
+    checkpoint_backend: Option<String>,
+    /// Test/module seam: overrides the named-checkpoint registry's cache dir —
+    /// see [`Self::with_checkpoint_cache_dir_override`].
+    checkpoint_cache_dir_override: Option<std::path::PathBuf>,
 }
 
 impl Container {
@@ -91,7 +102,7 @@ impl Container {
             network: None,
             aliases: Vec::new(),
             mounts: Vec::new(),
-            wait_strategy: Wait::for_listening_port(),
+            wait_strategy: Arc::from(Wait::for_listening_port()),
             memory_limit_mb: None,
             backend_override: None,
             spec_customizer: None,
@@ -101,6 +112,9 @@ impl Container {
             reuse_env_override: None,
             require_isolation: false,
             reaper_cache_dir_override: None,
+            checkpoint_ref: None,
+            checkpoint_backend: None,
+            checkpoint_cache_dir_override: None,
         }
     }
 
@@ -115,16 +129,27 @@ impl Container {
     /// respect too: a fresh name, fresh host ports, normal reaping, normal `stop()`.
     ///
     /// Deliberately does NOT carry over the checkpoint's `mounts`, `network_id`, or
-    /// `aliases` — the checkpoint image already has whatever those mounts wrote,
-    /// baked directly into its filesystem (see [`Checkpoint`]'s own doc for the
+    /// `aliases` — the checkpoint already has whatever those mounts wrote, baked
+    /// directly into its filesystem (see [`Checkpoint`]'s own doc for the
     /// "filesystem capture, not memory" semantics), and network topology has no
     /// well-defined meaning to carry across a restore.
+    ///
+    /// Sets both `image` and [`crate::model::ContainerSpec::checkpoint_ref`] to
+    /// `cp.ref` — docker ignores the latter (the ref already is a normal image tag,
+    /// so the ordinary create path just works); microsandbox, when it's set, boots
+    /// via `msb run --snapshot <ref>` instead of its normal image boot. `start()`
+    /// refuses before any backend work — [`RightsizeError::CheckpointBackendMismatch`]
+    /// — if the active backend's name doesn't match `cp.backend`, and
+    /// [`RightsizeError::ReuseCheckpointConflict`] if `.reuse(true)` is also active,
+    /// since reuse identity has no concept of a checkpoint reference.
     pub fn from_checkpoint(cp: &Checkpoint) -> Container {
-        let mut c = Container::new(&cp.image_ref);
+        let mut c = Container::new(&cp.checkpoint_ref);
         c.env = cp.spec.env.clone();
         c.command = cp.spec.command.clone();
         c.exposed_ports = cp.spec.ports.iter().map(|p| p.guest_port).collect();
         c.memory_limit_mb = cp.spec.memory_limit_mb;
+        c.checkpoint_ref = Some(cp.checkpoint_ref.clone());
+        c.checkpoint_backend = Some(cp.backend.clone());
         c
     }
 
@@ -202,7 +227,7 @@ impl Container {
     /// satisfies the bound too, via the blanket impl in `crate::wait`, so it is never
     /// double-boxed).
     pub fn waiting_for(mut self, strategy: impl WaitStrategy + 'static) -> Self {
-        self.wait_strategy = Box::new(strategy);
+        self.wait_strategy = Arc::new(strategy);
         self
     }
 
@@ -222,7 +247,10 @@ impl Container {
     /// behaves exactly as an ordinary ephemeral container (with a single stderr
     /// note that reuse was requested but not enabled). Reuse cannot be combined
     /// with [`Self::with_network`] — `start()` returns
-    /// [`RightsizeError::ReuseNetworkConflict`] up front. Defaults to `false`.
+    /// [`RightsizeError::ReuseNetworkConflict`] up front — nor with
+    /// [`Self::from_checkpoint`] — [`RightsizeError::ReuseCheckpointConflict`],
+    /// since reuse identity has no concept of a checkpoint ref. Defaults to
+    /// `false`.
     pub fn reuse(mut self, enabled: bool) -> Self {
         self.reuse = enabled;
         self
@@ -299,6 +327,19 @@ impl Container {
         self
     }
 
+    /// Test/module seam: overrides the named-checkpoint registry's cache dir
+    /// instead of the real `crate::cache_dir::dir()` — distinct from
+    /// [`Self::with_cache_dir_override`] (reuse) and
+    /// [`Self::with_reaper_cache_dir_override`] (the reaping ledger). Every
+    /// current caller is a unit test exercising `ContainerGuard::checkpoint_named`,
+    /// which must never touch a real machine's `~/.cache/rightsize/checkpoints/`
+    /// directory. Threaded onto the returned [`ContainerGuard`] at `start()` time.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_checkpoint_cache_dir_override(mut self, dir: std::path::PathBuf) -> Self {
+        self.checkpoint_cache_dir_override = Some(dir);
+        self
+    }
+
     /// Module hook: rewrites the `ContainerSpec` with knowledge of this container's own
     /// mapped host ports, right before `create()` — e.g. Redpanda/Kafka's
     /// advertised-listener rewrite, which needs to know its own mapped port to advertise
@@ -342,6 +383,18 @@ impl Container {
     pub async fn start(self) -> Result<ContainerGuard> {
         let backend = self.active_backend();
 
+        if let Some(creator) = &self.checkpoint_backend {
+            // Checked before ANY backend work, including require_isolation below —
+            // a checkpoint ref from one backend's mechanism has no meaning to the
+            // other's, so there is nothing useful to attempt on a mismatch.
+            if creator != backend.name() {
+                return Err(RightsizeError::CheckpointBackendMismatch {
+                    active_backend: backend.name().to_string(),
+                    checkpoint_backend: creator.clone(),
+                });
+            }
+        }
+
         if self.require_isolation && !backend.capabilities().hardware_isolated {
             // Checked before any create/network work — reuse's own registry lookup,
             // ensure_network, and create_started_container all come after this, so a
@@ -356,6 +409,12 @@ impl Container {
                 .reuse_env_override
                 .unwrap_or_else(crate::reuse::env_enabled);
             if reuse_env_enabled {
+                if self.checkpoint_ref.is_some() {
+                    // Reuse identity has no concept of a checkpoint ref (it
+                    // deliberately never enters the identity hash) — this
+                    // combination has no well-defined adopt/create behavior.
+                    return Err(RightsizeError::ReuseCheckpointConflict);
+                }
                 if let Some(net) = &self.network {
                     return Err(RightsizeError::ReuseNetworkConflict {
                         network_id: net.id().to_string(),
@@ -408,6 +467,7 @@ impl Container {
             self.memory_limit_mb,
             self.spec_customizer.as_deref(),
             self.reaper_cache_dir_override.as_deref(),
+            self.checkpoint_ref.as_deref(),
         )
         .await?;
 
@@ -425,7 +485,7 @@ impl Container {
         let diagnostics_handle_id = handle.id().to_string();
         let diagnostics_spec = handle.spec().clone();
         let diagnostics_ports = mapped_ports.clone();
-        let guard = ContainerGuard {
+        let mut guard = ContainerGuard {
             handle: Some(handle),
             backend: backend.clone(),
             mapped_ports: Mutex::new(mapped_ports),
@@ -436,23 +496,29 @@ impl Container {
             ledger_name,
             keep_alive,
             reaper_cache_dir_override: self.reaper_cache_dir_override.clone(),
+            checkpoint_cache_dir_override: self.checkpoint_cache_dir_override.clone(),
+            wait_strategy: self.wait_strategy.clone(),
+            network_links: Vec::new(),
         };
 
         // Guarded block: install_network_links -> register -> wait. On ANY error here,
         // await the guard's own stop to completion, then propagate the original error —
         // a half-started container never leaks regardless of where in this block it
         // failed, and start() does not return until teardown has finished.
-        if let Err(e) = link_register_and_wait(
+        match link_register_and_wait(
             &guard,
             &backend,
             self.network.as_deref(),
             &self.aliases,
-            self.wait_strategy.as_ref(),
+            guard.wait_strategy.as_ref(),
         )
         .await
         {
-            let _ = guard.stop().await;
-            return Err(e);
+            Ok(links) => guard.network_links = links,
+            Err(e) => {
+                let _ = guard.stop().await;
+                return Err(e);
+            }
         }
 
         // Registered only once the readiness wait has fully succeeded — mirrors the
@@ -494,6 +560,7 @@ async fn create_started_container(
     memory_limit_mb: Option<u64>,
     spec_customizer: Option<&SpecCustomizer>,
     reaper_cache_dir_override: Option<&std::path::Path>,
+    checkpoint_ref: Option<&str>,
 ) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
 
@@ -520,6 +587,7 @@ async fn create_started_container(
             run_id: RunId::value().to_string(),
             memory_limit_mb,
             keep_alive: false,
+            checkpoint_ref: checkpoint_ref.map(ToString::to_string),
         };
 
         if let Some(customizer) = spec_customizer {
@@ -684,18 +752,22 @@ async fn link_register_and_wait(
     network: Option<&Network>,
     aliases: &[String],
     wait_strategy: &dyn WaitStrategy,
-) -> Result<()> {
-    if let Some(net) = network {
+) -> Result<Vec<crate::backend::NetworkLink>> {
+    let links = if let Some(net) = network {
         let links = net.links_for_new_member();
         backend
             .install_network_links(guard.handle_ref(), &links)
             .await?;
-    }
+        links
+    } else {
+        Vec::new()
+    };
     if let Some(net) = network {
         net.register(guard.as_network_member(), aliases.to_vec(), backend.clone());
     }
     let target = GuardWaitTarget { guard };
-    wait_strategy.wait_until_ready(&target).await
+    wait_strategy.wait_until_ready(&target).await?;
+    Ok(links)
 }
 
 /// Adapts a [`ContainerGuard`] to the [`WaitTarget`] a [`WaitStrategy`] needs.
@@ -911,11 +983,14 @@ async fn try_adopt(
         run_id: RunId::value().to_string(),
         memory_limit_mb: container.memory_limit_mb,
         keep_alive: true,
+        // Reuse + from_checkpoint is rejected up front in `Container::start()`
+        // (`RightsizeError::ReuseCheckpointConflict`) — a reuse sandbox never
+        // carries a checkpoint ref.
+        checkpoint_ref: None,
     };
 
-    let handle = match backend.find_running(&adopted_spec).await {
-        Ok(Some(h)) => h,
-        Ok(None) | Err(_) => return None,
+    let Ok(Some(handle)) = backend.find_running(&adopted_spec).await else {
+        return None;
     };
 
     let raw = RawWaitTarget {
@@ -950,6 +1025,9 @@ async fn try_adopt(
         ledger_name: identity.name.clone(),
         keep_alive: true,
         reaper_cache_dir_override: container.reaper_cache_dir_override.clone(),
+        checkpoint_cache_dir_override: container.checkpoint_cache_dir_override.clone(),
+        wait_strategy: container.wait_strategy.clone(),
+        network_links: Vec::new(),
     };
     crate::diagnostics::register(
         &guard.ledger_name,
@@ -1002,6 +1080,7 @@ async fn create_and_start_reuse_sandbox(
             run_id: RunId::value().to_string(),
             memory_limit_mb: container.memory_limit_mb,
             keep_alive: true,
+            checkpoint_ref: None,
         };
         if let Some(customizer) = &container.spec_customizer {
             let lookup: std::collections::HashMap<u16, u16> =
@@ -1111,6 +1190,9 @@ async fn create_fresh_reuse(
         ledger_name: identity.name.clone(),
         keep_alive: true,
         reaper_cache_dir_override: container.reaper_cache_dir_override.clone(),
+        checkpoint_cache_dir_override: container.checkpoint_cache_dir_override.clone(),
+        wait_strategy: container.wait_strategy.clone(),
+        network_links: Vec::new(),
     };
     crate::diagnostics::register(
         &guard.ledger_name,
@@ -1171,6 +1253,25 @@ pub struct ContainerGuard {
     /// `stop_inner`/`Drop`'s own `crate::reaper::after_stop` calls — see that
     /// builder's doc. `None` (the real cache dir) for every real caller.
     reaper_cache_dir_override: Option<std::path::PathBuf>,
+    /// Carries [`Container::with_checkpoint_cache_dir_override`]'s value across
+    /// into [`Self::checkpoint_named`]'s own registry writes. `None` (the real
+    /// cache dir) for every real caller.
+    checkpoint_cache_dir_override: Option<std::path::PathBuf>,
+    /// The wait strategy this container was started with — re-run by
+    /// [`Self::checkpoint`] when the backend's checkpoint mechanism restarts the
+    /// workload (see [`crate::backend::Capabilities::checkpoint_restarts_workload`]).
+    /// `Arc`, not `Box`, so both the guard and the reuse-adopt path (which only
+    /// ever borrows a `&Container`) can share the same strategy instance without
+    /// cloning a `dyn WaitStrategy` itself.
+    wait_strategy: Arc<dyn WaitStrategy>,
+    /// The network links installed at `start()` time (empty if this container has
+    /// no `network`) — re-sent to `install_network_links` by [`Self::checkpoint`]
+    /// when the backend's checkpoint mechanism restarts the workload, since a
+    /// guest reboot kills msb's emulated exec-tunnel links just like it would any
+    /// other in-guest state. Always empty for a reuse-adopted guard: reuse and
+    /// networks are mutually exclusive (see `RightsizeError::ReuseNetworkConflict`),
+    /// so there's never anything to re-install there.
+    network_links: Vec<crate::backend::NetworkLink>,
 }
 
 impl ContainerGuard {
@@ -1256,30 +1357,235 @@ impl ContainerGuard {
         self.backend.exec(self.require_handle()?, &cmd).await
     }
 
-    /// Checkpoints this RUNNING container: commits its current filesystem state into
-    /// a new image via the active backend's `commit_to_image`, and returns a
-    /// [`Checkpoint`] carrying that image's ref plus this container's full spec (see
-    /// [`Checkpoint`]'s own doc for the "filesystem capture, not memory" semantics
-    /// and [`Container::from_checkpoint`] for restoring from the result).
+    /// Copies `host_path` (a file or directory) into this RUNNING container at
+    /// `container_path` — the RUNTIME counterpart to a start-time
+    /// [`Container::with_copy_file_to_container`] mount, usable any time after
+    /// `start()` rather than only pre-boot. `container_path` must be absolute (both
+    /// backend CLIs require a `NAME:/abs/path` shape); its parent directory is
+    /// created in the guest first (`mkdir -p`), so the destination never has to
+    /// pre-exist. Directory semantics match `cp -r`/`docker cp`/`msb copy`
+    /// themselves: copying a directory to an absent destination produces the
+    /// destination as a copy of the source (contents under the destination, not
+    /// nested one level deeper).
+    ///
+    /// Requires this guard to currently be running and `container_path` to be
+    /// absolute — both checked BEFORE any backend call, same state-error shape as
+    /// [`Self::exec`]/[`Self::logs`]. Works on a reuse container (it's an ordinary
+    /// runtime operation), but mutates shared reused state and is NOT part of the
+    /// reuse identity hash — see the reuse docs.
+    pub async fn copy_file_to_container(
+        &self,
+        host_path: impl AsRef<std::path::Path>,
+        container_path: &str,
+    ) -> Result<()> {
+        let handle = self.require_handle()?;
+        require_absolute_container_path(container_path)?;
+        if let Some(parent) = container_parent_dir(container_path) {
+            let mkdir = vec!["mkdir".to_string(), "-p".to_string(), parent.to_string()];
+            self.backend.exec(handle, &mkdir).await?;
+        }
+        self.backend
+            .copy_to_container(handle, host_path.as_ref(), container_path)
+            .await
+    }
+
+    /// Convenience for [`Self::copy_file_to_container`] when the content to copy in
+    /// only exists in memory: writes `content` to a private (mode `0600` on unix)
+    /// temp file, delegates to [`Self::copy_file_to_container`], and removes the
+    /// temp file afterward regardless of the outcome. No streaming protocol — this
+    /// is exactly the file path, minus the caller having to manage one.
+    pub async fn copy_content_to_container(
+        &self,
+        content: impl AsRef<[u8]>,
+        container_path: &str,
+    ) -> Result<()> {
+        let temp = TempCopyFile::create(content.as_ref())?;
+        self.copy_file_to_container(&temp.path, container_path)
+            .await
+    }
+
+    /// The reverse direction of [`Self::copy_file_to_container`]: copies
+    /// `container_path` (a file or directory) out of this RUNNING container to
+    /// `host_path`. `host_path`'s parent directory is created on the host first
+    /// (via the stdlib), so the destination never has to pre-exist. Same
+    /// running/absolute-path checks as the copy-in direction, in the same order,
+    /// before any backend call.
+    pub async fn copy_file_from_container(
+        &self,
+        container_path: &str,
+        host_path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        let handle = self.require_handle()?;
+        require_absolute_container_path(container_path)?;
+        let host_path = host_path.as_ref();
+        if let Some(parent) = host_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        self.backend
+            .copy_from_container(handle, container_path, host_path)
+            .await
+    }
+
+    /// Checkpoints this RUNNING container via the active backend's own
+    /// `create_checkpoint` mechanism (docker: image commit; microsandbox: disk
+    /// snapshot), and returns a [`Checkpoint`] carrying the resulting ref, which
+    /// backend created it, and this container's full spec (see [`Checkpoint`]'s own
+    /// doc for the "filesystem capture, not memory" semantics and
+    /// [`Container::from_checkpoint`] for restoring from the result).
     ///
     /// Gated on [`crate::backend::Capabilities::checkpoint`] BEFORE any backend
-    /// call: on a backend that doesn't support it (microsandbox today), this returns
-    /// [`RightsizeError::CheckpointUnsupported`] without ever reaching
-    /// `commit_to_image`. Requires this guard to currently be running — a state
-    /// error otherwise, same shape as [`Self::exec`]/[`Self::logs`].
+    /// call: on a backend that doesn't support it (a test double only — both real
+    /// backends do), this returns [`RightsizeError::CheckpointUnsupported`] without
+    /// ever reaching `create_checkpoint`. Requires this guard to currently be
+    /// running — a state error otherwise, same shape as [`Self::exec`]/[`Self::logs`].
+    ///
+    /// When the backend's checkpoint mechanism restarts the sandbox's workload
+    /// (`capabilities().checkpoint_restarts_workload` — microsandbox's stop/
+    /// snapshot/start cycle reboots the guest), this re-installs this container's
+    /// network links (if any were installed at `start()` time — a reboot kills
+    /// msb's emulated exec-tunnel links along with everything else in the guest)
+    /// and then re-runs the container's own configured wait strategy before
+    /// returning, so a caller never gets back a false-ready or unreachable-by-alias
+    /// container. Docker's image commit leaves the container undisturbed, so
+    /// neither re-installation nor re-wait runs there.
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
+        self.ensure_checkpoint_capable()?;
+        let handle = self.require_handle()?;
+        let nonce = checkpoint::generate_ref_nonce();
+        let (checkpoint_ref, spec) = self.checkpoint_core(handle, &nonce).await?;
+        Ok(Checkpoint {
+            checkpoint_ref,
+            backend: self.backend.name().to_string(),
+            spec,
+        })
+    }
+
+    /// Named counterpart to [`Self::checkpoint`]: everything that method does
+    /// (the capability gate, the running-guard check, the backend
+    /// `create_checkpoint` call, and — on a backend whose checkpoint mechanism
+    /// restarts the workload — the network-relink-then-rewait dance) applies
+    /// here identically, PLUS a durable, rediscoverable registry entry under
+    /// `name` (see the checkpoints docs' "Reusing checkpoints across runs"
+    /// section and [`Checkpoint::find`]/[`Checkpoint::list`]/[`Checkpoint::remove`]).
+    ///
+    /// `name` must match `^[a-z0-9][a-z0-9-]{0,40}$` —
+    /// [`RightsizeError::InvalidCheckpointName`] before any backend call or
+    /// registry I/O otherwise, the same up-front gate every named-checkpoint
+    /// entry point shares.
+    ///
+    /// **Re-checkpointing an existing name REPLACES it**: if the registry
+    /// already has an entry for `name`, this best-effort removes that entry's
+    /// backend-native artifact BEFORE taking the new checkpoint — but only when
+    /// that entry's backend matches the currently active one, mirroring
+    /// [`Checkpoint::find`]'s own same-backend gate. If the entry belongs to a
+    /// different backend, the removal call is skipped outright (the active
+    /// backend has no business operating on a ref format it didn't create) and
+    /// that artifact is left behind under its original backend. Either way, the
+    /// registry entry itself is rewritten once the new checkpoint succeeds.
+    /// Latest wins in the registry; a skipped cross-backend artifact has to be
+    /// cleaned up manually under the backend that created it (see the
+    /// checkpoints docs' cross-run section).
+    ///
+    /// The registry write happens ONLY after the backend checkpoint itself has
+    /// succeeded — a `create_checkpoint` failure leaves any existing registry
+    /// entry for `name` exactly as it was (already removed above, in the
+    /// replace case — so a failed re-checkpoint does lose the old entry; there
+    /// is no atomic "keep the old one if the new one fails" here, matching the
+    /// backend-level reality that the old artifact was already best-effort torn
+    /// down before the new one was attempted).
+    pub async fn checkpoint_named(&self, name: &str) -> Result<Checkpoint> {
+        checkpoint::validate_name(name)?;
+        self.ensure_checkpoint_capable()?;
+        let handle = self.require_handle()?;
+
+        let cache_dir = self
+            .checkpoint_cache_dir_override
+            .clone()
+            .unwrap_or_else(crate::cache_dir::dir);
+        let registry = checkpoint::Registry::new(&cache_dir, name);
+        if let Some(previous) = registry.read() {
+            if previous.backend == self.backend.name() {
+                let _ = self
+                    .backend
+                    .remove_checkpoint(&previous.checkpoint_ref)
+                    .await;
+            }
+        }
+
+        let (checkpoint_ref, spec) = self.checkpoint_core(handle, name).await?;
+
+        let entry = checkpoint::NamedRegistryEntry {
+            name: name.to_string(),
+            checkpoint_ref: checkpoint_ref.clone(),
+            backend: self.backend.name().to_string(),
+            created_iso: crate::reuse::now_iso8601(),
+            spec: checkpoint::NamedRegistrySpec {
+                env: spec.env.iter().cloned().collect(),
+                command: spec.command.clone(),
+                exposed_ports: spec.ports.iter().map(|p| p.guest_port).collect(),
+                memory_limit_mb: spec.memory_limit_mb,
+            },
+        };
+        registry.write_atomic(&entry)?;
+
+        Ok(Checkpoint {
+            checkpoint_ref,
+            backend: self.backend.name().to_string(),
+            spec,
+        })
+    }
+
+    /// The capability gate [`Self::checkpoint`] and [`Self::checkpoint_named`]
+    /// both apply BEFORE any backend call: on a backend that doesn't support
+    /// checkpointing (a test double only — both real backends do), this
+    /// returns [`RightsizeError::CheckpointUnsupported`] without ever reaching
+    /// `create_checkpoint`.
+    fn ensure_checkpoint_capable(&self) -> Result<()> {
         if !self.backend.capabilities().checkpoint {
             return Err(RightsizeError::CheckpointUnsupported {
                 backend: self.backend.name().to_string(),
             });
         }
-        let handle = self.require_handle()?;
-        let image_ref = checkpoint::generate_image_ref();
-        self.backend.commit_to_image(handle, &image_ref).await?;
-        Ok(Checkpoint {
-            image_ref,
-            spec: handle.spec().clone(),
-        })
+        Ok(())
+    }
+
+    /// The machinery [`Self::checkpoint`] and [`Self::checkpoint_named`] share:
+    /// the backend `create_checkpoint` call under `nonce_or_name` (a random
+    /// nonce for the former, the caller-chosen name for the latter — both
+    /// backends format whichever bare string they're given into their own ref
+    /// shape identically either way), and, on a backend whose checkpoint
+    /// mechanism restarts the workload
+    /// (`capabilities().checkpoint_restarts_workload` — microsandbox's stop/
+    /// snapshot/start cycle reboots the guest), re-installing this container's
+    /// network links (if any were installed at `start()` time — a reboot kills
+    /// msb's emulated exec-tunnel links along with everything else in the
+    /// guest) and re-running the container's own configured wait strategy
+    /// before returning, so a caller never gets back a false-ready or
+    /// unreachable-by-alias container. Docker's image commit leaves the
+    /// container undisturbed, so neither re-installation nor re-wait runs
+    /// there. Returns the resulting ref and this container's full spec at
+    /// checkpoint time.
+    async fn checkpoint_core(
+        &self,
+        handle: &dyn SandboxHandle,
+        nonce_or_name: &str,
+    ) -> Result<(String, ContainerSpec)> {
+        let checkpoint_ref = self
+            .backend
+            .create_checkpoint(handle, nonce_or_name)
+            .await?;
+        if self.backend.capabilities().checkpoint_restarts_workload {
+            if !self.network_links.is_empty() {
+                self.backend
+                    .install_network_links(handle, &self.network_links)
+                    .await?;
+            }
+            let target = GuardWaitTarget { guard: self };
+            self.wait_strategy.wait_until_ready(&target).await?;
+        }
+        Ok((checkpoint_ref, handle.spec().clone()))
     }
 
     /// Streams log lines to `consumer` as they're produced. Closing (or dropping) the
@@ -1442,6 +1748,265 @@ impl Drop for ContainerGuard {
     }
 }
 
+impl Checkpoint {
+    /// Rediscovers a NAMED checkpoint written by an earlier call to
+    /// [`ContainerGuard::checkpoint_named`] — in this process or an earlier
+    /// one, as long as both agree on the rightsize cache directory (see
+    /// `crate::cache_dir`). `Ok(None)` when no registry entry exists for
+    /// `name` at all — including a corrupt/unreadable entry, which is
+    /// best-effort cleaned up and treated exactly like "never existed."
+    ///
+    /// An entry whose `backend` matches the CURRENTLY ACTIVE backend is
+    /// PROBED (via `SandboxBackend::has_checkpoint`) before being returned: if
+    /// the backend-native artifact is gone (the disk snapshot/image was
+    /// deleted out from under the registry), the entry is stale — this
+    /// best-effort deletes the registry file and returns `Ok(None)`, same as
+    /// "never existed." An entry for a DIFFERENT backend is returned WITHOUT
+    /// probing: this crate never forces a backend the host may not even have
+    /// installed to answer a query it can't, and
+    /// [`Container::from_checkpoint`]'s own restore-time mismatch gate
+    /// (`RightsizeError::CheckpointBackendMismatch`) stays the sole authority
+    /// for that case.
+    ///
+    /// A probe failure (the backend's own `has_checkpoint` erroring — a
+    /// daemon unreachable, a malformed ref) propagates rather than resolving
+    /// to `Ok(None)`: only a definite "not there" is treated as stale.
+    ///
+    /// `name` is validated (`^[a-z0-9][a-z0-9-]{0,40}$`) before any registry
+    /// I/O or backend call.
+    pub async fn find(name: &str) -> Result<Option<Checkpoint>> {
+        checkpoint::validate_name(name)?;
+        find_named(name, &backends::active(), &crate::cache_dir::dir()).await
+    }
+
+    /// Every named checkpoint currently registered under the rightsize cache
+    /// directory — registry contents only, NO artifact probing (a checkpoint
+    /// whose backend-native artifact has since been deleted out from under
+    /// the registry still appears here; only [`Self::find`] resolves that
+    /// discrepancy, and only for the one name it's asked about).
+    /// Corrupt/unreadable entries are silently skipped.
+    pub fn list() -> Result<Vec<Checkpoint>> {
+        list_named(&crate::cache_dir::dir())
+    }
+
+    /// Removes a named checkpoint: best-effort removes the backend-native
+    /// artifact via the currently active backend's `remove_checkpoint`, then
+    /// deletes the registry file. Returns whether anything existed to remove
+    /// — `Ok(false)`, not an error, when `name` has no registry entry at all.
+    /// Idempotent: safe to call more than once, or on a name that was never
+    /// checkpointed — "not found anywhere" is success.
+    ///
+    /// The artifact-removal call is skipped when the entry's backend doesn't
+    /// match the currently active one — the same same-backend gate
+    /// [`Checkpoint::find`] applies — since the active backend has no business
+    /// operating on a ref format it didn't create. The registry entry is still
+    /// deleted (and this still returns `Ok(true)`) either way; a skipped
+    /// cross-backend artifact is left behind and must be cleaned up manually
+    /// under the backend that created it (see the checkpoints docs' cross-run
+    /// section).
+    ///
+    /// `name` is validated before any registry I/O or backend call.
+    pub async fn remove(name: &str) -> Result<bool> {
+        checkpoint::validate_name(name)?;
+        remove_named(name, &backends::active(), &crate::cache_dir::dir()).await
+    }
+}
+
+/// [`Checkpoint::find`]'s actual logic, parameterized over the backend and
+/// cache dir so this crate's own unit tests can exercise it against a fake
+/// backend and a temp directory instead of the real process-wide active
+/// backend and `~/.cache/rightsize`.
+async fn find_named(
+    name: &str,
+    backend: &Arc<dyn SandboxBackend>,
+    cache_dir: &std::path::Path,
+) -> Result<Option<Checkpoint>> {
+    let registry = checkpoint::Registry::new(cache_dir, name);
+    let Some(entry) = registry.read() else {
+        // Missing OR corrupt: best-effort clean up a corrupt file, harmless
+        // no-op if genuinely absent.
+        registry.delete();
+        return Ok(None);
+    };
+
+    if entry.backend != backend.name() {
+        // A different backend's entry is returned unprobed — see this
+        // method's own doc for why.
+        return Ok(Some(checkpoint_from_entry(entry)));
+    }
+
+    match backend.has_checkpoint(&entry.checkpoint_ref).await {
+        Ok(true) => Ok(Some(checkpoint_from_entry(entry))),
+        Ok(false) => {
+            // Definitely gone: the registry entry is stale.
+            registry.delete();
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// [`Checkpoint::list`]'s actual logic, parameterized over the cache dir for
+/// the same reason [`find_named`] is.
+fn list_named(cache_dir: &std::path::Path) -> Result<Vec<Checkpoint>> {
+    let entries = checkpoint::list_registry_entries(cache_dir)?;
+    Ok(entries.into_iter().map(checkpoint_from_entry).collect())
+}
+
+/// [`Checkpoint::remove`]'s actual logic, parameterized over the backend and
+/// cache dir for the same reason [`find_named`] is.
+async fn remove_named(
+    name: &str,
+    backend: &Arc<dyn SandboxBackend>,
+    cache_dir: &std::path::Path,
+) -> Result<bool> {
+    let registry = checkpoint::Registry::new(cache_dir, name);
+    let existed = registry.exists();
+    if let Some(entry) = registry.read() {
+        if entry.backend == backend.name() {
+            let _ = backend.remove_checkpoint(&entry.checkpoint_ref).await;
+        }
+    }
+    registry.delete();
+    Ok(existed)
+}
+
+/// Reconstructs a [`Checkpoint`] from a registry entry read back off disk.
+/// The entry only ever persisted the reduced slice of a spec
+/// `Container::from_checkpoint` actually reads (env, command, exposed/guest
+/// ports, memory limit — see `checkpoint::NamedRegistrySpec`'s own doc), so
+/// every other `ContainerSpec` field here is a harmless placeholder:
+/// `from_checkpoint` never reads a checkpoint's `spec.name`, `mounts`,
+/// `network_id`, `aliases`, `run_id`, `keep_alive`, or `spec.checkpoint_ref` —
+/// only the top-level `Checkpoint::checkpoint_ref` matters for that. Host
+/// ports are unknowable from a persisted spec (only the guest side was ever
+/// saved) and unused by `from_checkpoint` either way (it re-derives fresh
+/// host ports at `start()` time), so they're placeholder `0`.
+fn checkpoint_from_entry(entry: checkpoint::NamedRegistryEntry) -> Checkpoint {
+    let ports = entry
+        .spec
+        .exposed_ports
+        .iter()
+        .map(|&guest_port| crate::model::PortBinding {
+            host_port: 0,
+            guest_port,
+        })
+        .collect();
+    Checkpoint {
+        checkpoint_ref: entry.checkpoint_ref.clone(),
+        backend: entry.backend,
+        spec: ContainerSpec {
+            name: format!("rz-checkpoint-{}", entry.name),
+            image: entry.checkpoint_ref,
+            env: entry.spec.env.into_iter().collect(),
+            command: entry.spec.command,
+            ports,
+            mounts: Vec::new(),
+            network_id: None,
+            aliases: Vec::new(),
+            run_id: String::new(),
+            memory_limit_mb: entry.spec.memory_limit_mb,
+            keep_alive: false,
+            checkpoint_ref: None,
+        },
+    }
+}
+
+/// Fails fast with an actionable message unless `path` is absolute — both backend
+/// CLIs (`msb copy`, `docker cp`) require a `NAME:/abs/path` shape, and a relative
+/// path would resolve against whatever directory happens to be the guest's default
+/// working directory, which no caller of this API should have to know or guess.
+fn require_absolute_container_path(path: &str) -> Result<()> {
+    if path.starts_with('/') {
+        Ok(())
+    } else {
+        Err(RightsizeError::Backend(format!(
+            "container path '{path}' must be absolute — both msb copy and docker cp require a \
+             NAME:/abs/path shape"
+        )))
+    }
+}
+
+/// The parent directory of an absolute guest path, as a pure string operation (guest
+/// paths are always POSIX-shaped, regardless of the host OS this library runs on).
+/// `None` only for the root itself (`"/"`, after trimming a trailing slash) — nothing
+/// to `mkdir -p` there, since it always exists.
+fn container_parent_dir(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None; // path was "/" (or "///...") — no parent to create.
+    }
+    match trimmed.rfind('/') {
+        Some(0) => Some("/"),
+        Some(idx) => Some(&trimmed[..idx]),
+        None => None, // unreachable once `require_absolute_container_path` passed.
+    }
+}
+
+/// A host temp file created for [`ContainerGuard::copy_content_to_container`]:
+/// private permissions (mode `0600` on unix — best-effort elsewhere), removed on
+/// drop regardless of whether the copy that follows succeeds. RAII rather than a
+/// bare trailing cleanup call, so a copy failure still cleans up — the same
+/// `Drop`-guard discipline this crate's own integration tests use for a reuse
+/// sandbox's cleanup (see `rightsize-msb/tests/reuse_it.rs`).
+struct TempCopyFile {
+    path: std::path::PathBuf,
+}
+
+impl TempCopyFile {
+    /// Writes `content` to a fresh, uniquely-named file under the host temp
+    /// directory and returns a guard that removes it on drop.
+    fn create(content: &[u8]) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "rightsize-copy-content-{}-{seq}-{nanos}",
+            std::process::id()
+        ));
+        write_private_temp_file(&path, content)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempCopyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Writes `content` to a brand-new file at `path` with permissions restricted to
+/// the owner (mode `0600`) on unix — the file may carry arbitrary caller content,
+/// so it gets the same private-by-default treatment as any other host temp file
+/// this crate writes.
+#[cfg(unix)]
+fn write_private_temp_file(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(content)
+}
+
+/// Non-unix fallback: no portable "create with restricted permissions" primitive in
+/// `std` outside unix, so this is a plain create-new write.
+#[cfg(not(unix))]
+fn write_private_temp_file(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    use std::io::Write;
+    f.write_all(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,10 +2073,24 @@ mod tests {
         started: Vec<String>,
         stopped: Vec<String>,
         installed_links: Vec<(String, Vec<crate::backend::NetworkLink>)>,
-        /// `(handle id, image_ref)` for every `commit_to_image` call this backend
+        /// `(handle id, ref)` for every `create_checkpoint` call this backend
         /// actually received — the checkpoint gating tests' proof that a capability
         /// refusal never reaches the backend at all.
         committed: Vec<(String, String)>,
+        /// `(handle id, host path, container path, did host_path exist at call
+        /// time)` for every `copy_to_container` call this backend actually
+        /// received — the `existed` flag is the temp-file-cleanup test's proof that
+        /// the file was really there during the call, not merely gone afterward.
+        copied_in: Vec<(String, std::path::PathBuf, String, bool)>,
+        /// `(handle id, container path, host path)` for every `copy_from_container`
+        /// call this backend actually received.
+        copied_out: Vec<(String, String, std::path::PathBuf)>,
+        /// Every ref `remove_checkpoint` actually received — the named-checkpoint
+        /// replace/remove tests' proof of exactly which ref was torn down.
+        removed_checkpoints: Vec<String>,
+        /// Every ref `has_checkpoint` actually received — `Checkpoint::find`'s
+        /// probe tests' proof that a different-backend entry is never probed.
+        probed_checkpoints: Vec<String>,
     }
 
     struct FakeBackend {
@@ -1520,6 +2099,19 @@ mod tests {
         fail_ensure_network: bool,
         hardware_isolated: bool,
         checkpoint_capable: bool,
+        checkpoint_restarts_workload: bool,
+        /// When true, `create_checkpoint` fails outright — the
+        /// "checkpoint_named writes no registry entry on backend failure" test's
+        /// fixture.
+        fail_create_checkpoint: bool,
+        /// `has_checkpoint`'s canned answer: `Some(true)`/`Some(false)` for a
+        /// definite exists/absent, `None` to simulate a probe FAILURE (an `Err`,
+        /// never resolved to `Ok(false)` — see `SandboxBackend::has_checkpoint`'s
+        /// own "only a definite not-there may return false" contract). Defaults to
+        /// `Some(true)`, overridable after construction via
+        /// [`FakeBackend::set_probe_result`].
+        probe_result: StdMutex<Option<bool>>,
+        name: &'static str,
     }
     impl FakeBackend {
         fn new() -> Arc<Self> {
@@ -1529,6 +2121,10 @@ mod tests {
                 fail_ensure_network: false,
                 hardware_isolated: false,
                 checkpoint_capable: false,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
             })
         }
         fn failing_install_network_links() -> Arc<Self> {
@@ -1538,6 +2134,10 @@ mod tests {
                 fail_ensure_network: false,
                 hardware_isolated: false,
                 checkpoint_capable: false,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
             })
         }
         fn failing_ensure_network() -> Arc<Self> {
@@ -1547,6 +2147,10 @@ mod tests {
                 fail_ensure_network: true,
                 hardware_isolated: false,
                 checkpoint_capable: false,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
             })
         }
         /// A fake backend that reports `capabilities().hardware_isolated == true` —
@@ -1558,10 +2162,15 @@ mod tests {
                 fail_ensure_network: false,
                 hardware_isolated: true,
                 checkpoint_capable: false,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
             })
         }
-        /// A fake backend that reports `capabilities().checkpoint == true` — the
-        /// checkpoint happy-path fixture.
+        /// A fake backend that reports `capabilities().checkpoint == true` and
+        /// `checkpoint_restarts_workload == false` — the docker-shaped checkpoint
+        /// happy-path fixture (the container is left undisturbed).
         fn checkpoint_capable() -> Arc<Self> {
             Arc::new(Self {
                 state: StdMutex::new(FakeBackendState::default()),
@@ -1569,13 +2178,72 @@ mod tests {
                 fail_ensure_network: false,
                 hardware_isolated: false,
                 checkpoint_capable: true,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
             })
+        }
+        /// A fake backend that reports both `capabilities().checkpoint == true` AND
+        /// `checkpoint_restarts_workload == true` — the microsandbox-shaped
+        /// checkpoint fixture (the stop/snapshot/start cycle restarts the workload,
+        /// so `ContainerGuard::checkpoint` must re-run the wait strategy).
+        fn checkpoint_capable_restarts_workload() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: true,
+                checkpoint_restarts_workload: true,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
+            })
+        }
+        /// A fake backend with a caller-chosen name and `checkpoint` capability —
+        /// the backend-mismatch test's fixture, which needs two fakes with
+        /// DIFFERENT names (the default "fake" is shared by every other
+        /// constructor here, so a mismatch test needs its own).
+        fn named(name: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: true,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                name,
+            })
+        }
+        /// A `checkpoint`-capable fake whose `create_checkpoint` always fails —
+        /// the "a failed checkpoint_named leaves no registry entry" test's fixture.
+        fn checkpoint_capable_that_fails_create() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: true,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: true,
+                probe_result: StdMutex::new(Some(true)),
+                name: "fake",
+            })
+        }
+
+        /// Overrides this fake's `has_checkpoint` answer after construction — see
+        /// the `probe_result` field's own doc.
+        fn set_probe_result(&self, result: Option<bool>) {
+            *self.probe_result.lock().unwrap() = result;
         }
     }
     #[async_trait::async_trait]
     impl SandboxBackend for FakeBackend {
         fn name(&self) -> &str {
-            "fake"
+            self.name
         }
         fn supports_native_networks(&self) -> bool {
             false
@@ -1584,6 +2252,7 @@ mod tests {
             crate::backend::Capabilities {
                 hardware_isolated: self.hardware_isolated,
                 checkpoint: self.checkpoint_capable,
+                checkpoint_restarts_workload: self.checkpoint_restarts_workload,
             }
         }
         async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
@@ -1664,12 +2333,71 @@ mod tests {
         fn watchdog_kill_command(&self) -> Vec<String> {
             vec!["true".to_string()]
         }
-        async fn commit_to_image(&self, handle: &dyn SandboxHandle, image_ref: &str) -> Result<()> {
+        async fn create_checkpoint(
+            &self,
+            handle: &dyn SandboxHandle,
+            nonce: &str,
+        ) -> Result<String> {
+            if self.fail_create_checkpoint {
+                return Err(RightsizeError::Backend(
+                    "create_checkpoint failed".to_string(),
+                ));
+            }
+            let checkpoint_ref = format!("fake-checkpoint:{nonce}");
             self.state
                 .lock()
                 .unwrap()
                 .committed
-                .push((handle.id().to_string(), image_ref.to_string()));
+                .push((handle.id().to_string(), checkpoint_ref.clone()));
+            Ok(checkpoint_ref)
+        }
+        async fn remove_checkpoint(&self, checkpoint_ref: &str) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .removed_checkpoints
+                .push(checkpoint_ref.to_string());
+            Ok(())
+        }
+        async fn has_checkpoint(&self, checkpoint_ref: &str) -> Result<bool> {
+            self.state
+                .lock()
+                .unwrap()
+                .probed_checkpoints
+                .push(checkpoint_ref.to_string());
+            match *self.probe_result.lock().unwrap() {
+                Some(exists) => Ok(exists),
+                None => Err(RightsizeError::Backend(
+                    "has_checkpoint probe failed".to_string(),
+                )),
+            }
+        }
+        async fn copy_to_container(
+            &self,
+            handle: &dyn SandboxHandle,
+            host_path: &std::path::Path,
+            container_path: &str,
+        ) -> Result<()> {
+            let existed = host_path.exists();
+            self.state.lock().unwrap().copied_in.push((
+                handle.id().to_string(),
+                host_path.to_path_buf(),
+                container_path.to_string(),
+                existed,
+            ));
+            Ok(())
+        }
+        async fn copy_from_container(
+            &self,
+            handle: &dyn SandboxHandle,
+            container_path: &str,
+            host_path: &std::path::Path,
+        ) -> Result<()> {
+            self.state.lock().unwrap().copied_out.push((
+                handle.id().to_string(),
+                container_path.to_string(),
+                host_path.to_path_buf(),
+            ));
             Ok(())
         }
     }
@@ -1759,7 +2487,7 @@ mod tests {
     // =========================== checkpoint / restore ==============================
 
     // Capability gating: a backend with checkpoint == false refuses before any
-    // backend call — the typed error, and `commit_to_image` is never invoked.
+    // backend call — the typed error, and `create_checkpoint` is never invoked.
     #[tokio::test]
     async fn checkpoint_refuses_before_any_backend_call_when_capability_is_false() {
         let backend = FakeBackend::new(); // capabilities().checkpoint == false
@@ -1776,10 +2504,10 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains("fake"), "{msg}");
-        assert!(msg.contains("RIGHTSIZE_BACKEND=docker"), "{msg}");
+        assert!(msg.contains("capabilities().checkpoint"), "{msg}");
         assert!(
             backend.state.lock().unwrap().committed.is_empty(),
-            "commit_to_image must never be called once capability gating refuses"
+            "create_checkpoint must never be called once capability gating refuses"
         );
 
         guard.stop().await.unwrap();
@@ -1800,14 +2528,15 @@ mod tests {
         assert!(err.to_string().contains("not running"), "{err}");
         assert!(
             backend.state.lock().unwrap().committed.is_empty(),
-            "commit_to_image must never be called on a non-running guard"
+            "create_checkpoint must never be called on a non-running guard"
         );
     }
 
-    // The returned Checkpoint carries a well-formed imageRef and the full source
-    // spec — env, command, exposed ports, memory limit and all.
+    // The returned Checkpoint carries a well-formed backend-specific ref, the
+    // creating backend's name, and the full source spec — env, command, exposed
+    // ports, memory limit and all.
     #[tokio::test]
-    async fn checkpoint_returns_the_image_ref_and_the_full_source_spec() {
+    async fn checkpoint_returns_the_ref_backend_and_the_full_source_spec() {
         let backend = FakeBackend::checkpoint_capable();
         let c = container_on(&backend)
             .with_env("A", "1")
@@ -1819,21 +2548,22 @@ mod tests {
         let cp = guard.checkpoint().await.expect("checkpoint must succeed");
 
         let tag = cp
-            .image_ref
-            .strip_prefix("rightsize/checkpoint:")
+            .checkpoint_ref
+            .strip_prefix("fake-checkpoint:")
             .unwrap_or_else(|| {
                 panic!(
-                    "expected the rightsize/checkpoint: prefix, got {}",
-                    cp.image_ref
+                    "expected the fake-checkpoint: prefix, got {}",
+                    cp.checkpoint_ref
                 )
             });
-        assert_eq!(tag.len(), 12, "{}", cp.image_ref);
+        assert_eq!(tag.len(), 12, "{}", cp.checkpoint_ref);
         assert!(
             tag.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "{}",
-            cp.image_ref
+            cp.checkpoint_ref
         );
+        assert_eq!(cp.backend, "fake");
 
         assert_eq!(cp.spec.env, vec![("A".to_string(), "1".to_string())]);
         assert_eq!(cp.spec.command, Some(vec!["redis-server".to_string()]));
@@ -1844,9 +2574,226 @@ mod tests {
         let committed = backend.state.lock().unwrap().committed.clone();
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].0, guard.name());
-        assert_eq!(committed[0].1, cp.image_ref);
+        assert_eq!(committed[0].1, cp.checkpoint_ref);
 
         guard.stop().await.unwrap();
+    }
+
+    // Backend-mismatch: restoring a checkpoint under a different active backend
+    // than the one that created it refuses before any backend call.
+    #[tokio::test]
+    async fn from_checkpoint_under_a_different_backend_refuses_before_any_backend_call() {
+        let source_backend = FakeBackend::named("fake-a");
+        let source = container_on(&source_backend).with_exposed_ports(&[6379]);
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+        assert_eq!(cp.backend, "fake-a");
+
+        let restore_backend = FakeBackend::named("fake-b");
+        let restored = Container::from_checkpoint(&cp).with_backend(restore_backend.clone());
+
+        let err = expect_start_err(
+            restored.start().await,
+            "restoring under a different backend than the creator must refuse",
+        );
+        assert!(
+            matches!(err, RightsizeError::CheckpointBackendMismatch { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("fake-a"), "{msg}");
+        assert!(msg.contains("fake-b"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=fake-a"), "{msg}");
+        assert!(
+            restore_backend.state.lock().unwrap().created.is_empty(),
+            "no backend call may happen once the mismatch is detected"
+        );
+    }
+
+    // reuse + from_checkpoint: a config error, before any backend work.
+    #[tokio::test]
+    async fn reuse_combined_with_from_checkpoint_is_a_config_error() {
+        let source_backend = FakeBackend::checkpoint_capable();
+        let source = container_on(&source_backend).with_exposed_ports(&[6379]);
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        let restore_backend = FakeBackend::checkpoint_capable();
+        let restored = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .with_reuse_env_override(true)
+            .reuse(true);
+
+        let err = expect_start_err(
+            restored.start().await,
+            "reuse combined with from_checkpoint must refuse before any backend work",
+        );
+        assert!(
+            matches!(err, RightsizeError::ReuseCheckpointConflict),
+            "{err}"
+        );
+        assert!(
+            restore_backend.state.lock().unwrap().created.is_empty(),
+            "no backend call may happen once the conflict is detected"
+        );
+    }
+
+    /// A wait strategy that counts every call — the checkpoint-rewait tests' proof
+    /// of whether (and how many times) the wait strategy actually ran.
+    struct CountingWait {
+        calls: Arc<StdMutex<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl WaitStrategy for CountingWait {
+        async fn wait_until_ready(&self, _target: &dyn WaitTarget) -> Result<()> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn with_startup_timeout(self: Box<Self>, _timeout: Duration) -> Box<dyn WaitStrategy> {
+            self
+        }
+    }
+
+    // Post-checkpoint rewait: a backend whose checkpoint mechanism restarts the
+    // workload gets its wait strategy re-run before checkpoint() returns.
+    #[tokio::test]
+    async fn checkpoint_reruns_the_wait_strategy_when_the_backend_restarts_the_workload() {
+        let calls = Arc::new(StdMutex::new(0usize));
+        let backend = FakeBackend::checkpoint_capable_restarts_workload();
+        let c = Container::new("redis:8.6-alpine")
+            .with_backend(backend.clone())
+            .with_exposed_ports(&[6379])
+            .waiting_for(CountingWait {
+                calls: calls.clone(),
+            });
+        let guard = c.start().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1, "start() runs the wait once");
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "a backend whose checkpoint restarts the workload must re-run the wait strategy \
+             before checkpoint() returns"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Post-checkpoint rewait, negative case: a backend whose checkpoint leaves the
+    // container undisturbed (docker's image commit) must NOT re-run the wait.
+    #[tokio::test]
+    async fn checkpoint_does_not_rerun_the_wait_strategy_when_the_container_is_left_undisturbed() {
+        let calls = Arc::new(StdMutex::new(0usize));
+        let backend = FakeBackend::checkpoint_capable(); // checkpoint_restarts_workload == false
+        let c = Container::new("redis:8.6-alpine")
+            .with_backend(backend.clone())
+            .with_exposed_ports(&[6379])
+            .waiting_for(CountingWait {
+                calls: calls.clone(),
+            });
+        let guard = c.start().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "a backend whose checkpoint leaves the container running must not re-run the wait"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Post-checkpoint network re-link: a backend whose checkpoint mechanism
+    // restarts the workload (killing msb's emulated exec-tunnel links along with
+    // everything else in the guest) gets its network links re-installed, a second
+    // time with the same links, before checkpoint() returns.
+    #[tokio::test]
+    async fn checkpoint_reinstalls_network_links_when_the_backend_restarts_the_workload() {
+        let backend = FakeBackend::checkpoint_capable_restarts_workload();
+        let net = Arc::new(Network::new_network());
+        let stub = container_on(&backend)
+            .with_exposed_ports(&[8888])
+            .with_network(&net)
+            .with_network_aliases(&["configuration-stub"]);
+        let stub_guard = stub.start().await.unwrap();
+
+        let app = container_on(&backend)
+            .with_exposed_ports(&[8080])
+            .with_network(&net)
+            .waiting_for(ReadyImmediately);
+        let app_guard = app.start().await.unwrap();
+
+        let links_at_start = {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(
+                state.installed_links.len(),
+                1,
+                "start() installs the app's link to the already-running stub once"
+            );
+            state.installed_links[0].1.clone()
+        };
+
+        app_guard
+            .checkpoint()
+            .await
+            .expect("checkpoint must succeed");
+
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(
+                state.installed_links.len(),
+                2,
+                "a backend whose checkpoint restarts the workload must re-install the network \
+                 links a second time before checkpoint() returns: {:?}",
+                state.installed_links
+            );
+            assert_eq!(
+                state.installed_links[1].1, links_at_start,
+                "the re-installed links must be the exact same links installed at start()"
+            );
+        }
+
+        app_guard.stop().await.unwrap();
+        stub_guard.stop().await.unwrap();
+    }
+
+    // Post-checkpoint network re-link, negative case: a backend whose checkpoint
+    // leaves the container undisturbed (docker's image commit) must NOT re-install
+    // network links — the tunnel/alias state was never disturbed.
+    #[tokio::test]
+    async fn checkpoint_does_not_reinstall_network_links_when_the_container_is_left_undisturbed() {
+        let backend = FakeBackend::checkpoint_capable(); // checkpoint_restarts_workload == false
+        let net = Arc::new(Network::new_network());
+        let stub = container_on(&backend)
+            .with_exposed_ports(&[8888])
+            .with_network(&net)
+            .with_network_aliases(&["configuration-stub"]);
+        let stub_guard = stub.start().await.unwrap();
+
+        let app = container_on(&backend)
+            .with_exposed_ports(&[8080])
+            .with_network(&net)
+            .waiting_for(ReadyImmediately);
+        let app_guard = app.start().await.unwrap();
+        assert_eq!(backend.state.lock().unwrap().installed_links.len(), 1);
+
+        app_guard
+            .checkpoint()
+            .await
+            .expect("checkpoint must succeed");
+        assert_eq!(
+            backend.state.lock().unwrap().installed_links.len(),
+            1,
+            "a backend whose checkpoint leaves the container running must not re-install \
+             network links"
+        );
+
+        app_guard.stop().await.unwrap();
+        stub_guard.stop().await.unwrap();
     }
 
     // `Container::from_checkpoint` applies the checkpoint's image/env/command/
@@ -1871,7 +2818,8 @@ mod tests {
             .waiting_for(ReadyImmediately);
         let restored_guard = restored.start().await.expect("restore must start");
         let created = restore_backend.state.lock().unwrap().created[0].clone();
-        assert_eq!(created.image, cp.image_ref);
+        assert_eq!(created.image, cp.checkpoint_ref);
+        assert_eq!(created.checkpoint_ref, Some(cp.checkpoint_ref.clone()));
         assert_eq!(created.env, vec![("A".to_string(), "1".to_string())]);
         assert_eq!(created.command, Some(vec!["redis-server".to_string()]));
         assert_eq!(created.ports.len(), 1);
@@ -1897,6 +2845,567 @@ mod tests {
             ])
         );
         overridden_guard.stop().await.unwrap();
+    }
+
+    // =========================== named checkpoints ==============================
+
+    fn sample_named_entry(
+        name: &str,
+        checkpoint_ref: &str,
+        backend: &str,
+    ) -> checkpoint::NamedRegistryEntry {
+        checkpoint::NamedRegistryEntry {
+            name: name.to_string(),
+            checkpoint_ref: checkpoint_ref.to_string(),
+            backend: backend.to_string(),
+            created_iso: "2025-01-01T00:00:00Z".to_string(),
+            spec: checkpoint::NamedRegistrySpec {
+                env: std::collections::BTreeMap::from([("A".to_string(), "1".to_string())]),
+                command: Some(vec!["redis-server".to_string()]),
+                exposed_ports: vec![6379],
+                memory_limit_mb: Some(256),
+            },
+        }
+    }
+
+    // Name validation refuses before any backend call.
+    #[tokio::test]
+    async fn checkpoint_named_rejects_an_invalid_name_before_any_backend_call() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("checkpoint-named-invalid");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_checkpoint_cache_dir_override(cache_dir);
+        let guard = c.start().await.unwrap();
+
+        let err = guard
+            .checkpoint_named("Bad Name!")
+            .await
+            .expect_err("an invalid name must be rejected");
+        assert!(
+            matches!(err, RightsizeError::InvalidCheckpointName { .. }),
+            "{err}"
+        );
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "create_checkpoint must never be called once name validation refuses"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Writes the pinned registry JSON (exact field names) only after the backend
+    // checkpoint has succeeded.
+    #[tokio::test]
+    async fn checkpoint_named_writes_the_pinned_registry_json_after_backend_success() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("checkpoint-named-write");
+        let c = container_on(&backend)
+            .with_env("A", "1")
+            .with_exposed_ports(&[6379])
+            .with_command(&["redis-server"])
+            .with_memory_limit(256)
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+
+        let cp = guard
+            .checkpoint_named("seeded-db")
+            .await
+            .expect("checkpoint_named must succeed");
+        assert_eq!(cp.checkpoint_ref, "fake-checkpoint:seeded-db");
+        assert_eq!(cp.backend, "fake");
+
+        let raw = std::fs::read_to_string(cache_dir.join("checkpoints").join("seeded-db.json"))
+            .expect("the registry file must exist");
+        for pinned in [
+            "\"name\": \"seeded-db\"",
+            "\"ref\": \"fake-checkpoint:seeded-db\"",
+            "\"backend\": \"fake\"",
+            "\"createdIso\"",
+            "\"spec\"",
+            "\"env\"",
+            "\"command\"",
+            "\"exposedPorts\"",
+            "\"memoryLimitMb\": 256",
+        ] {
+            assert!(raw.contains(pinned), "{pinned} missing from {raw}");
+        }
+
+        guard.stop().await.unwrap();
+    }
+
+    // A failed backend checkpoint leaves no registry entry behind.
+    #[tokio::test]
+    async fn checkpoint_named_writes_no_registry_entry_when_the_backend_call_fails() {
+        let backend = FakeBackend::checkpoint_capable_that_fails_create();
+        let cache_dir = temp_cache_dir("checkpoint-named-fail");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+
+        guard
+            .checkpoint_named("seeded-db")
+            .await
+            .expect_err("a failing backend checkpoint must propagate");
+
+        assert!(
+            !cache_dir
+                .join("checkpoints")
+                .join("seeded-db.json")
+                .exists(),
+            "no registry entry may be written when the backend call fails"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Replace semantics: a second checkpoint_named under the same name removes the
+    // old ref first and leaves the registry pointing at the new one.
+    #[tokio::test]
+    async fn checkpoint_named_replaces_an_existing_name_removing_the_old_ref_first() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("checkpoint-named-replace");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+
+        let first = guard.checkpoint_named("seeded-db").await.unwrap();
+        assert_eq!(first.checkpoint_ref, "fake-checkpoint:seeded-db");
+
+        let second = guard.checkpoint_named("seeded-db").await.unwrap();
+        assert_eq!(second.checkpoint_ref, "fake-checkpoint:seeded-db");
+
+        assert_eq!(
+            backend.state.lock().unwrap().removed_checkpoints,
+            vec![first.checkpoint_ref.clone()],
+            "re-checkpointing an existing name must best-effort remove the OLD ref first"
+        );
+
+        let entry = checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .read()
+            .expect("the registry entry must still exist");
+        assert_eq!(entry.checkpoint_ref, second.checkpoint_ref);
+
+        guard.stop().await.unwrap();
+    }
+
+    // Replace semantics, cross-backend entry: when the existing registry entry
+    // belongs to a DIFFERENT backend than the one now active, checkpoint_named must
+    // never call remove_checkpoint on it (the active backend has no business
+    // operating on a ref format it didn't create) — it just proceeds with the new
+    // capture and overwrites the registry entry.
+    #[tokio::test]
+    async fn checkpoint_named_replace_never_removes_a_different_backend_entry() {
+        let backend = FakeBackend::checkpoint_capable(); // name == "fake"
+        let cache_dir = temp_cache_dir("checkpoint-named-replace-cross-backend");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "other-backend-ref",
+                "fake-other",
+            ))
+            .unwrap();
+
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+
+        let replaced = guard.checkpoint_named("seeded-db").await.unwrap();
+        assert_eq!(replaced.checkpoint_ref, "fake-checkpoint:seeded-db");
+
+        assert!(
+            backend.state.lock().unwrap().removed_checkpoints.is_empty(),
+            "a different-backend entry's ref must never reach remove_checkpoint"
+        );
+
+        let entry = checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .read()
+            .expect("the registry entry must be overwritten with the new one");
+        assert_eq!(entry.checkpoint_ref, replaced.checkpoint_ref);
+        assert_eq!(entry.backend, "fake");
+
+        guard.stop().await.unwrap();
+    }
+
+    // Checkpoint::find (via its parameterized inner function): no entry at all.
+    #[tokio::test]
+    async fn find_named_returns_none_when_no_entry_exists() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("find-named-absent");
+        let found = find_named(
+            "seeded-db",
+            &(backend as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap();
+        assert!(found.is_none());
+    }
+
+    // find: an entry whose artifact still exists (per the probe) is returned, and
+    // the probe actually ran against the recorded ref.
+    #[tokio::test]
+    async fn find_named_returns_the_checkpoint_when_the_artifact_still_exists() {
+        let backend = FakeBackend::checkpoint_capable(); // probe_result defaults to Some(true)
+        let cache_dir = temp_cache_dir("find-named-present");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:abc",
+                "fake",
+            ))
+            .unwrap();
+
+        let found = find_named(
+            "seeded-db",
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap()
+        .expect("an entry whose artifact exists must be returned");
+        assert_eq!(found.checkpoint_ref, "fake-checkpoint:abc");
+        assert_eq!(found.backend, "fake");
+        assert_eq!(found.spec.command, Some(vec!["redis-server".to_string()]));
+        assert_eq!(found.spec.ports[0].guest_port, 6379);
+        assert_eq!(found.spec.memory_limit_mb, Some(256));
+        assert_eq!(
+            backend.state.lock().unwrap().probed_checkpoints,
+            vec!["fake-checkpoint:abc".to_string()]
+        );
+    }
+
+    // find: a gone artifact is a stale entry — deleted, and treated as absent.
+    #[tokio::test]
+    async fn find_named_treats_a_gone_artifact_as_stale_and_deletes_the_entry() {
+        let backend = FakeBackend::checkpoint_capable();
+        backend.set_probe_result(Some(false)); // "definitely gone"
+        let cache_dir = temp_cache_dir("find-named-stale");
+        let registry = checkpoint::Registry::new(&cache_dir, "seeded-db");
+        registry
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:gone",
+                "fake",
+            ))
+            .unwrap();
+
+        let found = find_named(
+            "seeded-db",
+            &(backend as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap();
+        assert!(found.is_none());
+        assert!(
+            !registry.exists(),
+            "a stale entry (artifact confirmed gone) must be deleted"
+        );
+    }
+
+    // find: corrupt JSON is treated exactly like "no entry" — never probed.
+    #[tokio::test]
+    async fn find_named_treats_corrupt_json_as_absent_without_probing() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("find-named-corrupt");
+        std::fs::create_dir_all(cache_dir.join("checkpoints")).unwrap();
+        std::fs::write(
+            cache_dir.join("checkpoints").join("seeded-db.json"),
+            b"not json",
+        )
+        .unwrap();
+
+        let found = find_named(
+            "seeded-db",
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap();
+        assert!(found.is_none());
+        assert!(
+            backend.state.lock().unwrap().probed_checkpoints.is_empty(),
+            "a corrupt entry must never reach the probe"
+        );
+    }
+
+    // find: an entry for a DIFFERENT backend is returned WITHOUT probing.
+    #[tokio::test]
+    async fn find_named_returns_a_different_backend_entry_unprobed() {
+        let backend = FakeBackend::named("fake-active");
+        let cache_dir = temp_cache_dir("find-named-other-backend");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry("seeded-db", "other-ref", "fake-other"))
+            .unwrap();
+
+        let found = find_named(
+            "seeded-db",
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap()
+        .expect("a different-backend entry must still be returned");
+        assert_eq!(found.backend, "fake-other");
+        assert!(
+            backend.state.lock().unwrap().probed_checkpoints.is_empty(),
+            "a different-backend entry must never be probed via the active backend"
+        );
+    }
+
+    // find: a probe failure propagates — never resolves to "absent".
+    #[tokio::test]
+    async fn find_named_propagates_a_probe_failure_as_an_error() {
+        let backend = FakeBackend::checkpoint_capable();
+        backend.set_probe_result(None); // simulate a probe error
+        let cache_dir = temp_cache_dir("find-named-probe-error");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:x",
+                "fake",
+            ))
+            .unwrap();
+
+        let err = find_named(
+            "seeded-db",
+            &(backend as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .expect_err("a probe failure must surface, never resolve to Ok(None)");
+        assert!(matches!(err, RightsizeError::Backend(_)), "{err}");
+    }
+
+    // list: corrupt entries are skipped; a missing directory is an empty list.
+    #[tokio::test]
+    async fn list_named_skips_corrupt_entries() {
+        let cache_dir = temp_cache_dir("list-named-mixed");
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+
+        checkpoint::Registry::new(&cache_dir, "good")
+            .write_atomic(&sample_named_entry("good", "fake-checkpoint:good", "fake"))
+            .unwrap();
+        std::fs::write(
+            cache_dir.join("checkpoints").join("corrupt.json"),
+            b"not json",
+        )
+        .unwrap();
+
+        let listed = list_named(&cache_dir).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].checkpoint_ref, "fake-checkpoint:good");
+    }
+
+    // remove: idempotent, and reports whether anything actually existed.
+    #[tokio::test]
+    async fn remove_named_is_idempotent_and_reports_correctly() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("remove-named");
+        let registry = checkpoint::Registry::new(&cache_dir, "seeded-db");
+        registry
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:x",
+                "fake",
+            ))
+            .unwrap();
+
+        let removed = remove_named(
+            "seeded-db",
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap();
+        assert!(removed, "a name with a registry entry must report true");
+        assert!(!registry.exists());
+        assert_eq!(
+            backend.state.lock().unwrap().removed_checkpoints,
+            vec!["fake-checkpoint:x".to_string()]
+        );
+
+        let removed_again = remove_named(
+            "seeded-db",
+            &(backend as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !removed_again,
+            "removing a name with no registry entry must report false, not error"
+        );
+    }
+
+    // remove: an entry belonging to a DIFFERENT backend than the one now active must
+    // still delete the registry entry and report true, but must NEVER call
+    // remove_checkpoint on the active backend with a ref format it didn't create —
+    // the same same-backend gate find_named already applies.
+    #[tokio::test]
+    async fn remove_named_deletes_a_different_backend_entry_without_calling_remove_checkpoint() {
+        let backend = FakeBackend::named("fake-active");
+        let cache_dir = temp_cache_dir("remove-named-cross-backend");
+        let registry = checkpoint::Registry::new(&cache_dir, "seeded-db");
+        registry
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "other-backend-ref",
+                "fake-other",
+            ))
+            .unwrap();
+
+        let removed = remove_named(
+            "seeded-db",
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            removed,
+            "a different-backend entry still counts as something existed to remove"
+        );
+        assert!(
+            !registry.exists(),
+            "the registry entry must be deleted regardless of the entry's backend"
+        );
+        assert!(
+            backend.state.lock().unwrap().removed_checkpoints.is_empty(),
+            "a different-backend entry's ref must never reach remove_checkpoint"
+        );
+    }
+
+    // =============================== runtime copy ===================================
+
+    // Not-running: a typed error, before any backend call.
+    #[tokio::test]
+    async fn copy_file_to_container_on_a_non_running_container_is_a_state_error() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let mut guard = c.start().await.unwrap();
+        guard.stop_inner().await; // stops it in place, without consuming the guard.
+
+        let err = guard
+            .copy_file_to_container("/tmp/does-not-matter", "/dst")
+            .await
+            .expect_err("copy must refuse on a stopped guard");
+        assert!(err.to_string().contains("not running"), "{err}");
+        assert!(
+            backend.state.lock().unwrap().copied_in.is_empty(),
+            "the backend must never be called once the running check refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_file_from_container_on_a_non_running_container_is_a_state_error() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let mut guard = c.start().await.unwrap();
+        guard.stop_inner().await;
+
+        let err = guard
+            .copy_file_from_container("/src", "/tmp/does-not-matter")
+            .await
+            .expect_err("copy must refuse on a stopped guard");
+        assert!(err.to_string().contains("not running"), "{err}");
+        assert!(backend.state.lock().unwrap().copied_out.is_empty());
+    }
+
+    // Relative container path: a typed error, before any backend call, on both
+    // directions.
+    #[tokio::test]
+    async fn copy_file_to_container_with_a_relative_path_is_a_typed_error() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+
+        let err = guard
+            .copy_file_to_container("/tmp/does-not-matter", "relative/path")
+            .await
+            .expect_err("a relative container path must be refused");
+        assert!(err.to_string().contains("must be absolute"), "{err}");
+        assert!(backend.state.lock().unwrap().copied_in.is_empty());
+
+        guard.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_file_from_container_with_a_relative_path_is_a_typed_error() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+
+        let err = guard
+            .copy_file_from_container("relative/path", "/tmp/does-not-matter")
+            .await
+            .expect_err("a relative container path must be refused");
+        assert!(err.to_string().contains("must be absolute"), "{err}");
+        assert!(backend.state.lock().unwrap().copied_out.is_empty());
+
+        guard.stop().await.unwrap();
+    }
+
+    // The generic layer's own mkdir-p pre-step: an exec call is issued for the
+    // destination's parent directory before the backend's copy_to_container.
+    #[tokio::test]
+    async fn copy_file_to_container_issues_a_mkdir_p_for_the_parent_before_the_backend_copy() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+
+        guard
+            .copy_file_to_container("/tmp/host-src.txt", "/mnt/nested/dst.txt")
+            .await
+            .expect("copy must succeed against the fake backend");
+
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.copied_in.len(), 1);
+            assert_eq!(state.copied_in[0].2, "/mnt/nested/dst.txt");
+            assert_eq!(
+                state.copied_in[0].1,
+                std::path::PathBuf::from("/tmp/host-src.txt")
+            );
+        }
+
+        guard.stop().await.unwrap();
+    }
+
+    // copy_content_to_container: writes to a temp file, delegates to the file path,
+    // and removes the temp file afterward — the caller never has to manage it.
+    #[tokio::test]
+    async fn copy_content_to_container_creates_and_removes_its_temp_file() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+
+        guard
+            .copy_content_to_container(b"hello from memory".as_slice(), "/dst/from-memory.txt")
+            .await
+            .expect("copy must succeed against the fake backend");
+
+        let (temp_path, existed_during_the_call) = {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.copied_in.len(), 1);
+            assert_eq!(state.copied_in[0].2, "/dst/from-memory.txt");
+            (state.copied_in[0].1.clone(), state.copied_in[0].3)
+        };
+        assert!(
+            existed_during_the_call,
+            "the temp file must exist at the moment the backend is called: {temp_path:?}"
+        );
+        assert!(
+            !temp_path.exists(),
+            "the temp file must be removed once the copy call returns: {temp_path:?}"
+        );
+
+        guard.stop().await.unwrap();
     }
 
     // Interlock with the reaping ledger: a restored container is registered and

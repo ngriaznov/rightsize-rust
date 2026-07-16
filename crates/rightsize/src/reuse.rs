@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::cache_dir::unique_tmp_suffix;
 use crate::error::{Result, RightsizeError};
 use crate::model::FileMount;
 
@@ -234,7 +235,10 @@ impl Registry {
 
     /// Writes the registry file atomically (temp file + rename), creating
     /// `<cacheDir>/reuse/` if needed. Called only after the reused container's own
-    /// wait strategy has already succeeded.
+    /// wait strategy has already succeeded. The temp file's name is unique per
+    /// write (see [`unique_tmp_suffix`]) rather than a fixed `<hash>.json.tmp`, so
+    /// two processes registering the same identity at once can never interleave
+    /// writes into one shared temp file and rename a torn result.
     pub(crate) fn write_atomic(&self, entry: &RegistryEntry) -> std::io::Result<()> {
         let dir = self
             .path
@@ -243,7 +247,9 @@ impl Registry {
         fs::create_dir_all(dir)?;
         let json =
             serde_json::to_vec_pretty(entry).expect("RegistryEntry has no non-serializable fields");
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", unique_tmp_suffix()));
         {
             let mut f = File::create(&tmp)?;
             f.write_all(&json)?;
@@ -516,6 +522,34 @@ mod tests {
             created_iso: "2025-01-01T00:00:00Z".to_string(),
             backend: "docker".to_string(),
         }
+    }
+
+    #[test]
+    fn write_atomic_survives_a_stale_leftover_tmp_file() {
+        let cache = temp_cache_dir("stale-tmp");
+        let registry = Registry::new(&cache, "deadbeef");
+
+        // A writer that crashed between creating its temp file and renaming it
+        // would leave exactly this behind. It must not collide with (or be
+        // mistaken for) a later write's own uniquely-named temp file.
+        fs::create_dir_all(cache.join("reuse")).unwrap();
+        fs::write(
+            cache.join("reuse").join("deadbeef.json.tmp.stale"),
+            b"leftover from a crashed writer",
+        )
+        .unwrap();
+
+        registry.write_atomic(&sample_entry()).unwrap();
+        assert_eq!(registry.read(), Some(sample_entry()));
+
+        let mut replaced = sample_entry();
+        replaced.name = "rz-reuse-replacement0".to_string();
+        registry.write_atomic(&replaced).unwrap();
+        assert_eq!(
+            registry.read(),
+            Some(replaced),
+            "a second write must still land cleanly with the stale tmp file still sitting next to it"
+        );
     }
 
     #[test]

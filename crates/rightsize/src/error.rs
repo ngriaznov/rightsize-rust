@@ -76,6 +76,19 @@ pub enum RightsizeError {
         network_id: String,
     },
 
+    /// `.reuse(true)` was combined with `Container::from_checkpoint(...)`. Reuse's
+    /// identity hash has no concept of a checkpoint reference (`checkpoint_ref`
+    /// deliberately does not enter it), so this combination has no well-defined
+    /// adopt/create behavior. Raised in `Container::start()`, before any backend
+    /// work, once reuse is fully active (both opt-ins) — mirrors
+    /// [`RightsizeError::ReuseNetworkConflict`]'s own gating.
+    #[error(
+        "Container reuse cannot be combined with Container::from_checkpoint(...) — reuse \
+         identity does not cover a checkpoint reference; drop either .reuse(true) or start from \
+         an ordinary image instead"
+    )]
+    ReuseCheckpointConflict,
+
     /// `.require_isolation(true)` was set on a `Container` but the active backend's
     /// `capabilities().hardware_isolated` is `false` — e.g. the docker backend, which
     /// shares the host kernel. Raised in `Container::start()`, before any
@@ -88,14 +101,44 @@ pub enum RightsizeError {
     },
 
     /// `ContainerGuard::checkpoint()` was called but the active backend's
-    /// `capabilities().checkpoint` is `false` — e.g. the microsandbox backend, which
-    /// has no image-commit primitive to build a checkpoint from. Raised BEFORE any
-    /// backend call (see `ContainerGuard::checkpoint`'s doc). The message names the
-    /// backend and points at the docker backend and the checkpoints docs.
+    /// `capabilities().checkpoint` is `false` — every real backend has it today
+    /// (docker via image commit, microsandbox via disk snapshots); this only fires
+    /// for a test double that hasn't opted in. Raised BEFORE any backend call (see
+    /// `ContainerGuard::checkpoint`'s doc). The message names the backend and points
+    /// at the checkpoints docs, without steering toward a specific other backend.
     #[error("{}", format_checkpoint_unsupported(backend))]
     CheckpointUnsupported {
-        /// The active backend's registered name (e.g. `"microsandbox"`).
+        /// The active backend's registered name (a test double's, in practice —
+        /// see the variant doc).
         backend: String,
+    },
+
+    /// `Container::from_checkpoint(&cp)` was started under a different active
+    /// backend than the one that created `cp` (`Checkpoint::backend`) — a
+    /// docker-committed image cannot boot as a microsandbox snapshot ref, and vice
+    /// versa. Raised in `Container::start()`, before any backend work. The message
+    /// names both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy.
+    #[error(
+        "{}",
+        format_checkpoint_backend_mismatch(active_backend, checkpoint_backend)
+    )]
+    CheckpointBackendMismatch {
+        /// The currently active backend's registered name.
+        active_backend: String,
+        /// The backend that created the checkpoint being restored.
+        checkpoint_backend: String,
+    },
+
+    /// A named checkpoint's name failed the checkpoints feature's validation
+    /// regex (`^[a-z0-9][a-z0-9-]{0,40}$`) — raised by
+    /// `ContainerGuard::checkpoint_named`, `Checkpoint::find`, and
+    /// `Checkpoint::remove`, before any backend call or registry I/O in every
+    /// case. The regex is the same across every port of this library (a
+    /// cross-language contract), so a name rejected here is rejected everywhere.
+    #[error("checkpoint name '{name}' is invalid — names must match ^[a-z0-9][a-z0-9-]{{0,40}}$")]
+    InvalidCheckpointName {
+        /// The rejected name, verbatim.
+        name: String,
     },
 
     /// The msb toolchain provisioner failed (download, checksum, install).
@@ -130,13 +173,25 @@ fn format_isolation_required(backend: &str) -> String {
 }
 
 /// Renders `CheckpointUnsupported`'s message: the same fact-em-dash-remedy grammar as
-/// [`format_unsupported`], naming the active backend and pointing at the backend/docs
-/// that do support it.
+/// [`format_unsupported`], naming the active backend without steering toward a
+/// specific other one — both real backends support checkpointing today, so the only
+/// backend that can ever hit this is a test double.
 fn format_checkpoint_unsupported(backend: &str) -> String {
     format!(
         "Checkpoint/restore was requested but the active '{backend}' backend does not support \
-         it — set RIGHTSIZE_BACKEND=docker to checkpoint (see the checkpoints docs for the \
-         microVM-memory-snapshot roadmap item)"
+         it — checkpointing needs a backend whose capabilities().checkpoint is true (see the \
+         checkpoints docs)"
+    )
+}
+
+/// Renders `CheckpointBackendMismatch`'s message: names both the active backend and
+/// the checkpoint's creator, plus the `RIGHTSIZE_BACKEND=<creator>` remedy.
+fn format_checkpoint_backend_mismatch(active_backend: &str, checkpoint_backend: &str) -> String {
+    format!(
+        "Container::from_checkpoint(...) was started under the '{active_backend}' backend, but \
+         this checkpoint was created by the '{checkpoint_backend}' backend — set \
+         RIGHTSIZE_BACKEND={checkpoint_backend} to restore it, or take a fresh checkpoint under \
+         '{active_backend}' instead"
     )
 }
 
@@ -235,13 +290,29 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_unsupported_names_the_backend_and_the_docker_remedy() {
+    fn checkpoint_unsupported_names_the_backend_without_steering_to_a_specific_other_one() {
         let e = RightsizeError::CheckpointUnsupported {
-            backend: "microsandbox".to_string(),
+            backend: "test-double".to_string(),
         };
         let msg = e.to_string();
+        assert!(msg.contains("test-double"), "{msg}");
+        assert!(msg.contains("capabilities().checkpoint"), "{msg}");
+        assert!(
+            !msg.contains("RIGHTSIZE_BACKEND=docker"),
+            "must not steer toward a specific backend — both real backends support it now: {msg}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_backend_mismatch_names_both_backends_and_the_remedy() {
+        let e = RightsizeError::CheckpointBackendMismatch {
+            active_backend: "docker".to_string(),
+            checkpoint_backend: "microsandbox".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("docker"), "{msg}");
         assert!(msg.contains("microsandbox"), "{msg}");
-        assert!(msg.contains("RIGHTSIZE_BACKEND=docker"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=microsandbox"), "{msg}");
     }
 
     #[test]
@@ -253,5 +324,23 @@ mod tests {
         assert!(msg.contains("rz-net-1"), "{msg}");
         assert!(msg.contains(".reuse(true)"), "{msg}");
         assert!(msg.contains(".with_network(...)"), "{msg}");
+    }
+
+    #[test]
+    fn reuse_checkpoint_conflict_names_both_knobs() {
+        let e = RightsizeError::ReuseCheckpointConflict;
+        let msg = e.to_string();
+        assert!(msg.contains(".reuse(true)"), "{msg}");
+        assert!(msg.contains("from_checkpoint"), "{msg}");
+    }
+
+    #[test]
+    fn invalid_checkpoint_name_names_the_rejected_name_and_the_pattern() {
+        let e = RightsizeError::InvalidCheckpointName {
+            name: "Bad Name!".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("Bad Name!"), "{msg}");
+        assert!(msg.contains("^[a-z0-9][a-z0-9-]{0,40}$"), "{msg}");
     }
 }

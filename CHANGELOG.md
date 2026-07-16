@@ -7,7 +7,90 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The MySQL module's readiness budget is 180 seconds** (was 120), the same
+  treatment the ClickHouse module already has: a loaded Windows CI runner was
+  observed still short of ready at 123 seconds, past the previous ceiling. The
+  budget is a deadline, not a wait — a faster boot still completes as fast as
+  it ever did.
+
+### Added
+
+- **Runtime file copy** (`rightsize`, `rightsize-msb`, `rightsize-docker`):
+  `ContainerGuard::copy_file_to_container(host_path, container_path)`,
+  `copy_content_to_container(bytes, container_path)`, and
+  `copy_file_from_container(container_path, host_path)` — the Testcontainers-style
+  runtime counterpart to the existing start-time `with_copy_file_to_container`
+  mount, usable any time after `start()` against an already-running container, on
+  either backend. Both directions accept a file or a directory (no separate
+  "directory" method) with `cp -r`-style destination naming, require the container
+  to be running and `container_path` to be absolute (both checked before any
+  backend call), and create the destination's parent directory automatically —
+  `mkdir -p` in the guest via `exec` on the way in, `std::fs::create_dir_all` on
+  the host on the way out. `copy_content_to_container` writes its bytes to a
+  private (mode `0600` on unix) temp file and cleans it up regardless of the
+  copy's outcome. `SandboxBackend` gains `copy_to_container`/`copy_from_container`,
+  defensively unsupported by default; microsandbox implements both via `msb copy
+  -q`, docker by shelling out to the `docker` CLI (`docker cp`) rather than
+  hand-rolling the daemon's tar-archive endpoints — the reaping watchdog's own
+  kill command already makes the `docker` CLI a hard requirement for that backend,
+  so this adds no new dependency. Works on a [reuse](docs/reuse.md) container like
+  any other runtime operation, but mutates shared reused state and is not part of
+  the reuse identity hash. See [Copying Files](docs/copy.md).
+- **microsandbox checkpoint/restore** (`rightsize`, `rightsize-msb`,
+  `rightsize-docker`): `capabilities().checkpoint` is now `true` on BOTH real
+  backends — microsandbox stops the sandbox, snapshots its disk (`msb snapshot
+  create --from <name> rz-ckpt-<12hex>`), removes the stopped sandbox, and boots
+  it back from that snapshot under the same name and ports (an attached `msb run
+  --snapshot <ref>` re-boot, not `msb start`, which relies on upstream
+  microsandbox's detached-spawn path and fails deterministically under a Windows
+  CI job object); docker unchanged (image commit). `Capabilities` gains
+  `checkpoint_restarts_workload` (docker `false`, microsandbox `true`); when it's
+  `true`, `ContainerGuard::checkpoint()` re-runs the container's own configured
+  wait strategy before returning, since microsandbox's cycle reboots the guest and
+  a bare return would hand back a false-ready container. When this container has
+  network links installed (see
+  [Networks](docs/backends.md#networking-is-emulated-not-native)), they're
+  re-installed before that wait-strategy re-run, since the guest reboot drops
+  microsandbox's emulated exec-tunnel links along with everything else. If the
+  snapshot step itself fails, the sandbox is left stopped (never removed) and the
+  error names `msb start <name>` as the by-hand remedy; if the snapshot succeeds
+  but the re-boot from it fails, the error names the checkpoint ref and
+  `Container::from_checkpoint(...)` as the recovery path. `Checkpoint` is renamed
+  and extended: `image_ref` becomes `checkpoint_ref` (its format is now
+  backend-specific — a docker image tag or a microsandbox snapshot name), and it
+  gains `backend`, the registered name of whichever backend created it.
+  `Container::from_checkpoint(&cp)` refuses to start under a different active
+  backend than `cp.backend` with a new typed `RightsizeError::
+  CheckpointBackendMismatch`, before any backend work; combining `.reuse(true)`
+  with `from_checkpoint` similarly fails fast with a new typed
+  `RightsizeError::ReuseCheckpointConflict` (reuse identity has no concept of a
+  checkpoint ref). `SandboxBackend::commit_to_image` is renamed to
+  `create_checkpoint` (takes a random nonce, returns the backend-native ref) and
+  gains a sibling `remove_checkpoint` (SPI-only best-effort cleanup — `msb
+  snapshot rm` / `docker rmi`, "not found" is success). `ContainerSpec` gains
+  `checkpoint_ref`, set by `from_checkpoint`; microsandbox boots via `msb run
+  --snapshot <ref>` instead of its normal image argument when it's set, docker
+  ignores it. `CheckpointUnsupported`'s message no longer steers toward docker
+  specifically, since both real backends support checkpointing now. Checkpoints
+  can also be NAMED and made durable across processes:
+  `ContainerGuard::checkpoint_named(name)` (name must match
+  `^[a-z0-9][a-z0-9-]{0,40}$`, checked before any backend call — a bad name is a
+  new typed `RightsizeError::InvalidCheckpointName`) writes a small registry entry,
+  `<cacheDir>/checkpoints/<name>.json`, atomically and only after the backend
+  checkpoint has succeeded; re-checkpointing an existing name best-effort removes
+  the previous ref first, then replaces the entry (latest wins). `Checkpoint`
+  gains `find(name)`, `list()`, and `remove(name)`: `find` rediscovers a named
+  checkpoint written by any earlier process sharing the same cache directory,
+  probing a same-backend entry's artifact via a new SPI method,
+  `SandboxBackend::has_checkpoint` (docker: image inspect; microsandbox: `msb
+  snapshot inspect`), and treating a confirmed-gone artifact as a stale entry it
+  cleans up automatically — a different-backend entry is returned unprobed, since
+  the restore-time mismatch gate is already the authority there; `list` reads the
+  registry only, with no artifact probing; `remove` best-effort tears down both
+  the artifact and the registry entry and is idempotent. See
+  [Checkpoint / Restore](docs/checkpoints.md).
 
 ## [0.2.0] - 2026-07-12
 

@@ -18,6 +18,8 @@
 
 - [Container Reuse](./reuse.md)
 
+- [Copying Files](./copy.md)
+
 - [Failure Diagnostics](./diagnostics.md)
 
 - [Isolation Requirement](./isolation.md)

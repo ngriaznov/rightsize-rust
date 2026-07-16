@@ -167,6 +167,12 @@ but a few edges are real, not just timing quirks:
 - **Network-alias tunnels on microsandbox serve one connection at a time.** See
   [Networking](./core-concepts/networking.md#limits-on-the-microvm-backend) — a real
   capability gap versus Docker's native bridge networking, not a timing quirk.
+- **Checkpointing restarts the workload on microsandbox, not on Docker.** Both
+  backends support `checkpoint()`/`checkpoint_named()` (`capabilities().checkpoint`
+  is `true` on both), but by different mechanisms: Docker commits the running
+  container to an image, undisturbed; microsandbox stops the sandbox, snapshots its
+  disk, and boots it back up, rebooting the guest — `capabilities().checkpoint_restarts_workload`
+  tells you which you're on. See [Checkpoint / Restore](./checkpoints.md).
 - **Readiness-probe caveats apply to both backends**, not just microsandbox — see
   [Wait Strategies](./core-concepts/wait-strategies.md#the-read-probe-story). A
   userland proxy/forwarder on *either* backend can accept a connection before the

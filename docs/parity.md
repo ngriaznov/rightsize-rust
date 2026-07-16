@@ -18,7 +18,8 @@ backends, on every change to a `SandboxBackend` implementation.
 | Lifecycle | Start, stop, and idempotence — a second `stop()` on an already-stopped guard is a no-op, not an error. |
 | Host port mapping | A container's exposed port is published to `127.0.0.1` on both backends, readable back via the guard. |
 | Env / command propagation | Environment variables and a custom command are visible inside the running workload. |
-| File copy-in | A bundled resource and a host path both round-trip into the guest at the requested path; the default mount is read-only. |
+| File copy-in | A bundled resource and a host path both round-trip into the guest at the requested path at start time (`with_copy_file_to_container`); the default mount is read-only. |
+| Runtime file copy | `copyFileToContainer` / `copyContentToContainer` / `copyFileFromContainer` round-trip files, in-memory content, and directories against a RUNNING container on both backends; destination parents are created automatically; both operations require a running container and fail with a typed error otherwise. |
 | Exec | Real exit codes and stderr come back from an in-guest command. |
 | Logs + follow | Captured stdout, `for_log_message` waiting on it, and `follow_output`'s ordered no-duplicate streaming — including each backend's own follow-channel quirk (msb's watchdog-driven tail replay vs. docker's natural stream close). |
 | Wait strategies and budgets | Port, HTTP, and log-message waits all honor a configured startup timeout. |
@@ -26,10 +27,11 @@ backends, on every change to a `SandboxBackend` implementation.
 | Boot-failure retries | State-db migration races and image-cache corruption self-heal with an automatic single retry rather than surfacing to the caller. |
 | Reaping ledger + sweep | A run's ledger files are written before create and removed after a clean stop; a fabricated dead run's sandbox is provably reaped, at the backend level, by a fresh process's init-time sweep. |
 | Reuse gating + identity hash | The double opt-in (`.reuse(true)` + `RIGHTSIZE_REUSE`), adoption of an already-running spec-identical sandbox, and the identity hash's pinned cross-language test vector — see below. |
-| Capabilities | Each backend reports its pinned `hardwareIsolated`/`checkpoint` values (msb: `true`/`false`; docker: `false`/`true`). |
+| Capabilities | Each backend reports its pinned `hardwareIsolated`/`checkpoint` values — microsandbox: isolated (its own kernel per sandbox) AND checkpoint-capable via disk snapshot; docker: not isolated (shared host kernel) but checkpoint-capable via image commit. |
 | `requireIsolation` gating | A container requiring hardware isolation refuses to start on a non-isolated backend and starts normally on a hardware-isolated one. |
 | Diagnostics report format | The exact rendered shape of a live-container diagnostics report — see below. |
-| Checkpoint gating | Identical typed-error refusal on a non-checkpoint-capable backend, success with a well-formed image reference on a capable one. |
+| Checkpoint gating | `checkpoint()` succeeds on both real backends and throws a typed, backend-naming error on a backend without the capability, before any backend call; restoring a checkpoint under a different active backend than the one that created it fails with a typed mismatch error before any backend work. |
+| Named checkpoints | A checkpoint created with a name persists a registry entry (one JSON file per name under the rightsize cache directory, pinned field names) and is rediscoverable in any later process via find/list/remove; re-checkpointing a name replaces its artifact and entry; a stale entry whose artifact is gone resolves to absent and is cleaned up. |
 
 ## The pinned identity-hash vector
 

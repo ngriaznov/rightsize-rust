@@ -94,6 +94,16 @@ pub struct ContainerSpec {
     /// wiring the field in now costs nothing and the reuse wave doesn't need to touch
     /// any of those call sites again.
     pub keep_alive: bool,
+    /// Set by [`crate::Container::from_checkpoint`] to the source [`crate::Checkpoint`]'s
+    /// `ref` — the checkpoint feature's own signal to the backend that this spec's
+    /// `image` is a checkpoint reference, not an ordinary image. docker ignores this
+    /// (the ref already IS a normal image tag; the ordinary create path just works);
+    /// microsandbox, when this is set, boots via `msb run --snapshot <ref>`
+    /// instead of its normal image boot, keeping every other flag identical.
+    /// Deliberately NOT part of the reuse identity hash — reuse and
+    /// `from_checkpoint` are not a supported combination (see
+    /// `RightsizeError::ReuseCheckpointConflict`). Defaults to `None`.
+    pub checkpoint_ref: Option<String>,
 }
 
 impl ContainerSpec {
@@ -116,6 +126,7 @@ impl ContainerSpec {
             run_id: run_id.into(),
             memory_limit_mb: None,
             keep_alive: false,
+            checkpoint_ref: None,
         }
     }
 }
@@ -138,6 +149,7 @@ mod tests {
         assert!(spec.aliases.is_empty());
         assert_eq!(spec.memory_limit_mb, None);
         assert!(!spec.keep_alive);
+        assert!(spec.checkpoint_ref.is_none());
     }
 
     #[test]

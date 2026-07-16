@@ -1,7 +1,10 @@
-//! `DockerBackend`: maps `SandboxBackend` onto exactly the daemon HTTP endpoints this
-//! backend needs, over the hand-rolled unix-socket client and the frame demuxer. This
-//! is also the correctness oracle other backends are checked against, since Docker
-//! enforces semantics (read-only mounts, native networks) microsandbox only emulates.
+//! `DockerBackend`: maps `SandboxBackend` onto the daemon HTTP endpoints this
+//! backend needs, over the hand-rolled unix-socket client and the frame demuxer —
+//! with one deliberate exception: runtime file copy shells out to the `docker` CLI
+//! (see [`DockerBackend::copy_to_container`]'s doc) rather than hand-rolling the
+//! daemon's tar-archive copy endpoints. This is also the correctness oracle other
+//! backends are checked against, since Docker enforces semantics (read-only mounts,
+//! native networks) microsandbox only emulates.
 //!
 //! **`Handle` has no per-container mutable state** (contrast microsandbox's
 //! `HandleState` map): every operation here is a stateless HTTP call keyed by the
@@ -9,6 +12,7 @@
 //! look up in a side table.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -397,6 +401,9 @@ impl SandboxBackend for DockerBackend {
             // Containers share the host kernel — no per-sandbox microVM boundary.
             hardware_isolated: false,
             checkpoint: true,
+            // An image commit touches nothing running — the container is left
+            // undisturbed, unlike microsandbox's stop/snapshot/start cycle.
+            checkpoint_restarts_workload: false,
         }
     }
 
@@ -740,12 +747,14 @@ impl SandboxBackend for DockerBackend {
     }
 
     /// `POST /commit?container=&repo=&tag=` — the checkpoint feature's own backend
-    /// primitive (`rightsize::ContainerGuard::checkpoint`). `image_ref` is already
-    /// the full `rightsize/checkpoint:<12hex>` reference the core allocator chose;
-    /// this only needs to split it into the `repo`/`tag` pair the endpoint wants
-    /// (the same split `split_repo_tag` already does for image pulls).
-    async fn commit_to_image(&self, handle: &dyn SandboxHandle, image_ref: &str) -> Result<()> {
-        let (repo, tag) = split_repo_tag(image_ref);
+    /// primitive (`rightsize::ContainerGuard::checkpoint`). Formats `nonce` (a
+    /// random 12-lowercase-hex string the generic layer generates fresh per call)
+    /// into this backend's own ref shape, `rightsize/checkpoint:<nonce>`, splitting
+    /// it into the `repo`/`tag` pair the endpoint wants (the same split
+    /// `split_repo_tag` already does for image pulls), and returns the ref.
+    async fn create_checkpoint(&self, handle: &dyn SandboxHandle, nonce: &str) -> Result<String> {
+        let checkpoint_ref = format!("rightsize/checkpoint:{nonce}");
+        let (repo, tag) = split_repo_tag(&checkpoint_ref);
         let path = format!(
             "/commit?container={}&repo={}&tag={}",
             encode_query_value(handle.id()),
@@ -755,10 +764,95 @@ impl SandboxBackend for DockerBackend {
         let resp = self.client.request("POST", &path, None).await?;
         if resp.status >= 400 {
             return Err(RightsizeError::Backend(format!(
-                "docker could not commit container {} to image '{image_ref}' (HTTP {}): {}",
+                "docker could not commit container {} to image '{checkpoint_ref}' (HTTP {}): {}",
                 handle.id(),
                 resp.status,
                 String::from_utf8_lossy(&resp.body)
+            )));
+        }
+        Ok(checkpoint_ref)
+    }
+
+    /// `DELETE /images/{ref}?force=true` — best-effort; a 404 (already gone) is
+    /// success, matching [`Self::remove_by_name`]'s own "not found is fine"
+    /// contract.
+    async fn remove_checkpoint(&self, checkpoint_ref: &str) -> Result<()> {
+        let path = format!("/images/{}?force=true", encode_path_segment(checkpoint_ref));
+        let resp = self.client.request("DELETE", &path, None).await?;
+        if resp.status >= 400 && resp.status != 404 {
+            return Err(RightsizeError::Backend(format!(
+                "docker could not remove checkpoint image '{checkpoint_ref}' (HTTP {}): {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            )));
+        }
+        Ok(())
+    }
+
+    /// `GET /images/{ref}/json` — the named-checkpoint existence probe
+    /// (`SandboxBackend::has_checkpoint`, `Checkpoint::find`'s staleness check).
+    /// A 200 means the tagged image still exists; a 404 is a definite "not
+    /// there." Any OTHER status (or a transport-level request failure, via the
+    /// `?` above) surfaces as an error — this SPI forbids a probe failure from
+    /// resolving to "absent," unlike [`Self::pull_if_missing`]'s own inspect,
+    /// which only reacts to affirmatively-404 and doesn't fail loudly on
+    /// inspect trouble.
+    async fn has_checkpoint(&self, checkpoint_ref: &str) -> Result<bool> {
+        let path = format!("/images/{}/json", encode_path_segment(checkpoint_ref));
+        let resp = self.client.request("GET", &path, None).await?;
+        match resp.status {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(RightsizeError::Backend(format!(
+                "docker could not inspect checkpoint image '{checkpoint_ref}' (HTTP {status}): {}",
+                String::from_utf8_lossy(&resp.body)
+            ))),
+        }
+    }
+
+    /// Shells out to the `docker` CLI (`docker cp <host_path> <id>:<container_path>`)
+    /// rather than the daemon HTTP API this backend otherwise speaks exclusively —
+    /// the daemon's copy endpoints are tar-archive-in/tar-archive-out, and adding
+    /// tar encode/decode here would mean either a new third-party dependency or a
+    /// hand-rolled tar implementation, both worse than shelling out. The `docker`
+    /// CLI is already a hard requirement for this backend regardless (the reaping
+    /// watchdog's own kill command is a plain `docker rm -f`), so this adds no new
+    /// external dependency.
+    async fn copy_to_container(
+        &self,
+        handle: &dyn SandboxHandle,
+        host_path: &Path,
+        container_path: &str,
+    ) -> Result<()> {
+        let args = docker_cp_in_args(handle.id(), host_path, container_path);
+        let result = run_docker_cli(&args).await?;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "docker cp into container {} failed (exit {}): {}",
+                handle.id(),
+                result.exit_code,
+                result.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The reverse direction of [`Self::copy_to_container`], same `docker cp`
+    /// shape and error-surfacing.
+    async fn copy_from_container(
+        &self,
+        handle: &dyn SandboxHandle,
+        container_path: &str,
+        host_path: &Path,
+    ) -> Result<()> {
+        let args = docker_cp_out_args(handle.id(), container_path, host_path);
+        let result = run_docker_cli(&args).await?;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "docker cp out of container {} failed (exit {}): {}",
+                handle.id(),
+                result.exit_code,
+                result.stderr.trim()
             )));
         }
         Ok(())
@@ -775,6 +869,49 @@ impl SandboxBackend for DockerBackend {
             "rm".to_string(),
         ]
     }
+}
+
+/// Builds the argv for `docker cp <host_path> <container_id>:<container_path>` —
+/// pure argv construction, kept separate from [`run_docker_cli`] so the shape is a
+/// plain data-in/data-out unit test, independent of a real `docker` binary (the
+/// same split `rightsize-msb`'s own `commands` module uses for its `msb` argv).
+fn docker_cp_in_args(container_id: &str, host_path: &Path, container_path: &str) -> Vec<String> {
+    vec![
+        "cp".to_string(),
+        host_path.display().to_string(),
+        format!("{container_id}:{container_path}"),
+    ]
+}
+
+/// Builds the argv for `docker cp <container_id>:<container_path> <host_path>` —
+/// the reverse direction of [`docker_cp_in_args`].
+fn docker_cp_out_args(container_id: &str, container_path: &str, host_path: &Path) -> Vec<String> {
+    vec![
+        "cp".to_string(),
+        format!("{container_id}:{container_path}"),
+        host_path.display().to_string(),
+    ]
+}
+
+/// Runs the `docker` CLI (never the daemon HTTP API this backend otherwise speaks
+/// exclusively — see [`DockerBackend::copy_to_container`]'s doc for why copy is the
+/// one exception) with a closed/null stdin, matching every other child process this
+/// workspace spawns under the hood (see `rightsize-msb`'s own convention), and
+/// captures its exit code plus stdout/stderr.
+async fn run_docker_cli(args: &[String]) -> Result<ExecResult> {
+    let output = tokio::process::Command::new("docker")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| {
+            RightsizeError::Backend(format!("failed to spawn docker {}: {e}", args.join(" ")))
+        })?;
+    Ok(ExecResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// The `cleanup_sync` path's blocking counterpart to `stop`+`remove`: issues a plain
@@ -968,6 +1105,10 @@ mod tests {
         let caps = backend.capabilities();
         assert!(!caps.hardware_isolated, "containers share the host kernel");
         assert!(caps.checkpoint);
+        assert!(
+            !caps.checkpoint_restarts_workload,
+            "an image commit leaves the running container undisturbed"
+        );
     }
 
     /// A minimal, dependency-free temp-directory helper for the blocking-socket
@@ -1508,10 +1649,10 @@ mod tests {
         );
     }
 
-    // --- commit_to_image (checkpoint) -----------------------------------------
+    // --- create_checkpoint (checkpoint) ---------------------------------------
 
     #[tokio::test]
-    async fn commit_to_image_posts_commit_with_the_split_repo_and_tag() {
+    async fn create_checkpoint_posts_commit_with_the_split_repo_and_tag_and_returns_the_ref() {
         let (client, _dir, received) = multi_request_fixture(vec![
             b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
         ])
@@ -1522,10 +1663,11 @@ mod tests {
             spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
         };
 
-        backend
-            .commit_to_image(&handle, "rightsize/checkpoint:abc123def456")
+        let checkpoint_ref = backend
+            .create_checkpoint(&handle, "abc123def456")
             .await
             .expect("commit must succeed on a 201");
+        assert_eq!(checkpoint_ref, "rightsize/checkpoint:abc123def456");
 
         let requests = received.lock().unwrap().clone();
         assert_eq!(requests.len(), 1, "{requests:?}");
@@ -1541,7 +1683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_to_image_surfaces_a_daemon_error_as_a_backend_error() {
+    async fn create_checkpoint_surfaces_a_daemon_error_as_a_backend_error() {
         let (client, _dir, _received) = multi_request_fixture(vec![
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 23\r\n\r\n{\"message\":\"no such\"}"
                 .to_vec(),
@@ -1554,12 +1696,109 @@ mod tests {
         };
 
         let err = backend
-            .commit_to_image(&handle, "rightsize/checkpoint:abc123def456")
+            .create_checkpoint(&handle, "abc123def456")
             .await
             .expect_err("a 404 must surface as an error");
         assert!(
             matches!(err, rightsize::error::RightsizeError::Backend(_)),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_checkpoint_deletes_the_image_and_treats_not_found_as_success() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+
+        backend
+            .remove_checkpoint("rightsize/checkpoint:abc123def456")
+            .await
+            .expect("a 404 (already gone) must be treated as success");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("DELETE /images/rightsize/checkpoint:abc123def456"),
+            "{requests:?}"
+        );
+    }
+
+    // --- has_checkpoint (named checkpoints' existence probe) --------------------
+
+    #[tokio::test]
+    async fn has_checkpoint_returns_true_on_a_200() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+
+        let exists = backend
+            .has_checkpoint("rightsize/checkpoint:abc123def456")
+            .await
+            .expect("a 200 must resolve to Ok(true)");
+        assert!(exists);
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("GET /images/rightsize/checkpoint:abc123def456/json"),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_checkpoint_returns_false_on_a_404() {
+        let (client, _dir, _received) = multi_request_fixture(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+
+        let exists = backend
+            .has_checkpoint("rightsize/checkpoint:gone")
+            .await
+            .expect("a 404 must resolve to Ok(false), not an error");
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn has_checkpoint_surfaces_any_other_status_as_an_error() {
+        let (client, _dir, _received) = multi_request_fixture(vec![
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 15\r\n\r\n{\"message\":\"x\"}"
+                .to_vec(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client);
+
+        let err = backend
+            .has_checkpoint("rightsize/checkpoint:abc123def456")
+            .await
+            .expect_err("a probe failure must surface, never resolve to Ok(false)");
+        assert!(
+            matches!(err, rightsize::error::RightsizeError::Backend(_)),
+            "{err}"
+        );
+    }
+
+    // --- docker cp argv construction -------------------------------------------
+
+    #[test]
+    fn docker_cp_in_args_puts_the_host_path_first_and_container_id_colon_path_second() {
+        assert_eq!(
+            docker_cp_in_args("daemon-id-1", Path::new("/host/src.txt"), "/guest/dst.txt"),
+            vec!["cp", "/host/src.txt", "daemon-id-1:/guest/dst.txt"]
+        );
+    }
+
+    #[test]
+    fn docker_cp_out_args_puts_the_container_id_colon_path_first_and_host_path_second() {
+        assert_eq!(
+            docker_cp_out_args("daemon-id-1", "/guest/src.txt", Path::new("/host/dst.txt")),
+            vec!["cp", "daemon-id-1:/guest/src.txt", "/host/dst.txt"]
         );
     }
 }

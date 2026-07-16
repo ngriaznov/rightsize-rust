@@ -277,14 +277,22 @@ Violations fail fast with an actionable error.
   backend that doesn't provide hardware isolation, instead of silently running
   an untrusted workload wherever `RIGHTSIZE_BACKEND` happened to resolve. See
   [Isolation Requirement](docs/isolation.md).
-- **Checkpoint / restore (docker only).** `guard.checkpoint()` commits a running
-  container's filesystem to an image; `Container::from_checkpoint(&cp)` restores
-  as many fresh containers from it as needed — boot once, seed once, restore per
-  test instead of re-seeding. See [Checkpoint / Restore](docs/checkpoints.md).
+- **Checkpoint / restore.** `guard.checkpoint()` captures a running container's
+  filesystem — an image commit on docker, a disk snapshot on microsandbox —
+  and `Container::from_checkpoint(&cp)` restores as many sandboxes from it as
+  needed: boot once, seed once, restore per test instead of re-seeding.
+  `guard.checkpoint_named("seeded-db")` gives a checkpoint durable identity a
+  later process can rediscover with `Checkpoint::find`/`Checkpoint::list`. See
+  [Checkpoint / Restore](docs/checkpoints.md).
+- **Runtime file copy.** `guard.copy_file_to_container(...)`/
+  `copy_content_to_container(...)`/`copy_file_from_container(...)` round-trip
+  files, in-memory content, and directories into and out of an already-running
+  container, on either backend — the parent directory on the destination side
+  is always created for you. See [Copying Files](docs/copy.md).
 - **Cross-language parity.** The `SandboxBackend` contract above — lifecycle,
-  networking, reaping, reuse, diagnostics, isolation, checkpoints — is verified
-  identically in the Kotlin and TypeScript ports of this library by each port's
-  own copy of the shared contract suite. See
+  networking, reaping, reuse, diagnostics, isolation, checkpoints, runtime
+  copy — is verified identically in the Kotlin and TypeScript ports of this
+  library by each port's own copy of the shared contract suite. See
   [Cross-Language Parity](docs/parity.md).
 
 ## Configuration

@@ -7,12 +7,22 @@
 //! image's `ENTRYPOINT` on 0.6.2 — only attached mode does — so [`run`] never
 //! emits `-d`, and the backend supervises the resulting child directly.
 
+use std::path::Path;
+
 use rightsize::model::ContainerSpec;
 
 /// Builds the argv for `msb run`, in the pinned order: name, memory (if set), ports,
-/// env, mounts, image, then `-- <command>` iff `spec.command` is `Some` — a `None`
-/// command means "run the image's default `ENTRYPOINT`/`CMD`", which requires omitting
-/// the trailing `--` entirely rather than passing it with no arguments after it.
+/// env, mounts, image-or-snapshot, then `-- <command>` iff `spec.command` is `Some`
+/// — a `None` command means "run the image's default `ENTRYPOINT`/`CMD`", which
+/// requires omitting the trailing `--` entirely rather than passing it with no
+/// arguments after it.
+///
+/// When `spec.checkpoint_ref` is set (this container was built from
+/// [`rightsize::Container::from_checkpoint`]), `--snapshot <ref>` replaces the plain
+/// image argument — `--snapshot` exists only on `msb run`, mutually exclusive with
+/// the IMAGE positional, and boots a fresh sandbox from that disk snapshot instead
+/// of pulling an image. Every other flag (name, memory, ports, env, mounts, the
+/// trailing command) stays identical either way.
 pub fn run(spec: &ContainerSpec) -> Vec<String> {
     let mut argv = vec!["run".to_string(), "--name".to_string(), spec.name.clone()];
 
@@ -41,7 +51,13 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
         ));
     }
 
-    argv.push(spec.image.clone());
+    match &spec.checkpoint_ref {
+        Some(snapshot_ref) => {
+            argv.push("--snapshot".to_string());
+            argv.push(snapshot_ref.clone());
+        }
+        None => argv.push(spec.image.clone()),
+    }
 
     if let Some(command) = &spec.command {
         argv.push("--".to_string());
@@ -49,6 +65,62 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
     }
 
     argv
+}
+
+/// Builds the argv for `msb copy <src> <name>:<dst>` — copying a host file or
+/// directory INTO a running sandbox.
+pub fn copy_in(host_path: &Path, sandbox_name: &str, container_path: &str) -> Vec<String> {
+    vec![
+        "copy".to_string(),
+        "-q".to_string(),
+        host_path.display().to_string(),
+        format!("{sandbox_name}:{container_path}"),
+    ]
+}
+
+/// Builds the argv for `msb copy <name>:<src> <dst>` — copying a file or directory
+/// OUT of a running sandbox to the host.
+pub fn copy_out(sandbox_name: &str, container_path: &str, host_path: &Path) -> Vec<String> {
+    vec![
+        "copy".to_string(),
+        "-q".to_string(),
+        format!("{sandbox_name}:{container_path}"),
+        host_path.display().to_string(),
+    ]
+}
+
+/// Builds the argv for `msb snapshot create --from <sandbox> <snapshot>` — requires
+/// the sandbox to be STOPPED first (the checkpoint feature's own responsibility;
+/// this function only builds the argv).
+pub fn snapshot_create(sandbox_name: &str, snapshot_name: &str) -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "create".to_string(),
+        "--from".to_string(),
+        sandbox_name.to_string(),
+        snapshot_name.to_string(),
+    ]
+}
+
+/// Builds the argv for `msb snapshot rm <snapshot>` — the checkpoint feature's
+/// cleanup primitive (`SandboxBackend::remove_checkpoint`).
+pub fn snapshot_rm(snapshot_name: &str) -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "rm".to_string(),
+        snapshot_name.to_string(),
+    ]
+}
+
+/// Builds the argv for `msb snapshot inspect <snapshot>` — the named-checkpoint
+/// existence probe (`SandboxBackend::has_checkpoint`): exit 0 means the snapshot
+/// still exists.
+pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "inspect".to_string(),
+        snapshot_name.to_string(),
+    ]
 }
 
 /// Builds the argv for a plain (non-streaming) `msb exec`.
@@ -146,6 +218,7 @@ mod tests {
             run_id: "abc".to_string(),
             memory_limit_mb: None,
             keep_alive: false,
+            checkpoint_ref: None,
         }
     }
 
@@ -228,5 +301,71 @@ mod tests {
         let spec = ContainerSpec::new("rz-bare-1", "alpine:3.19", "bare");
         let cmd = run(&spec);
         assert_eq!(cmd, vec!["run", "--name", "rz-bare-1", "alpine:3.19"]);
+    }
+
+    #[test]
+    fn run_command_uses_dash_dash_snapshot_instead_of_the_image_when_checkpoint_ref_is_set() {
+        let mut spec = full_spec();
+        spec.checkpoint_ref = Some("rz-ckpt-deadbeefcafe".to_string());
+        let cmd = run(&spec);
+        assert_eq!(
+            cmd,
+            vec![
+                "run",
+                "--name",
+                "rz-abc-1",
+                "-p",
+                "12345:6379",
+                "-e",
+                "A=1",
+                "--mount-file",
+                "/tmp/f.conf:/etc/f.conf",
+                "--snapshot",
+                "rz-ckpt-deadbeefcafe",
+                "--",
+                "redis-server",
+                "--port",
+                "6379",
+            ]
+        );
+        assert!(!cmd.contains(&spec.image));
+    }
+
+    #[test]
+    fn copy_in_and_out_and_snapshot_spellings() {
+        assert_eq!(
+            copy_in(
+                std::path::Path::new("/host/src.txt"),
+                "rz-abc-1",
+                "/guest/dst.txt"
+            ),
+            vec!["copy", "-q", "/host/src.txt", "rz-abc-1:/guest/dst.txt"]
+        );
+        assert_eq!(
+            copy_out(
+                "rz-abc-1",
+                "/guest/src.txt",
+                std::path::Path::new("/host/dst.txt")
+            ),
+            vec!["copy", "-q", "rz-abc-1:/guest/src.txt", "/host/dst.txt"]
+        );
+        assert_eq!(
+            snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe"),
+            vec![
+                "snapshot",
+                "create",
+                "--from",
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe"
+            ]
+        );
+        assert_eq!(
+            snapshot_rm("rz-ckpt-deadbeefcafe"),
+            vec!["snapshot", "rm", "rz-ckpt-deadbeefcafe"]
+        );
+        assert_eq!(
+            snapshot_inspect("rz-ckpt-deadbeefcafe"),
+            vec!["snapshot", "inspect", "rz-ckpt-deadbeefcafe"]
+        );
     }
 }

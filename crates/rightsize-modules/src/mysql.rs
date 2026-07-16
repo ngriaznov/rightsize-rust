@@ -140,9 +140,11 @@ impl Default for MySqlReadyForConnections {
         // First boot initializes the datafiles and boots mysqld twice (a throwaway
         // temp server for init scripts, then the real one). On a fast host that
         // finishes well under 60s, but a loaded Windows CI runner's first boot
-        // overruns it — 120s absorbs the slow case without masking a real hang.
+        // overran even the previous 120s budget (123s observed) — 180s, matching
+        // ClickHouseContainer's own budget for the same "loaded Windows runner"
+        // reason, absorbs the slow case without masking a real hang.
         Self {
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_secs(180),
         }
     }
 }

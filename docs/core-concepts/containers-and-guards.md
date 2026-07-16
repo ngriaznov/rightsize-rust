@@ -135,6 +135,13 @@ Once you have a `ContainerGuard`:
   halts delivery — no further lines reach the closure even if the container keeps
   running. See [Backend differences](../backends.md#backend-differences) for a
   microsandbox-specific timing nuance in how the *last* line is delivered.
+- `guard.copy_file_to_container(...)`/`copy_content_to_container(...)`/
+  `copy_file_from_container(...)` — runtime file copy against an already-running
+  container, on either backend. See [Copying Files](../copy.md).
+- `guard.checkpoint().await` — captures the running container's filesystem state
+  for `Container::from_checkpoint(...)` to restore later; `guard.checkpoint_named(name).await`
+  does the same but persists a registry entry a later process can rediscover. See
+  [Checkpoint / Restore](../checkpoints.md).
 
 ## The `OnceCell` shared-container recipe
 

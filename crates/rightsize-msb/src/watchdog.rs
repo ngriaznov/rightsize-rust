@@ -63,13 +63,15 @@ pub(crate) fn spawn_follow(
     name: String,
     consumer: Box<dyn Fn(String) + Send + Sync>,
 ) -> Result<FollowHandle> {
-    let mut child = Command::new(&msb)
-        .args(commands::follow_logs(&name))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| RightsizeError::Backend(format!("failed to spawn msb logs -f {name}: {e}")))?;
+    let mut child = crate::backend::spawn_msb_command(|| {
+        let mut cmd = Command::new(&msb);
+        cmd.args(commands::follow_logs(&name))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd
+    })
+    .map_err(|e| RightsizeError::Backend(format!("failed to spawn msb logs -f {name}: {e}")))?;
 
     let stdout = child.stdout.take().expect("piped stdout");
     let state = Arc::new(Mutex::new(FollowState {

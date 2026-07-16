@@ -51,6 +51,26 @@ pub fn default_dir(env: &HashMap<String, String>) -> PathBuf {
     Path::new(&home).join(".cache").join("rightsize")
 }
 
+/// Generates a filename-safe suffix that's unique per call, even across two
+/// processes racing each other: pid, a process-wide monotonic counter, and the
+/// current time in nanoseconds — the same pid+counter+nanos shape
+/// `TempCopyFile::create` uses for its own unique host temp files (see
+/// `crate::container`). The checkpoint and reuse registries both use this for
+/// their atomic-write temp files' names instead of a fixed one, so concurrent
+/// writers (or a crashed writer's leftover) can never collide on the temp path.
+pub(crate) fn unique_tmp_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{seq}-{nanos}", std::process::id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
