@@ -14,15 +14,16 @@ snapshots, which would resume a sandbox mid-execution — a near-instant restore
 where a live process's in-memory state (not just its filesystem) survives too.
 That still needs upstream microsandbox support.
 
-## Portable checkpoint archives
+## Self-contained archives
 
-[Named checkpoints](./checkpoints.md#reusing-checkpoints-across-runs) make a
-checkpoint rediscoverable across processes on the SAME machine, via the shared
-rightsize cache directory's registry. What's missing is moving one to a different
-machine or CI cache entirely: export/import via `msb snapshot export`/`docker
-save` (and their `import`/`load` counterparts), so a checkpoint seeded once in CI
-can be shipped as a build artifact and restored on a fresh runner instead of
-re-seeding there too.
+[Checkpoint export/import](./checkpoints.md#moving-checkpoints-between-machines)
+ships now — a checkpoint seeded once in CI can be shipped as a build artifact and
+restored on a fresh runner instead of re-seeding there too. What's left: the
+archive doesn't bundle the OCI image, so the destination machine still pulls it on
+the restored container's first boot — offline restores need the image baked into
+the archive itself. Blocked upstream: msb 0.6.6's own `--with-image` export fails
+an integrity check on import ("raw manifest digest mismatch"), so this waits on a
+fix there.
 
 ## Module breadth
 

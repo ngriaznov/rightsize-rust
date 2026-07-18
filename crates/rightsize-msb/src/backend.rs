@@ -48,6 +48,11 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(300);
 /// I/O over a (typically sparse, small) rootfs, but generous headroom matters more
 /// than tightness here since a slow step must not spuriously fail a checkpoint.
 const CHECKPOINT_STEP_TIMEOUT: Duration = Duration::from_secs(120);
+/// `msb snapshot export`/`snapshot import`/`snapshot list` — moving a
+/// (zstd-compressed, typically small) disk snapshot artifact to/from an archive
+/// file. Same generous headroom as [`COPY_TIMEOUT`]: a slow disk must not
+/// spuriously fail an export/import.
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// An immutable `msb` sandbox reference: its `ContainerSpec` and the name `msb` knows
 /// it by (always `spec.name` for this backend). All mutable per-container state lives
@@ -316,6 +321,31 @@ fn is_name_conflict(output: &str) -> bool {
 /// probe failure must never masquerade as "not there."
 fn is_snapshot_not_found(output: &str) -> bool {
     output.to_lowercase().contains("snapshot not found")
+}
+
+/// True if `output` (an `msb snapshot import` child's combined stdout/stderr)
+/// names msb's "already imported" wording — `error: snapshot already exists:
+/// <path>`. For a content-addressed archive this IS success: the artifact is
+/// already sitting there under its digest-derived directory, so
+/// [`MsbCliBackend::import_checkpoint`] treats it as one, continuing straight to
+/// resolving the effective ref exactly like a fresh, successful import would.
+fn is_snapshot_already_exists(output: &str) -> bool {
+    output.to_lowercase().contains("snapshot already exists")
+}
+
+/// Parses the digest-derived directory name `msb snapshot import` unpacked into,
+/// out of its own printed output — verified contract: on both a fresh import and
+/// an already-exists "success", the last non-empty printed line ends with the
+/// artifact path, and that path's OWN basename (not a file inside it) is the
+/// digest-derived directory name (e.g. `sha256-b9c0448ee9d54e33`). `None` when the
+/// output has no non-empty line at all — msb printed nothing usable.
+fn parse_import_digest_dir_name(output: &str) -> Option<String> {
+    let last_line = output.lines().rev().find(|line| !line.trim().is_empty())?;
+    let path_str = last_line.split_whitespace().last()?;
+    Path::new(path_str)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(str::to_string)
 }
 
 /// Before retrying a boot that hit msb's state-database error — enough for a winning
@@ -736,6 +766,63 @@ impl SandboxBackend for MsbCliBackend {
             result.exit_code,
             result.stderr.trim()
         )))
+    }
+
+    /// `msb snapshot export <ref> <dest>` (never `--with-image` — see
+    /// `crate::commands::snapshot_export`'s own doc for why) — the
+    /// checkpoint-archive feature's export primitive
+    /// (`rightsize::Checkpoint::export_to`).
+    async fn export_checkpoint(&self, checkpoint_ref: &str, dest: &Path) -> Result<()> {
+        let msb = self.msb.clone();
+        let snapshot_ref = checkpoint_ref.to_string();
+        let dest = dest.to_path_buf();
+        let dest_for_error = dest.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            invoke_standalone(
+                &msb,
+                &commands::snapshot_export(&snapshot_ref, &dest),
+                ARCHIVE_TIMEOUT,
+            )
+        })
+        .await
+        .map_err(|e| RightsizeError::Backend(format!("checkpoint export task panicked: {e}")))??;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "msb snapshot export {checkpoint_ref} {} failed (exit {}): {}",
+                dest_for_error.display(),
+                result.exit_code,
+                result.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `msb snapshot import <src_file>`, treating "already exists" as success,
+    /// then `msb snapshot list --format json` to confirm the imported snapshot's
+    /// DIGEST-DIR NAME is registered — the checkpoint-archive feature's import
+    /// primitive (`rightsize::Checkpoint::import_from`). `ref_hint` (the archive
+    /// manifest's original ref) plays no role here: msb's import is
+    /// content-addressed, so the effective ref is always the digest-dir name
+    /// parsed from the import output, never `ref_hint` and never the full
+    /// `sha256:<64hex>` digest (msb does not resolve that as a snapshot ref). See
+    /// [`msb_import_checkpoint_cycle`] for the orchestration this delegates to.
+    async fn import_checkpoint(&self, src_file: &Path, _ref_hint: &str) -> Result<String> {
+        let msb = self.msb.clone();
+        let archive_path = src_file.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut invoke_import = || {
+                invoke_standalone(
+                    &msb,
+                    &commands::snapshot_import(&archive_path),
+                    ARCHIVE_TIMEOUT,
+                )
+            };
+            let mut invoke_list =
+                || invoke_standalone(&msb, &commands::snapshot_list(), ARCHIVE_TIMEOUT);
+            msb_import_checkpoint_cycle(&mut invoke_import, &mut invoke_list)
+        })
+        .await
+        .map_err(|e| RightsizeError::Backend(format!("checkpoint import task panicked: {e}")))?
     }
 }
 
@@ -1176,6 +1263,62 @@ fn msb_checkpoint_cycle<T>(
     })
 }
 
+/// Orchestrates the checkpoint-archive feature's import cycle: `msb snapshot
+/// import` (treating "already exists" as success — see
+/// [`is_snapshot_already_exists`]) then `msb snapshot list --format json` to
+/// confirm the imported snapshot's digest-dir name is registered, via
+/// `invoke_import`/`invoke_list` (both injected, mirroring
+/// [`msb_checkpoint_cycle`]'s own shape) so this orchestration is unit-testable
+/// without a real `msb` binary. Returns the digest-dir name itself —
+/// [`MsbCliBackend::import_checkpoint`]'s effective ref — never the full
+/// `sha256:<64hex>` digest, which msb does not accept as a snapshot ref.
+///
+/// Failure handling: an import failure that ISN'T "already exists" surfaces with
+/// its stderr and never reaches `snapshot list` at all. A successful (or
+/// already-exists) import whose output has no parseable digest-dir name, or a
+/// `snapshot list` failure, or a digest-dir name that matches no listed entry,
+/// each surface as their own actionable error.
+fn msb_import_checkpoint_cycle(
+    invoke_import: &mut dyn FnMut() -> Result<ExecResult>,
+    invoke_list: &mut dyn FnMut() -> Result<ExecResult>,
+) -> Result<String> {
+    let import_result = invoke_import()?;
+    let combined = format!("{}\n{}", import_result.stdout, import_result.stderr);
+    if import_result.exit_code != 0 && !is_snapshot_already_exists(&combined) {
+        return Err(RightsizeError::Backend(format!(
+            "msb snapshot import failed (exit {}): {}",
+            import_result.exit_code,
+            import_result.stderr.trim()
+        )));
+    }
+
+    let digest_dir_name = parse_import_digest_dir_name(&combined).ok_or_else(|| {
+        RightsizeError::Backend(format!(
+            "msb snapshot import succeeded but its output did not end with a recognizable \
+             artifact path to resolve a digest from:\n{combined}"
+        ))
+    })?;
+
+    let list_result = invoke_list()?;
+    if list_result.exit_code != 0 {
+        return Err(RightsizeError::Backend(format!(
+            "msb snapshot list --format json failed while resolving the imported checkpoint's \
+             digest (exit {}): {}",
+            list_result.exit_code,
+            list_result.stderr.trim()
+        )));
+    }
+
+    crate::snapshot_json::confirm_digest_dir_name(&list_result.stdout, &digest_dir_name).ok_or_else(
+        || {
+            RightsizeError::Backend(format!(
+                "msb snapshot list --format json had no entry matching the imported snapshot's \
+                 digest directory '{digest_dir_name}'"
+            ))
+        },
+    )
+}
+
 /// Waits (bounded by [`ATTACHED_STOP_TIMEOUT`]) for an already-signalled-to-stop
 /// attached `msb run` child to exit on its own, force-killing it if the deadline
 /// passes first. Shared by [`MsbCliBackend::stop`] (after its own `msb stop`
@@ -1549,6 +1692,188 @@ mod tests {
             "rm must still be attempted before a reboot failure surfaces: {calls:?}"
         );
         assert_eq!(calls[2], commands::rm("rz-abc-1"));
+    }
+
+    // ---- checkpoint-archive import: digest parsing + already-exists handling ----
+
+    #[test]
+    fn is_snapshot_already_exists_matches_the_verified_wording() {
+        assert!(is_snapshot_already_exists(
+            "error: snapshot already exists: /home/u/.microsandbox/snapshots/sha256-b9c0448ee9d54e33"
+        ));
+        assert!(is_snapshot_already_exists(
+            "ERROR: Snapshot Already Exists: /path"
+        ));
+    }
+
+    #[test]
+    fn is_snapshot_already_exists_negative_cases_do_not_match() {
+        assert!(!is_snapshot_already_exists(""));
+        assert!(!is_snapshot_already_exists("error: snapshot not found: x"));
+        assert!(!is_snapshot_already_exists("imported successfully"));
+    }
+
+    #[test]
+    fn parse_import_digest_dir_name_takes_the_basename_of_the_last_lines_final_token() {
+        assert_eq!(
+            parse_import_digest_dir_name(
+                "Importing snapshot...\nImported to /home/u/.microsandbox/snapshots/sha256-b9c0448ee9d54e33\n"
+            ),
+            Some("sha256-b9c0448ee9d54e33".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_import_digest_dir_name_skips_trailing_blank_lines() {
+        assert_eq!(
+            parse_import_digest_dir_name("/snapshots/sha256-abcdef\n\n\n"),
+            Some("sha256-abcdef".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_import_digest_dir_name_none_on_entirely_blank_output() {
+        assert_eq!(parse_import_digest_dir_name("\n\n"), None);
+        assert_eq!(parse_import_digest_dir_name(""), None);
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_happy_path_returns_the_digest_dir_name() {
+        let mut import_calls = 0;
+        let mut list_calls = 0;
+        let result = {
+            let mut invoke_import = || {
+                import_calls += 1;
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "Imported to /snapshots/sha256-b9c0448ee9d54e33\n".to_string(),
+                    stderr: String::new(),
+                })
+            };
+            let mut invoke_list = || {
+                list_calls += 1;
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: r#"[{"digest":"sha256:fulldigesthere","name":"sha256-b9c0448ee9d54e33","artifact_path":"/snapshots/sha256-b9c0448ee9d54e33"}]"#
+                        .to_string(),
+                    stderr: String::new(),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import, &mut invoke_list)
+        };
+        assert_eq!(
+            result.unwrap(),
+            "sha256-b9c0448ee9d54e33",
+            "the effective ref must be the digest-dir name, never the full sha256: digest — msb \
+             does not resolve the full digest as a snapshot ref"
+        );
+        assert_eq!(import_calls, 1);
+        assert_eq!(list_calls, 1);
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_treats_already_exists_as_success_and_still_confirms_the_name() {
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "error: snapshot already exists: /snapshots/sha256-b9c0448ee9d54e33"
+                        .to_string(),
+                })
+            };
+            let mut invoke_list = || {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout:
+                        r#"[{"digest":"sha256:fulldigesthere","name":"sha256-b9c0448ee9d54e33"}]"#
+                            .to_string(),
+                    stderr: String::new(),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import, &mut invoke_list)
+        };
+        assert_eq!(
+            result.unwrap(),
+            "sha256-b9c0448ee9d54e33",
+            "an already-exists import is success for a content-addressed archive, and still \
+             resolves to the digest-dir name"
+        );
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_a_non_already_exists_failure_surfaces_stderr_and_never_lists() {
+        let mut list_called = false;
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "error: corrupt archive: bad checksum".to_string(),
+                })
+            };
+            let mut invoke_list = || {
+                list_called = true;
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "[]".to_string(),
+                    stderr: String::new(),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import, &mut invoke_list)
+        };
+        let err = result.expect_err("a genuine import failure must surface");
+        assert!(err.to_string().contains("bad checksum"), "{err}");
+        assert!(
+            !list_called,
+            "snapshot list must never run once the import itself failed for real"
+        );
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_surfaces_a_snapshot_list_failure() {
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "/snapshots/sha256-b9c0448ee9d54e33\n".to_string(),
+                    stderr: String::new(),
+                })
+            };
+            let mut invoke_list = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "database is locked".to_string(),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import, &mut invoke_list)
+        };
+        let err = result.expect_err("a failing snapshot list must surface");
+        assert!(err.to_string().contains("database is locked"), "{err}");
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_surfaces_an_unmatched_digest_dir_name() {
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "/snapshots/sha256-b9c0448ee9d54e33\n".to_string(),
+                    stderr: String::new(),
+                })
+            };
+            let mut invoke_list = || {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "[]".to_string(),
+                    stderr: String::new(),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import, &mut invoke_list)
+        };
+        let err = result.expect_err("no matching entry must surface as an error");
+        assert!(err.to_string().contains("sha256-b9c0448ee9d54e33"), "{err}");
     }
 
     #[test]
@@ -1959,6 +2284,102 @@ mod tests {
             "silently_remove must retry a state-db error on the stop call, not skip \
              straight to rm without retrying"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- checkpoint-archive export/import against a fake msb binary ----
+
+    /// Writes a stub `msb` replacement that answers `snapshot export`, `snapshot
+    /// import`, and `snapshot list --format json` — the three subcommands
+    /// `export_checkpoint`/`import_checkpoint` drive. `import_exit_code`/
+    /// `import_stderr` let a test choose between a fresh-import success (exit 0)
+    /// and an already-exists "success" (nonzero exit, msb's own wording on
+    /// stderr) — both of which [`MsbCliBackend::import_checkpoint`] must resolve
+    /// to the same effective ref.
+    #[cfg(unix)]
+    fn write_fake_msb_for_archives(
+        dir: &Path,
+        import_exit_code: u8,
+        import_stderr: &str,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-archive.sh");
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1 $2\" in\n\
+             \"snapshot export\")\n\
+             printf 'fake-export-payload:%s' \"$3\" > \"$4\"\n\
+             exit 0\n\
+             ;;\n\
+             \"snapshot import\")\n\
+             echo '{import_stderr}' 1>&2\n\
+             echo 'Imported to /home/u/.microsandbox/snapshots/sha256-fakedigest1234'\n\
+             exit {import_exit_code}\n\
+             ;;\n\
+             \"snapshot list\")\n\
+             echo '[{{\"digest\":\"sha256:fakedigest1234full\",\"name\":\"sha256-fakedigest1234\"}}]'\n\
+             exit 0\n\
+             ;;\n\
+             esac\n\
+             exit 1\n"
+        );
+        std::fs::write(&script, body).expect("write fake msb archive script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake msb archive script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_checkpoint_and_import_checkpoint_round_trip_via_a_fake_msb_binary() {
+        let dir = unique_test_dir("archive-fake-binary-fresh");
+        let script = write_fake_msb_for_archives(&dir, 0, "");
+        let backend = MsbCliBackend::new(script);
+
+        let dest = dir.join("cp.archive-payload");
+        backend
+            .export_checkpoint("rz-ckpt-deadbeefcafe", &dest)
+            .await
+            .expect("export_checkpoint must succeed against the fake binary");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "fake-export-payload:rz-ckpt-deadbeefcafe"
+        );
+
+        let effective_ref = backend
+            .import_checkpoint(&dest, "rz-ckpt-deadbeefcafe")
+            .await
+            .expect("import_checkpoint must succeed against the fake binary");
+        assert_eq!(
+            effective_ref, "sha256-fakedigest1234",
+            "the effective ref must be the digest-dir name (the import output path's \
+             basename), never the full sha256: digest from `snapshot list`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_checkpoint_treats_already_exists_as_success_via_the_fake_msb_binary() {
+        let dir = unique_test_dir("archive-fake-binary-exists");
+        let script = write_fake_msb_for_archives(
+            &dir,
+            1,
+            "error: snapshot already exists: /home/u/.microsandbox/snapshots/sha256-fakedigest1234",
+        );
+        let backend = MsbCliBackend::new(script);
+
+        let effective_ref = backend
+            .import_checkpoint(Path::new("/does/not/matter/for/this/stub"), "whatever-ref")
+            .await
+            .expect(
+                "an already-exists import must resolve exactly like a fresh one, not surface \
+                 as an error",
+            );
+        assert_eq!(effective_ref, "sha256-fakedigest1234");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

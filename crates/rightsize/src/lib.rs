@@ -14,6 +14,7 @@
 //! rediscover), copying files into a running container, live diagnostics, and gating
 //! a start on hardware isolation via `.require_isolation(true)`.
 
+mod archive;
 pub mod backend;
 pub mod backends;
 pub mod cache_dir;

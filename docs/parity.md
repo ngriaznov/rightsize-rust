@@ -32,6 +32,7 @@ backends, on every change to a `SandboxBackend` implementation.
 | Diagnostics report format | The exact rendered shape of a live-container diagnostics report — see below. |
 | Checkpoint gating | `checkpoint()` succeeds on both real backends and throws a typed, backend-naming error on a backend without the capability, before any backend call; restoring a checkpoint under a different active backend than the one that created it fails with a typed mismatch error before any backend work. |
 | Named checkpoints | A checkpoint created with a name persists a registry entry (one JSON file per name under the rightsize cache directory, pinned field names) and is rediscoverable in any later process via find/list/remove; re-checkpointing a name replaces its artifact and entry; a stale entry whose artifact is gone resolves to absent and is cleaned up. |
+| Checkpoint export/import | `exportTo` writes a self-describing archive (pinned metadata plus the backend artifact) for a checkpoint created by the active backend; `importFrom` materializes it on a machine running the same backend, re-registers a named checkpoint with replace semantics, and returns a restorable checkpoint; a backend mismatch or malformed archive fails with a typed error before any backend work. |
 
 ## The pinned identity-hash vector
 

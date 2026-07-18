@@ -130,12 +130,14 @@ let restored = Container::from_checkpoint(&checkpoint); // created under docker
 // If the active backend is microsandbox:
 let err = restored.start().await.unwrap_err();
 // RightsizeError::CheckpointBackendMismatch, naming both backends:
-// "... was started under the 'microsandbox' backend, but this checkpoint was
-//  created by the 'docker' backend — set RIGHTSIZE_BACKEND=docker to restore it ..."
+// "... the active backend is 'microsandbox', but this checkpoint was created by
+//  the 'docker' backend — set RIGHTSIZE_BACKEND=docker to use it ..."
 ```
 
 This check runs before any backend work, so a mismatch never reaches the CLI/daemon
-at all.
+at all. `Checkpoint::export_to`/`Checkpoint::import_from` (see
+["Moving checkpoints between machines"](#moving-checkpoints-between-machines)
+below) apply the exact same gate, before any backend or filesystem work.
 
 ## Restored containers are ordinary containers
 
@@ -267,6 +269,78 @@ record but leaves the artifact behind, and once the record is gone a later `remo
 finds nothing to act on — remove a checkpoint under its creating backend in the first
 place, or
 use the [manual CLI cleanup](#cleanup) below.
+
+## Moving checkpoints between machines
+
+Everything above rediscovers a checkpoint on the SAME machine, via the shared
+rightsize cache directory's registry. `export_to`/`import_from` move one to a
+DIFFERENT machine entirely — a portable archive file, so a checkpoint seeded once
+in CI can be cached as a build artifact and restored on a later runner instead of
+re-seeding there too:
+
+```rust,ignore
+use rightsize::{Checkpoint, Container};
+
+// On the seeding machine (or CI job):
+let checkpoint = original.checkpoint_named("seeded-db").await?;
+checkpoint.export_to("/tmp/seeded-db.archive").await?;
+
+// On a later machine, running the SAME backend:
+let checkpoint = Checkpoint::import_from("/tmp/seeded-db.archive").await?;
+let restored = Container::from_checkpoint(&checkpoint).start().await?;
+```
+
+The archive is a plain file: `checkpoint.export_to(path)` writes it,
+`Checkpoint::import_from(path)` reads it back and returns a restorable
+`Checkpoint` — no network transport of its own, so shipping it anywhere (a CI
+cache, an artifact store, a shared volume) is the caller's own choice.
+
+**The image is not bundled.** An archive carries the checkpoint's filesystem
+state, not the base image it was built from — the destination machine pulls the
+image fresh on the restored container's first boot, exactly as it would for any
+other `start()`. This is a deliberate limitation of msb 0.6.6's export format
+(bundling the image fails an integrity check on import), not a rightsize choice;
+see the [roadmap](./roadmap.md) for the self-contained-archive idea this leaves
+open.
+
+**Same backend required, same as everywhere else.** `export_to`/`import_from`
+apply the same backend-match gate as `from_checkpoint` itself:
+
+```rust,ignore
+let err = Checkpoint::import_from("/tmp/seeded-db.archive").await.unwrap_err();
+// RightsizeError::CheckpointBackendMismatch if the archive was exported under a
+// different backend than the one active on this machine.
+```
+
+A malformed or foreign archive (not a tar, missing its metadata, an unsupported
+format version, an invalid name) fails the same way — a typed error before any
+backend work, never a partial import.
+
+**Named archives replace, same semantics as `checkpoint_named`.** Importing an
+archive exported from a NAMED checkpoint re-registers that name on the
+destination machine, replacing any existing entry for it — the same
+[replace semantics](#reusing-checkpoints-across-runs) as taking a fresh named
+checkpoint locally. An archive from an unnamed `checkpoint()` imports fine too; it
+just writes no registry entry, and `import_from` returns an ephemeral
+`Checkpoint`.
+
+**msb's imported ref is a digest-derived directory name, not the original name.**
+microsandbox's `snapshot import` is content-addressed: the ref an imported
+checkpoint restores under is the digest-dir name it unpacked into (e.g.
+`sha256-b9c0448ee9d54e33`, visible as such in `Checkpoint::find`/`Checkpoint::list`
+results afterward), never the `rz-ckpt-<12hex>` name the archive was exported
+under, and never the full `sha256:<64hex>` digest either — msb doesn't resolve
+that as a snapshot ref. This is harmless — refs are opaque everywhere in this
+library, and `Container::from_checkpoint` restores from it exactly like any
+other — but don't be surprised to see a digest-shaped ref where a `rz-ckpt-` one
+might be expected. Docker's imported ref is the original tag, unchanged.
+
+**Archive size** follows each backend's own artifact: microsandbox's is the
+zstd-compressed disk snapshot, typically small even for a seeded database
+(sparse, compressed); docker's is a full `docker save` of the committed image
+layer, closer to the image's own size. Neither archive applies its own
+compression on top — msb's payload is already compressed, and docker's compresses
+poorly enough not to matter.
 
 ## Reuse is not a supported combination
 

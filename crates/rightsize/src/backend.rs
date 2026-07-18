@@ -267,6 +267,52 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// Writes this backend's own checkpoint payload for `checkpoint_ref` to
+    /// `dest_file` — the checkpoint-archive feature's export primitive
+    /// (`crate::Checkpoint::export_to`): msb runs `snapshot export <ref> <dest>`
+    /// (never `--with-image` — its import fails an integrity check in 0.6.6, so
+    /// the destination machine pulls the image fresh on first boot instead);
+    /// docker runs `docker save -o <dest> <ref>`. `dest_file`'s parent directory
+    /// already exists by the time this is called (the generic layer creates a
+    /// fresh temp staging directory before calling this); this method writes only
+    /// the one file.
+    ///
+    /// Default: unsupported (test doubles/fakes don't need this); both real
+    /// backends override it.
+    async fn export_checkpoint(&self, _checkpoint_ref: &str, _dest_file: &Path) -> Result<()> {
+        Err(RightsizeError::unsupported(
+            "checkpoint export",
+            self.name(),
+        ))
+    }
+
+    /// Materializes a checkpoint archive's payload (`src_file`, extracted from the
+    /// archive by the generic layer) onto this backend, returning the EFFECTIVE
+    /// ref the imported artifact is now reachable under — the checkpoint-archive
+    /// feature's import primitive (`crate::Checkpoint::import_from`). `ref_hint`
+    /// is the ref the archive's manifest recorded at export time.
+    ///
+    /// The two backends resolve the effective ref very differently: docker's
+    /// `docker load -i <src_file>` preserves the tag baked into the save file, so
+    /// its effective ref is simply `ref_hint` unchanged. Microsandbox's `msb
+    /// snapshot import <src_file>` is content-addressed — it unpacks under a
+    /// digest-derived directory name that has nothing to do with `ref_hint`, and
+    /// re-importing an archive whose digest already exists on this machine fails
+    /// with "snapshot already exists", which this method treats as success (the
+    /// artifact is already there) rather than an error — so its effective ref is
+    /// that digest-dir name (confirmed present via `msb snapshot list --format
+    /// json`), never `ref_hint` and never the full `sha256:<64hex>` digest, which
+    /// msb does not accept as a snapshot ref.
+    ///
+    /// Default: unsupported (test doubles/fakes don't need this); both real
+    /// backends override it.
+    async fn import_checkpoint(&self, _src_file: &Path, _ref_hint: &str) -> Result<String> {
+        Err(RightsizeError::unsupported(
+            "checkpoint import",
+            self.name(),
+        ))
+    }
+
     /// Copies `host_path` (a file or directory) into the running container at
     /// `container_path` — the RUNTIME counterpart to a start-time
     /// [`crate::model::FileMount`] (`Container::with_copy_file_to_container`, a

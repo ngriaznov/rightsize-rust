@@ -121,6 +121,20 @@ pub(crate) struct NamedRegistrySpec {
     pub memory_limit_mb: Option<u64>,
 }
 
+impl NamedRegistrySpec {
+    /// Reduces a full `ContainerSpec` down to the four fields this shape persists —
+    /// the same reduction `ContainerGuard::checkpoint_named` and
+    /// `Checkpoint::export_to` both need, factored out here so it's written once.
+    pub(crate) fn from_container_spec(spec: &ContainerSpec) -> Self {
+        NamedRegistrySpec {
+            env: spec.env.iter().cloned().collect(),
+            command: spec.command.clone(),
+            exposed_ports: spec.ports.iter().map(|p| p.guest_port).collect(),
+            memory_limit_mb: spec.memory_limit_mb,
+        }
+    }
+}
+
 /// `<cacheDir>/checkpoints/<name>.json`'s payload — the cross-language contract's
 /// exact field names and order, pinned identically across the Kotlin/Node/Rust
 /// implementations (parity-testable, see the parity docs page).

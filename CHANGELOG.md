@@ -7,7 +7,25 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Checkpoint export/import** (`rightsize`, `rightsize-msb`, `rightsize-docker`):
+  `Checkpoint::export_to(path)` writes a checkpoint to a portable archive (a plain
+  tar carrying pinned JSON metadata plus the backend's own payload — msb's
+  `snapshot export`, docker's `docker save`), and `Checkpoint::import_from(path)`
+  materializes an archive on the active backend and returns a restorable
+  `Checkpoint`, re-registering a named checkpoint with the same replace semantics
+  as `checkpoint_named`. Both fail with a typed error (a backend mismatch, a stale
+  or malformed archive) before any backend or filesystem work. `SandboxBackend`
+  gains `export_checkpoint`/`import_checkpoint`; microsandbox's import confirms
+  the digest-derived directory name an imported snapshot lands under via `msb
+  snapshot list --format json` and returns that as the effective ref (msb does
+  not resolve the full `sha256:` digest as a snapshot ref), docker's `docker
+  load` preserves the original tag unchanged. Archives never bundle the OCI
+  image (msb 0.6.6's `--with-image`
+  export fails an integrity check on import) — the destination machine pulls it
+  fresh on the restored container's first boot. See
+  [Checkpoint / Restore](docs/checkpoints.md#moving-checkpoints-between-machines).
 
 ## [0.3.0] - 2026-07-16
 

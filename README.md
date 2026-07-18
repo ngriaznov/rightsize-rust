@@ -5,8 +5,8 @@
 **Testcontainers-style integration testing on microVMs. No Docker required.**
 
 rightsize-rust runs your integration-test containers as hardware-isolated
-[microsandbox](https://github.com/superradcompany/microsandbox) microVMs — one
-microVM per container — behind a Tokio-async-native, RAII-guard Rust API. The
+[microsandbox](https://github.com/superradcompany/microsandbox) microVMs - one
+microVM per container - behind a Tokio-async-native, RAII-guard Rust API. The
 runtime self-provisions on first use (one Cargo dependency, zero install steps),
 and a hand-rolled Docker backend covers the platforms microVMs can't reach.
 
@@ -26,7 +26,7 @@ async fn orders_flow_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The guard *is* the API: `start()` returns an RAII handle. Call `stop().await` for
-explicit, ordered teardown, or just drop it — a dedicated cleanup thread reclaims
+explicit, ordered teardown, or just drop it - a dedicated cleanup thread reclaims
 the container even if the test panics ([how it works](#how-it-works)).
 
 ## Why microVMs
@@ -41,7 +41,7 @@ the container even if the test panics ([how it works](#how-it-works)).
 
 The Docker client's transport is hand-rolled by design: a small layer over
 `tokio::net::UnixStream`, so a dependency bump elsewhere in your tree can never be
-the reason a Docker call gets misrouted onto TCP — no `bollard`, no `hyper`, ever. The
+the reason a Docker call gets misrouted onto TCP - no `bollard`, no `hyper`, ever. The
 JSON layer on top of it is ordinary `serde`/`serde_json`, which carries none of that
 transport-routing risk.
 
@@ -63,7 +63,7 @@ No backend wiring: the feature-enabled backends (`backend-msb` and
 `backend-docker`, both on by default) register themselves the first time any
 module starts. On first test run, rightsize-rust downloads the pinned
 microsandbox runtime (SHA-256-verified, from GitHub releases) into
-`~/.cache/rightsize/` and boots your containers as microVMs — resolution picks
+`~/.cache/rightsize/` and boots your containers as microVMs - resolution picks
 the best supported backend, honoring `RIGHTSIZE_BACKEND` when set. No daemon,
 no root, no pre-installed anything.
 
@@ -77,7 +77,7 @@ rightsize_modules::register_default_backends();
 
 (Depending on `rightsize` and the backend crates directly, without
 `rightsize-modules`? Register providers by hand via
-`rightsize::backends::register_provider` — see the book.)
+`rightsize::backends::register_provider` - see the book.)
 
 ### Driving a container by hand
 
@@ -100,7 +100,7 @@ arango.stop().await?;
 
 ### Sharing one container across tests
 
-rightsize-rust has no JUnit-style static-scope annotation — the RAII guard is the
+rightsize-rust has no JUnit-style static-scope annotation - the RAII guard is the
 whole API surface. To share a container across many tests in one binary, boot it
 once behind a `tokio::sync::OnceCell` and let process exit reclaim it:
 
@@ -143,15 +143,15 @@ rightsize-rust picks a backend automatically; override with
 beta. CI-verified on `windows-2022`/`windows-2025` hosted runners, where WHP is
 already enabled with no reboot required. If WHP isn't enabled on your machine,
 `RIGHTSIZE_BACKEND=microsandbox` fails naming the precondition (run
-`msb doctor --fix` in an elevated terminal — this may require a reboot); leaving
+`msb doctor --fix` in an elevated terminal - this may require a reboot); leaving
 `RIGHTSIZE_BACKEND` unset falls back to Docker silently.
 
 Both backends satisfy one behavioral contract (`SandboxBackend`), verified by a
-shared test suite — the tests you write run unchanged on either. A few edges are
+shared test suite - the tests you write run unchanged on either. A few edges are
 backend-specific rather than behavioral divergences:
 
 - **Network-alias tunnels on microsandbox have real limits** versus Docker's
-  native bridge networking — see [Networking](#networking).
+  native bridge networking - see [Networking](#networking).
 - **Read-only file mounts aren't enforced in-guest on microsandbox 0.6.2.**
   `FileMount::read_only` is honored by Docker; on microsandbox the guest currently
   gets a writable mount regardless. Don't rely on guest-side write protection
@@ -190,16 +190,16 @@ remain available.
 | `FlociContainer` | `endpoint_url()`; `FlociContainer::aws()`/`azure()`/`gcp()` factories — [floci.io](https://floci.io) cloud emulators (unsigned REST, no SDK needed) |
 | `FlinkContainer` | `rest_url()`; `with_task_manager()` for a full session cluster — **Docker only**¹ |
 
-Heavyweight JVM images raise their own memory floor via `with_memory_limit` —
+Heavyweight JVM images raise their own memory floor via `with_memory_limit` -
 SpringCloudConfig, Keycloak, Neo4j and Flink (1024 MB), Pinot's four-JVM cluster
 (4096 MB). That's baked into the module; you don't set it. Each module's rustdoc
 documents its exact image tag, wait strategy, and the reasoning behind those
-choices — the [module chapter of the book](docs/modules/index.md) collects
+choices - the [module chapter of the book](docs/modules/index.md) collects
 the worked examples.
 
 ¹ `with_task_manager()` returns a `Result`: on microsandbox it errs with
 `RightsizeError::UnsupportedByBackend` (the Flink image carries no `nc`/busybox
-for the network-link emulation — see [Networking](#networking)), naming the
+for the network-link emulation - see [Networking](#networking)), naming the
 docker backend as the remedy. A bare JobManager (`rest_url()` only) runs on both.
 
 ## Networking
@@ -226,8 +226,8 @@ let app = Container::new("my-service:latest")
 ```
 
 `Network::resolve(alias, port)` returns `alias:port` on **both** backends. On
-Docker that's a native network alias. On microsandbox — where microVMs are fully
-isolated from each other — rightsize-rust transparently installs an `/etc/hosts`
+Docker that's a native network alias. On microsandbox - where microVMs are fully
+isolated from each other - rightsize-rust transparently installs an `/etc/hosts`
 entry plus a TCP relay tunneled over the sandbox's exec channel.
 
 The microVM emulation has limits worth knowing: start dependencies before their
@@ -239,37 +239,37 @@ Violations fail fast with an actionable error.
 
 - **Self-provisioning runtime.** A pinned `msb` release (binary + libkrunfw) is
   downloaded once, SHA-256-verified against the release manifest, and installed
-  atomically under `~/.cache/rightsize/` — the binary lands last, so a crashed
+  atomically under `~/.cache/rightsize/` - the binary lands last, so a crashed
   install is detected and repaired, never half-trusted. A cross-process lock
   keeps parallel test binaries from racing.
 - **Attached-mode supervision.** Each container is a held child process
   supervising its microVM; the image's `ENTRYPOINT` runs exactly as it would
   under Docker.
 - **Pre-allocated ports.** Host ports are chosen before boot, so brokers like
-  Redpanda/Kafka get their advertised listeners baked in — no restart dance. A
+  Redpanda/Kafka get their advertised listeners baked in - no restart dance. A
   backend binds the ports it's given; it never allocates its own.
 - **One trait, two runtimes.** `SandboxBackend` is a small `async_trait`; the
   shared contract suite is the referee, with the Docker backend doubling as the
   correctness oracle for the microVM backend.
 - **Two-tier cleanup, no async `Drop`.** The happy path is an explicit, awaited
-  `guard.stop().await`. The fallback — a guard simply dropped, a test panicking
-  mid-body — hands a small teardown descriptor to a dedicated background OS thread
+  `guard.stop().await`. The fallback - a guard simply dropped, a test panicking
+  mid-body - hands a small teardown descriptor to a dedicated background OS thread
   that tears the container down with blocking I/O only, no Tokio required. Orphan
   reaping (below) is the backstop for the backstop, cleaning up whatever a prior
   process's hard `SIGKILL` left behind.
 - **Orphan reaping.** A run-record ledger under the rightsize cache dir, an
   init-time sweep, and a per-run watchdog (default on) reap sandboxes a crashed
-  process (`SIGKILL`, OOM-kill, a killed CI step) left behind — liveness-aware, so
+  process (`SIGKILL`, OOM-kill, a killed CI step) left behind - liveness-aware, so
   it's safe across concurrent runs, unlike a bare name-prefix scan. Controlled by
   `RIGHTSIZE_REAPER=on|sweep|off`. See [Orphan Reaping](docs/reaping.md).
 - **Container reuse.** `.reuse(true)` combined with `RIGHTSIZE_REUSE=true`/`1`
-  marks a sandbox to survive process exit and be ADOPTED — not rebuilt — by a
+  marks a sandbox to survive process exit and be ADOPTED - not rebuilt - by a
   later, spec-identical `start()`. Identity is a `sha256` over a canonical
   serialization of the reuse-relevant spec, pinned as a cross-language test
   vector so the same spec hashes identically here and in the Kotlin/Node ports.
   See [Container Reuse](docs/reuse.md).
-- **Failure diagnostics.** `rightsize::diagnostics()` — and the automatic
-  `DiagnosticsGuard` hook, which prints on panic and stays silent otherwise —
+- **Failure diagnostics.** `rightsize::diagnostics()` - and the automatic
+  `DiagnosticsGuard` hook, which prints on panic and stays silent otherwise -
   renders every container this process has running, its state, ports, and last
   50 log lines, in a report format pinned identically across the Kotlin/Node
   ports. See [Failure Diagnostics](docs/diagnostics.md).
@@ -278,20 +278,22 @@ Violations fail fast with an actionable error.
   an untrusted workload wherever `RIGHTSIZE_BACKEND` happened to resolve. See
   [Isolation Requirement](docs/isolation.md).
 - **Checkpoint / restore.** `guard.checkpoint()` captures a running container's
-  filesystem — an image commit on docker, a disk snapshot on microsandbox —
+  filesystem - an image commit on docker, a disk snapshot on microsandbox -
   and `Container::from_checkpoint(&cp)` restores as many sandboxes from it as
   needed: boot once, seed once, restore per test instead of re-seeding.
   `guard.checkpoint_named("seeded-db")` gives a checkpoint durable identity a
-  later process can rediscover with `Checkpoint::find`/`Checkpoint::list`. See
+  later process can rediscover with `Checkpoint::find`/`Checkpoint::list`, and
+  `checkpoint.export_to(path)`/`Checkpoint::import_from(path)` move one to a
+  different machine entirely as a portable archive file. See
   [Checkpoint / Restore](docs/checkpoints.md).
 - **Runtime file copy.** `guard.copy_file_to_container(...)`/
   `copy_content_to_container(...)`/`copy_file_from_container(...)` round-trip
   files, in-memory content, and directories into and out of an already-running
-  container, on either backend — the parent directory on the destination side
+  container, on either backend - the parent directory on the destination side
   is always created for you. See [Copying Files](docs/copy.md).
-- **Cross-language parity.** The `SandboxBackend` contract above — lifecycle,
+- **Cross-language parity.** The `SandboxBackend` contract above - lifecycle,
   networking, reaping, reuse, diagnostics, isolation, checkpoints, runtime
-  copy — is verified identically in the Kotlin and TypeScript ports of this
+  copy - is verified identically in the Kotlin and TypeScript ports of this
   library by each port's own copy of the shared contract suite. See
   [Cross-Language Parity](docs/parity.md).
 
@@ -318,7 +320,7 @@ cargo run -p rightsize-modules --example postgres   # RAII guard: start -> tokio
 cargo run -p rightsize-modules --example network    # two containers on a Network, reached by alias
 ```
 
-Like everything else in this repo, they run on either backend — force one with
+Like everything else in this repo, they run on either backend - force one with
 `RIGHTSIZE_BACKEND=microsandbox|docker` prefixed on any of the commands above.
 
 ## Development
@@ -338,7 +340,7 @@ RIGHTSIZE_BACKEND=docker       cargo test --workspace --features sandbox-it   # 
 CI runs the full matrix (`unit`, `msb-linux`, `msb-macos`, `docker-fallback`).
 A change to a `SandboxBackend` implementation, or anything the shared contract
 suite exercises, should run the `sandbox-it` suite against both backends before a
-PR — see [CONTRIBUTING.md](.github/CONTRIBUTING.md).
+PR - see [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## Documentation
 
@@ -346,7 +348,7 @@ The book is at
 **[ngriaznov.github.io/rightsize-rust](https://ngriaznov.github.io/rightsize-rust/)**
 (source under `docs/`, built with mdBook). It covers getting started, core concepts
 (containers & guards, wait strategies, networking, files & resources), backends,
-every module, and the internals — all its samples are machine-compile-verified.
+every module, and the internals - all its samples are machine-compile-verified.
 
 ## License
 

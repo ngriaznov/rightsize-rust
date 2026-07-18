@@ -1521,12 +1521,7 @@ impl ContainerGuard {
             checkpoint_ref: checkpoint_ref.clone(),
             backend: self.backend.name().to_string(),
             created_iso: crate::reuse::now_iso8601(),
-            spec: checkpoint::NamedRegistrySpec {
-                env: spec.env.iter().cloned().collect(),
-                command: spec.command.clone(),
-                exposed_ports: spec.ports.iter().map(|p| p.guest_port).collect(),
-                memory_limit_mb: spec.memory_limit_mb,
-            },
+            spec: checkpoint::NamedRegistrySpec::from_container_spec(&spec),
         };
         registry.write_atomic(&entry)?;
 
@@ -1810,6 +1805,68 @@ impl Checkpoint {
         checkpoint::validate_name(name)?;
         remove_named(name, &backends::active(), &crate::cache_dir::dir()).await
     }
+
+    /// Exports this checkpoint to a portable archive at `path`: a plain tar
+    /// containing pinned JSON metadata (`checkpoint.json`) plus the backend's own
+    /// checkpoint payload (`artifact`), written byte-for-byte exactly as the
+    /// backend CLI produced it (msb's `snapshot export`; docker's `docker save`).
+    /// See the checkpoints docs' "Moving checkpoints between machines" section for
+    /// the full story — the destination machine pulls the image fresh on first
+    /// boot rather than the archive bundling it, size expectations, and the msb
+    /// digest-shaped ref an import produces.
+    ///
+    /// Requires the ACTIVE backend to equal `self.backend` — before any backend or
+    /// filesystem work, this fails with [`RightsizeError::CheckpointBackendMismatch`]
+    /// otherwise. The backend-native artifact is then probed
+    /// (`SandboxBackend::has_checkpoint`): exporting a stale checkpoint fails with
+    /// [`RightsizeError::CheckpointArtifactMissing`] rather than producing a broken
+    /// archive. `path`'s parent directories are created if missing; a pre-existing
+    /// file at `path` is overwritten. Works on an unnamed checkpoint too — the
+    /// archive's `name` field is simply `null`.
+    pub async fn export_to(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        export_to_impl(
+            self,
+            path.as_ref(),
+            &backends::active(),
+            &crate::cache_dir::dir(),
+            &std::env::temp_dir(),
+        )
+        .await
+    }
+
+    /// Imports a checkpoint archive written by [`Self::export_to`], materializing
+    /// its payload on the ACTIVE backend and returning a `Checkpoint` restorable
+    /// via [`crate::Container::from_checkpoint`] exactly like any other.
+    ///
+    /// The archive is extracted to a fresh temp dir and fully validated BEFORE any
+    /// backend call or registry write: the file must exist and extract as a tar
+    /// containing `checkpoint.json`, which must parse, carry
+    /// `rightsizeArchive: 1`, a `name` matching the checkpoint-name pattern when
+    /// non-null, and a `backend` equal to the currently active one. Each violation
+    /// is a typed error — [`RightsizeError::MalformedArchive`],
+    /// [`RightsizeError::InvalidCheckpointName`], or
+    /// [`RightsizeError::CheckpointBackendMismatch`] respectively.
+    ///
+    /// The backend then materializes the artifact
+    /// (`SandboxBackend::import_checkpoint`) and returns the EFFECTIVE ref: docker's
+    /// is the original ref unchanged; microsandbox's is the resolved digest
+    /// (content-addressed, so re-importing the identical archive twice is a
+    /// harmless no-op that resolves to the same ref both times). A NAMED archive
+    /// then replaces the matching registry entry — best-effort removing the
+    /// PREVIOUS same-backend artifact first, but only when its ref actually
+    /// differs from the new effective ref, so re-importing the identical archive
+    /// never deletes the artifact it just materialized — and writes the new entry
+    /// under the effective ref. An UNNAMED archive writes no registry entry at all
+    /// and returns an ephemeral `Checkpoint`.
+    pub async fn import_from(path: impl AsRef<std::path::Path>) -> Result<Checkpoint> {
+        import_from_impl(
+            path.as_ref(),
+            &backends::active(),
+            &crate::cache_dir::dir(),
+            &std::env::temp_dir(),
+        )
+        .await
+    }
 }
 
 /// [`Checkpoint::find`]'s actual logic, parameterized over the backend and
@@ -1871,20 +1928,175 @@ async fn remove_named(
     Ok(existed)
 }
 
-/// Reconstructs a [`Checkpoint`] from a registry entry read back off disk.
-/// The entry only ever persisted the reduced slice of a spec
-/// `Container::from_checkpoint` actually reads (env, command, exposed/guest
-/// ports, memory limit — see `checkpoint::NamedRegistrySpec`'s own doc), so
-/// every other `ContainerSpec` field here is a harmless placeholder:
-/// `from_checkpoint` never reads a checkpoint's `spec.name`, `mounts`,
-/// `network_id`, `aliases`, `run_id`, `keep_alive`, or `spec.checkpoint_ref` —
-/// only the top-level `Checkpoint::checkpoint_ref` matters for that. Host
-/// ports are unknowable from a persisted spec (only the guest side was ever
-/// saved) and unused by `from_checkpoint` either way (it re-derives fresh
-/// host ports at `start()` time), so they're placeholder `0`.
-fn checkpoint_from_entry(entry: checkpoint::NamedRegistryEntry) -> Checkpoint {
-    let ports = entry
-        .spec
+/// [`Checkpoint::export_to`]'s actual logic, parameterized over the backend and
+/// cache dir for the same reason [`find_named`] is, plus `staging_parent` — the
+/// directory the export's [`crate::archive::TempStagingDir`] is created under
+/// (`std::env::temp_dir()` in production; a private per-test directory in a
+/// test that wants a deterministic staging-cleanup scan).
+async fn export_to_impl(
+    cp: &Checkpoint,
+    dest: &std::path::Path,
+    backend: &Arc<dyn SandboxBackend>,
+    cache_dir: &std::path::Path,
+    staging_parent: &std::path::Path,
+) -> Result<()> {
+    if cp.backend != backend.name() {
+        return Err(RightsizeError::CheckpointBackendMismatch {
+            active_backend: backend.name().to_string(),
+            checkpoint_backend: cp.backend.clone(),
+        });
+    }
+    if !backend.has_checkpoint(&cp.checkpoint_ref).await? {
+        return Err(RightsizeError::CheckpointArtifactMissing {
+            checkpoint_ref: cp.checkpoint_ref.clone(),
+            backend: cp.backend.clone(),
+        });
+    }
+
+    // Guard: cleaned up on drop, success or failure alike (see the guard's own
+    // doc for why this is the finally/defer equivalent here).
+    let staging = crate::archive::TempStagingDir::create_in(staging_parent, "export")?;
+    backend
+        .export_checkpoint(
+            &cp.checkpoint_ref,
+            &crate::archive::artifact_path(staging.path()),
+        )
+        .await?;
+
+    // A `Checkpoint` doesn't carry its own name — only the registry does — so
+    // recover it (if any) by matching this ref/backend against every registered
+    // entry. `None` (an unnamed archive) either for a genuinely unnamed
+    // checkpoint or one whose registry entry has since been removed/replaced.
+    let name = find_registered_name(cache_dir, &cp.backend, &cp.checkpoint_ref);
+    let manifest = crate::archive::ArchiveManifest {
+        rightsize_archive: crate::archive::FORMAT_VERSION,
+        name,
+        checkpoint_ref: cp.checkpoint_ref.clone(),
+        backend: cp.backend.clone(),
+        created_iso: crate::reuse::now_iso8601(),
+        spec: checkpoint::NamedRegistrySpec::from_container_spec(&cp.spec),
+    };
+    crate::archive::write_manifest(&crate::archive::manifest_path(staging.path()), &manifest)?;
+
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    crate::archive::tar_create(dest, staging.path()).await
+}
+
+/// The reverse-lookup [`export_to_impl`] needs: the name of the named-checkpoint
+/// registry entry (if any) whose `checkpoint_ref`/`backend` match exactly. A
+/// missing/unreadable registry directory resolves to `None`, same as "nothing
+/// registered" — this is a best-effort archive-metadata lookup, never a fatal
+/// error in its own right.
+fn find_registered_name(
+    cache_dir: &std::path::Path,
+    backend: &str,
+    checkpoint_ref: &str,
+) -> Option<String> {
+    checkpoint::list_registry_entries(cache_dir)
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.backend == backend && entry.checkpoint_ref == checkpoint_ref)
+        .map(|entry| entry.name)
+}
+
+/// [`Checkpoint::import_from`]'s actual logic, parameterized over the backend and
+/// cache dir for the same reason [`find_named`] is, plus `staging_parent` — see
+/// [`export_to_impl`]'s doc for why this is a parameter rather than always
+/// `std::env::temp_dir()`.
+async fn import_from_impl(
+    src: &std::path::Path,
+    backend: &Arc<dyn SandboxBackend>,
+    cache_dir: &std::path::Path,
+    staging_parent: &std::path::Path,
+) -> Result<Checkpoint> {
+    let staging = crate::archive::TempStagingDir::create_in(staging_parent, "import")?;
+    crate::archive::tar_extract(src, staging.path()).await?;
+
+    let manifest =
+        crate::archive::read_manifest(src, &crate::archive::manifest_path(staging.path()))?;
+    if manifest.rightsize_archive != crate::archive::FORMAT_VERSION {
+        return Err(RightsizeError::MalformedArchive {
+            path: src.to_path_buf(),
+            reason: format!(
+                "unsupported rightsizeArchive version {} (this port understands only {})",
+                manifest.rightsize_archive,
+                crate::archive::FORMAT_VERSION
+            ),
+        });
+    }
+    if let Some(name) = &manifest.name {
+        checkpoint::validate_name(name)?;
+    }
+    if manifest.backend != backend.name() {
+        return Err(RightsizeError::CheckpointBackendMismatch {
+            active_backend: backend.name().to_string(),
+            checkpoint_backend: manifest.backend.clone(),
+        });
+    }
+
+    // Every check above is pure (filesystem-only) — this is the first backend
+    // call import_from ever makes.
+    let effective_ref = backend
+        .import_checkpoint(
+            &crate::archive::artifact_path(staging.path()),
+            &manifest.checkpoint_ref,
+        )
+        .await?;
+
+    if let Some(name) = &manifest.name {
+        let registry = checkpoint::Registry::new(cache_dir, name);
+        if let Some(previous) = registry.read() {
+            // Only remove the OLD artifact when it's actually a different ref: msb
+            // imports are content-addressed, so re-importing the identical
+            // archive under the same name resolves to the SAME effective ref the
+            // previous import already registered — best-effort-removing it here
+            // would delete the artifact this call just materialized, before the
+            // registry write below even lands.
+            if previous.backend == backend.name() && previous.checkpoint_ref != effective_ref {
+                let _ = backend.remove_checkpoint(&previous.checkpoint_ref).await;
+            }
+        }
+        let entry = checkpoint::NamedRegistryEntry {
+            name: name.clone(),
+            checkpoint_ref: effective_ref.clone(),
+            backend: backend.name().to_string(),
+            created_iso: crate::reuse::now_iso8601(),
+            spec: manifest.spec.clone(),
+        };
+        registry.write_atomic(&entry)?;
+    }
+
+    Ok(checkpoint_from_reduced(
+        manifest.name.as_deref().unwrap_or("imported"),
+        effective_ref,
+        backend.name().to_string(),
+        manifest.spec,
+    ))
+}
+
+/// Builds a [`Checkpoint`] from a reduced spec plus the identity a full registry
+/// entry would otherwise carry — the shared construction [`checkpoint_from_entry`]
+/// (a rediscovered NAMED checkpoint) and [`import_from_impl`] (an imported archive,
+/// named or not) both need. `display_name` only ever feeds the placeholder
+/// `ContainerSpec::name` (`rz-checkpoint-<display_name>`) — never read by
+/// `Container::from_checkpoint`, which only reads `Checkpoint::checkpoint_ref` for
+/// that. Every other placeholder field mirrors [`checkpoint_from_entry`]'s
+/// original doc: `from_checkpoint` never reads a checkpoint's `spec.mounts`,
+/// `network_id`, `aliases`, `run_id`, `keep_alive`, or `spec.checkpoint_ref`. Host
+/// ports are unknowable from a persisted spec (only the guest side was ever saved)
+/// and unused by `from_checkpoint` either way (it re-derives fresh host ports at
+/// `start()` time), so they're placeholder `0`.
+fn checkpoint_from_reduced(
+    display_name: &str,
+    checkpoint_ref: String,
+    backend: String,
+    spec: checkpoint::NamedRegistrySpec,
+) -> Checkpoint {
+    let ports = spec
         .exposed_ports
         .iter()
         .map(|&guest_port| crate::model::PortBinding {
@@ -1893,23 +2105,30 @@ fn checkpoint_from_entry(entry: checkpoint::NamedRegistryEntry) -> Checkpoint {
         })
         .collect();
     Checkpoint {
-        checkpoint_ref: entry.checkpoint_ref.clone(),
-        backend: entry.backend,
+        checkpoint_ref: checkpoint_ref.clone(),
+        backend,
         spec: ContainerSpec {
-            name: format!("rz-checkpoint-{}", entry.name),
-            image: entry.checkpoint_ref,
-            env: entry.spec.env.into_iter().collect(),
-            command: entry.spec.command,
+            name: format!("rz-checkpoint-{display_name}"),
+            image: checkpoint_ref,
+            env: spec.env.into_iter().collect(),
+            command: spec.command,
             ports,
             mounts: Vec::new(),
             network_id: None,
             aliases: Vec::new(),
             run_id: String::new(),
-            memory_limit_mb: entry.spec.memory_limit_mb,
+            memory_limit_mb: spec.memory_limit_mb,
             keep_alive: false,
             checkpoint_ref: None,
         },
     }
+}
+
+/// Reconstructs a [`Checkpoint`] from a registry entry read back off disk — see
+/// [`checkpoint_from_reduced`] for the shared construction and its own doc for
+/// which fields are real versus placeholder.
+fn checkpoint_from_entry(entry: checkpoint::NamedRegistryEntry) -> Checkpoint {
+    checkpoint_from_reduced(&entry.name, entry.checkpoint_ref, entry.backend, entry.spec)
 }
 
 /// Fails fast with an actionable message unless `path` is absolute — both backend
@@ -2091,6 +2310,19 @@ mod tests {
         /// Every ref `has_checkpoint` actually received — `Checkpoint::find`'s
         /// probe tests' proof that a different-backend entry is never probed.
         probed_checkpoints: Vec<String>,
+        /// `(ref, dest path)` for every `export_checkpoint` call this backend
+        /// actually received — the archive export tests' proof of exactly what
+        /// was asked to be exported, and that nothing is asked for once a
+        /// pre-backend-call gate refuses.
+        exported_checkpoints: Vec<(String, std::path::PathBuf)>,
+        /// `(src file path, ref hint, the bytes actually sitting at that path at
+        /// call time)` for every `import_checkpoint` call this backend actually
+        /// received — the archive import tests' proof that every validation step
+        /// genuinely runs before any backend call, and that the round-tripped
+        /// payload bytes really reached the backend. The bytes are captured
+        /// eagerly (at call time), since the source path lives in a temp staging
+        /// dir that's gone by the time `import_from` returns.
+        imported_checkpoints: Vec<(std::path::PathBuf, String, Vec<u8>)>,
     }
 
     struct FakeBackend {
@@ -2104,6 +2336,10 @@ mod tests {
         /// "checkpoint_named writes no registry entry on backend failure" test's
         /// fixture.
         fail_create_checkpoint: bool,
+        /// When true, `export_checkpoint` fails outright, AFTER the staging dir
+        /// already exists — the "temp dir cleaned up on failure too" test's
+        /// fixture.
+        fail_export_checkpoint: bool,
         /// `has_checkpoint`'s canned answer: `Some(true)`/`Some(false)` for a
         /// definite exists/absent, `None` to simulate a probe FAILURE (an `Err`,
         /// never resolved to `Ok(false)` — see `SandboxBackend::has_checkpoint`'s
@@ -2111,6 +2347,12 @@ mod tests {
         /// `Some(true)`, overridable after construction via
         /// [`FakeBackend::set_probe_result`].
         probe_result: StdMutex<Option<bool>>,
+        /// Overrides `import_checkpoint`'s returned effective ref; `None` (the
+        /// default) returns `format!("effective:{ref_hint}")` — distinct from
+        /// `ref_hint` on purpose, so a test can tell "the effective ref" and "the
+        /// ref the archive's manifest recorded" apart even when nothing
+        /// deliberately overrides it.
+        import_effective_ref: StdMutex<Option<String>>,
         name: &'static str,
     }
     impl FakeBackend {
@@ -2123,7 +2365,9 @@ mod tests {
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2136,7 +2380,9 @@ mod tests {
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2149,7 +2395,9 @@ mod tests {
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2164,7 +2412,9 @@ mod tests {
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2180,7 +2430,9 @@ mod tests {
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2197,7 +2449,9 @@ mod tests {
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: true,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2214,7 +2468,9 @@ mod tests {
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name,
             })
         }
@@ -2229,7 +2485,27 @@ mod tests {
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
                 fail_create_checkpoint: true,
+                fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
+                name: "fake",
+            })
+        }
+        /// A `checkpoint`-capable fake whose `export_checkpoint` always fails,
+        /// AFTER the caller's staging dir already exists — the "export_to cleans
+        /// up its staging dir on failure too" test's fixture.
+        fn checkpoint_capable_that_fails_export() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: true,
+                checkpoint_restarts_workload: false,
+                fail_create_checkpoint: false,
+                fail_export_checkpoint: true,
+                probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
                 name: "fake",
             })
         }
@@ -2238,6 +2514,12 @@ mod tests {
         /// the `probe_result` field's own doc.
         fn set_probe_result(&self, result: Option<bool>) {
             *self.probe_result.lock().unwrap() = result;
+        }
+
+        /// Overrides this fake's `import_checkpoint` effective-ref answer after
+        /// construction — see the `import_effective_ref` field's own doc.
+        fn set_import_effective_ref(&self, effective_ref: impl Into<String>) {
+            *self.import_effective_ref.lock().unwrap() = Some(effective_ref.into());
         }
     }
     #[async_trait::async_trait]
@@ -2371,6 +2653,47 @@ mod tests {
                     "has_checkpoint probe failed".to_string(),
                 )),
             }
+        }
+        /// Writes a recognizable payload (the ref itself, so a test can assert
+        /// the round-tripped archive really carried this call's own bytes) to
+        /// `dest`, and records the call.
+        async fn export_checkpoint(
+            &self,
+            checkpoint_ref: &str,
+            dest: &std::path::Path,
+        ) -> Result<()> {
+            if self.fail_export_checkpoint {
+                return Err(RightsizeError::Backend(
+                    "export_checkpoint failed".to_string(),
+                ));
+            }
+            std::fs::write(dest, format!("fake-artifact-payload:{checkpoint_ref}"))?;
+            self.state
+                .lock()
+                .unwrap()
+                .exported_checkpoints
+                .push((checkpoint_ref.to_string(), dest.to_path_buf()));
+            Ok(())
+        }
+        /// Records the call and returns the canned effective ref — see the
+        /// `import_effective_ref` field's own doc.
+        async fn import_checkpoint(
+            &self,
+            src_file: &std::path::Path,
+            ref_hint: &str,
+        ) -> Result<String> {
+            let bytes = std::fs::read(src_file).unwrap_or_default();
+            self.state.lock().unwrap().imported_checkpoints.push((
+                src_file.to_path_buf(),
+                ref_hint.to_string(),
+                bytes,
+            ));
+            Ok(self
+                .import_effective_ref
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("effective:{ref_hint}")))
         }
         async fn copy_to_container(
             &self,
@@ -3279,6 +3602,670 @@ mod tests {
             backend.state.lock().unwrap().removed_checkpoints.is_empty(),
             "a different-backend entry's ref must never reach remove_checkpoint"
         );
+    }
+
+    // ============================ checkpoint archives ============================
+
+    fn temp_archive_path(label: &str) -> std::path::PathBuf {
+        temp_cache_dir(label).join("cp.archive")
+    }
+
+    fn archive_manifest(
+        name: Option<&str>,
+        backend: &str,
+        checkpoint_ref: &str,
+    ) -> crate::archive::ArchiveManifest {
+        crate::archive::ArchiveManifest {
+            rightsize_archive: crate::archive::FORMAT_VERSION,
+            name: name.map(str::to_string),
+            checkpoint_ref: checkpoint_ref.to_string(),
+            backend: backend.to_string(),
+            created_iso: "2025-01-01T00:00:00Z".to_string(),
+            spec: checkpoint::NamedRegistrySpec {
+                env: std::collections::BTreeMap::from([("A".to_string(), "1".to_string())]),
+                command: Some(vec!["redis-server".to_string()]),
+                exposed_ports: vec![6379],
+                memory_limit_mb: Some(256),
+            },
+        }
+    }
+
+    /// Builds a well-formed archive directly at the tar layer — independent of
+    /// `export_to_impl`, so a test can also build a deliberately malformed one
+    /// (see [`write_archive_missing_manifest`]/[`write_archive_malformed_json`]).
+    async fn write_archive(
+        dest: &std::path::Path,
+        manifest: &crate::archive::ArchiveManifest,
+        artifact_bytes: &[u8],
+    ) {
+        let staging = crate::archive::TempStagingDir::create("test-fixture").unwrap();
+        crate::archive::write_manifest(&crate::archive::manifest_path(staging.path()), manifest)
+            .unwrap();
+        std::fs::write(
+            crate::archive::artifact_path(staging.path()),
+            artifact_bytes,
+        )
+        .unwrap();
+        crate::archive::tar_create(dest, staging.path())
+            .await
+            .unwrap();
+    }
+
+    /// A tar containing only `artifact`, no `checkpoint.json` — the "archive
+    /// missing checkpoint.json" fixture.
+    async fn write_archive_missing_manifest(dest: &std::path::Path) {
+        let staging = crate::archive::TempStagingDir::create("test-fixture-no-manifest").unwrap();
+        std::fs::write(crate::archive::artifact_path(staging.path()), b"artifact").unwrap();
+        let output = tokio::process::Command::new("tar")
+            .arg("-cf")
+            .arg(dest)
+            .arg("-C")
+            .arg(staging.path())
+            .arg("artifact")
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// A tar whose `checkpoint.json` member exists but isn't valid JSON — the
+    /// "malformed json" fixture.
+    async fn write_archive_malformed_json(dest: &std::path::Path) {
+        let staging = crate::archive::TempStagingDir::create("test-fixture-bad-json").unwrap();
+        std::fs::write(crate::archive::manifest_path(staging.path()), b"not json").unwrap();
+        std::fs::write(crate::archive::artifact_path(staging.path()), b"artifact").unwrap();
+        crate::archive::tar_create(dest, staging.path())
+            .await
+            .unwrap();
+    }
+
+    // export: backend mismatch refuses before any backend or filesystem work.
+    #[tokio::test]
+    async fn export_to_refuses_on_a_backend_mismatch_before_any_backend_call() {
+        let cp = Checkpoint {
+            checkpoint_ref: "fake-checkpoint:abc".to_string(),
+            backend: "fake-a".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+
+        let active_backend = FakeBackend::named("fake-b");
+        let dest = temp_archive_path("export-mismatch");
+        let err = export_to_impl(
+            &cp,
+            &dest,
+            &(active_backend.clone() as Arc<dyn SandboxBackend>),
+            &temp_cache_dir("export-mismatch-cache"),
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("a backend mismatch must refuse before any work");
+        assert!(
+            matches!(err, RightsizeError::CheckpointBackendMismatch { .. }),
+            "{err}"
+        );
+        assert!(!dest.exists(), "no archive may be written on a mismatch");
+        assert!(
+            active_backend
+                .state
+                .lock()
+                .unwrap()
+                .exported_checkpoints
+                .is_empty(),
+            "no backend call may happen once the mismatch is detected"
+        );
+    }
+
+    // export: a stale artifact (has_checkpoint == false) is a typed error, and
+    // export_checkpoint is never called.
+    #[tokio::test]
+    async fn export_to_refuses_when_the_artifact_is_stale() {
+        let backend = FakeBackend::checkpoint_capable();
+        backend.set_probe_result(Some(false)); // "definitely gone"
+        let cp = Checkpoint {
+            checkpoint_ref: "fake-checkpoint:gone".to_string(),
+            backend: "fake".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+
+        let dest = temp_archive_path("export-stale");
+        let err = export_to_impl(
+            &cp,
+            &dest,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &temp_cache_dir("export-stale-cache"),
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("a stale artifact must refuse");
+        assert!(
+            matches!(err, RightsizeError::CheckpointArtifactMissing { .. }),
+            "{err}"
+        );
+        assert!(!dest.exists());
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .exported_checkpoints
+                .is_empty(),
+            "export_checkpoint must never be called once the staleness probe refuses"
+        );
+    }
+
+    // export: the staging dir is removed whether the export succeeds or fails
+    // partway through.
+    #[tokio::test]
+    async fn export_to_cleans_up_its_staging_dir_on_success_and_on_failure() {
+        // A private staging parent, not the shared `std::env::temp_dir()` —
+        // sibling tests race identically-prefixed staging dirs into that
+        // shared directory, so scanning it for "no `rightsize-archive-
+        // export-*` entries" is flaky under parallel test execution. Scanning
+        // this test's own private parent instead is fully deterministic.
+        let staging_parent = temp_cache_dir("export-cleanup-staging-parent");
+        let matching_staging_dirs = |label: &str| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(&staging_parent)
+                .map(|rd| {
+                    rd.filter_map(std::result::Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.contains(label))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // Success path.
+        let backend = FakeBackend::checkpoint_capable();
+        let cp = Checkpoint {
+            checkpoint_ref: "fake-checkpoint:ok".to_string(),
+            backend: "fake".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+        export_to_impl(
+            &cp,
+            &temp_archive_path("export-cleanup-ok"),
+            &(backend as Arc<dyn SandboxBackend>),
+            &temp_cache_dir("export-cleanup-ok-cache"),
+            &staging_parent,
+        )
+        .await
+        .expect("export must succeed");
+        assert!(
+            matching_staging_dirs("rightsize-archive-export-").is_empty(),
+            "a successful export must leave no staging dir behind"
+        );
+
+        // Failure path: export_checkpoint itself fails after the staging dir
+        // already exists.
+        let failing_backend = FakeBackend::checkpoint_capable_that_fails_export();
+        let cp = Checkpoint {
+            checkpoint_ref: "fake-checkpoint:fail".to_string(),
+            backend: "fake".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+        export_to_impl(
+            &cp,
+            &temp_archive_path("export-cleanup-fail"),
+            &(failing_backend as Arc<dyn SandboxBackend>),
+            &temp_cache_dir("export-cleanup-fail-cache"),
+            &staging_parent,
+        )
+        .await
+        .expect_err("export_checkpoint must fail");
+        assert!(
+            matching_staging_dirs("rightsize-archive-export-").is_empty(),
+            "a failed export must ALSO leave no staging dir behind"
+        );
+    }
+
+    // export -> import round trip through a real tar file: payload bytes
+    // identical, metadata fields identical, effective ref propagated into the
+    // returned checkpoint and (for a named source) the registry entry.
+    #[tokio::test]
+    async fn export_then_import_round_trips_payload_and_metadata_and_propagates_the_effective_ref()
+    {
+        let export_backend = FakeBackend::checkpoint_capable();
+        let export_cache = temp_cache_dir("archive-roundtrip-export-cache");
+        checkpoint::Registry::new(&export_cache, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:seeded-db",
+                "fake",
+            ))
+            .unwrap();
+        let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        spec.env = vec![("A".to_string(), "1".to_string())];
+        spec.command = Some(vec!["redis-server".to_string()]);
+        spec.ports = vec![crate::model::PortBinding {
+            host_port: 0,
+            guest_port: 6379,
+        }];
+        spec.memory_limit_mb = Some(256);
+        let cp = Checkpoint {
+            checkpoint_ref: "fake-checkpoint:seeded-db".to_string(),
+            backend: "fake".to_string(),
+            spec,
+        };
+
+        let dest = temp_archive_path("archive-roundtrip");
+        export_to_impl(
+            &cp,
+            &dest,
+            &(export_backend.clone() as Arc<dyn SandboxBackend>),
+            &export_cache,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect("export must succeed");
+        assert_eq!(
+            export_backend.state.lock().unwrap().exported_checkpoints[0].0,
+            "fake-checkpoint:seeded-db"
+        );
+
+        // A second, independent backend instance and cache dir — the "different
+        // machine" this feature exists for.
+        let import_backend = FakeBackend::checkpoint_capable();
+        let import_cache = temp_cache_dir("archive-roundtrip-import-cache");
+        let imported = import_from_impl(
+            &dest,
+            &(import_backend.clone() as Arc<dyn SandboxBackend>),
+            &import_cache,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect("import must succeed");
+
+        assert_eq!(
+            imported.checkpoint_ref,
+            "effective:fake-checkpoint:seeded-db"
+        );
+        assert_eq!(imported.backend, "fake");
+        assert_eq!(
+            imported.spec.command,
+            Some(vec!["redis-server".to_string()])
+        );
+        assert_eq!(imported.spec.ports[0].guest_port, 6379);
+        assert_eq!(imported.spec.memory_limit_mb, Some(256));
+
+        let state = import_backend.state.lock().unwrap();
+        assert_eq!(state.imported_checkpoints.len(), 1);
+        assert_eq!(state.imported_checkpoints[0].1, "fake-checkpoint:seeded-db");
+        assert_eq!(
+            state.imported_checkpoints[0].2,
+            b"fake-artifact-payload:fake-checkpoint:seeded-db".to_vec(),
+            "the imported artifact bytes must match exactly what export_checkpoint wrote"
+        );
+        drop(state);
+
+        let entry = checkpoint::Registry::new(&import_cache, "seeded-db")
+            .read()
+            .expect("a named archive must write a registry entry on import");
+        assert_eq!(entry.checkpoint_ref, imported.checkpoint_ref);
+        assert_eq!(entry.backend, "fake");
+    }
+
+    // export: unnamed checkpoints export fine — the archive's `name` is null, and
+    // import writes no registry entry.
+    #[tokio::test]
+    async fn an_unnamed_checkpoint_exports_and_imports_with_a_null_name_and_no_registry_write() {
+        let export_backend = FakeBackend::checkpoint_capable();
+        let cp = Checkpoint {
+            checkpoint_ref: "fake-checkpoint:anon".to_string(),
+            backend: "fake".to_string(),
+            spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
+        };
+        let dest = temp_archive_path("archive-unnamed");
+        export_to_impl(
+            &cp,
+            &dest,
+            &(export_backend as Arc<dyn SandboxBackend>),
+            &temp_cache_dir("archive-unnamed-export-cache"), // no registry entry here.
+            &std::env::temp_dir(),
+        )
+        .await
+        .unwrap();
+
+        let staging = crate::archive::TempStagingDir::create("archive-unnamed-inspect").unwrap();
+        crate::archive::tar_extract(&dest, staging.path())
+            .await
+            .unwrap();
+        let raw = std::fs::read_to_string(crate::archive::manifest_path(staging.path())).unwrap();
+        assert!(raw.contains("\"name\": null"), "{raw}");
+
+        let import_backend = FakeBackend::checkpoint_capable();
+        let import_cache = temp_cache_dir("archive-unnamed-import-cache");
+        let imported = import_from_impl(
+            &dest,
+            &(import_backend as Arc<dyn SandboxBackend>),
+            &import_cache,
+            &std::env::temp_dir(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(imported.checkpoint_ref, "effective:fake-checkpoint:anon");
+        assert!(
+            checkpoint::list_registry_entries(&import_cache)
+                .unwrap()
+                .is_empty(),
+            "an unnamed archive must write no registry entry at all"
+        );
+    }
+
+    // import: a missing file is a typed error, no backend call, no registry write.
+    #[tokio::test]
+    async fn import_from_a_missing_file_is_a_typed_error_before_any_backend_call() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("import-missing-file");
+        let err = import_from_impl(
+            std::path::Path::new("/definitely/not/a/real/archive"),
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("a missing archive file must be a typed error");
+        assert!(
+            matches!(err, RightsizeError::MalformedArchive { .. }),
+            "{err}"
+        );
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .imported_checkpoints
+                .is_empty(),
+            "no backend call may happen once extraction fails"
+        );
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+    }
+
+    // import: an archive missing checkpoint.json is a typed error, no backend
+    // call, no registry write.
+    #[tokio::test]
+    async fn import_from_an_archive_missing_checkpoint_json_is_a_typed_error() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("import-missing-manifest");
+        let archive = temp_archive_path("import-missing-manifest-archive");
+        write_archive_missing_manifest(&archive).await;
+
+        let err = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("a missing checkpoint.json must be a typed error");
+        assert!(
+            matches!(err, RightsizeError::MalformedArchive { .. }),
+            "{err}"
+        );
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .imported_checkpoints
+                .is_empty()
+        );
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+    }
+
+    // import: malformed JSON is a typed error, no backend call, no registry write.
+    #[tokio::test]
+    async fn import_from_malformed_json_is_a_typed_error() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("import-malformed-json");
+        let archive = temp_archive_path("import-malformed-json-archive");
+        write_archive_malformed_json(&archive).await;
+
+        let err = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("malformed JSON must be a typed error");
+        assert!(
+            matches!(err, RightsizeError::MalformedArchive { .. }),
+            "{err}"
+        );
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .imported_checkpoints
+                .is_empty()
+        );
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+    }
+
+    // import: an unsupported rightsizeArchive version is a typed error naming the
+    // value, no backend call, no registry write.
+    #[tokio::test]
+    async fn import_from_an_unsupported_archive_version_is_a_typed_error_naming_the_value() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("import-bad-version");
+        let archive = temp_archive_path("import-bad-version-archive");
+        let mut manifest = archive_manifest(Some("seeded-db"), "fake", "fake-checkpoint:x");
+        manifest.rightsize_archive = 2;
+        write_archive(&archive, &manifest, b"artifact").await;
+
+        let err = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("an unsupported version must be a typed error");
+        match err {
+            RightsizeError::MalformedArchive { reason, .. } => {
+                assert!(reason.contains('2'), "{reason}");
+            }
+            other => panic!("expected MalformedArchive, got {other:?}"),
+        }
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .imported_checkpoints
+                .is_empty()
+        );
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+    }
+
+    // import: an invalid name is a typed error, no backend call, no registry
+    // write.
+    #[tokio::test]
+    async fn import_from_an_invalid_name_is_a_typed_error() {
+        let backend = FakeBackend::checkpoint_capable();
+        let cache_dir = temp_cache_dir("import-invalid-name");
+        let archive = temp_archive_path("import-invalid-name-archive");
+        let manifest = archive_manifest(Some("Bad Name!"), "fake", "fake-checkpoint:x");
+        write_archive(&archive, &manifest, b"artifact").await;
+
+        let err = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("an invalid name must be a typed error");
+        assert!(
+            matches!(err, RightsizeError::InvalidCheckpointName { .. }),
+            "{err}"
+        );
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .imported_checkpoints
+                .is_empty()
+        );
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+    }
+
+    // import: a backend mismatch is a typed error, no backend call, no registry
+    // write.
+    #[tokio::test]
+    async fn import_from_a_backend_mismatch_is_a_typed_error() {
+        let backend = FakeBackend::named("fake-active"); // checkpoint-capable
+        let cache_dir = temp_cache_dir("import-backend-mismatch");
+        let archive = temp_archive_path("import-backend-mismatch-archive");
+        let manifest = archive_manifest(Some("seeded-db"), "fake-other", "other-ref");
+        write_archive(&archive, &manifest, b"artifact").await;
+
+        let err = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect_err("a backend mismatch must be a typed error");
+        assert!(
+            matches!(err, RightsizeError::CheckpointBackendMismatch { .. }),
+            "{err}"
+        );
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .imported_checkpoints
+                .is_empty()
+        );
+        assert!(list_named(&cache_dir).unwrap().is_empty());
+    }
+
+    // import replace semantics: an existing same-backend entry with a DIFFERENT
+    // ref has its old artifact best-effort removed, and the registry entry is
+    // rewritten with the new effective ref.
+    #[tokio::test]
+    async fn import_replaces_an_existing_same_backend_entry_removing_the_old_ref_first() {
+        let backend = FakeBackend::checkpoint_capable();
+        backend.set_import_effective_ref("fake-checkpoint:new-digest");
+        let cache_dir = temp_cache_dir("import-replace-same-backend");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:old-digest",
+                "fake",
+            ))
+            .unwrap();
+
+        let archive = temp_archive_path("import-replace-same-backend-archive");
+        let manifest = archive_manifest(Some("seeded-db"), "fake", "fake-checkpoint:whatever");
+        write_archive(&archive, &manifest, b"artifact").await;
+
+        let imported = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect("import must succeed");
+        assert_eq!(imported.checkpoint_ref, "fake-checkpoint:new-digest");
+
+        assert_eq!(
+            backend.state.lock().unwrap().removed_checkpoints,
+            vec!["fake-checkpoint:old-digest".to_string()],
+            "the OLD ref must be best-effort removed before the registry is rewritten"
+        );
+
+        let entry = checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .read()
+            .expect("the registry entry must still exist");
+        assert_eq!(entry.checkpoint_ref, "fake-checkpoint:new-digest");
+    }
+
+    // import replace semantics, content-addressed re-import: when the new
+    // effective ref is the SAME as the existing entry's ref (msb's content-
+    // addressed import resolving to the same digest twice), the old artifact must
+    // NOT be removed — that artifact IS the one this import just materialized.
+    #[tokio::test]
+    async fn import_never_removes_the_old_artifact_when_the_effective_ref_is_unchanged() {
+        let backend = FakeBackend::checkpoint_capable();
+        backend.set_import_effective_ref("fake-checkpoint:same-digest");
+        let cache_dir = temp_cache_dir("import-replace-same-ref");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "fake-checkpoint:same-digest",
+                "fake",
+            ))
+            .unwrap();
+
+        let archive = temp_archive_path("import-replace-same-ref-archive");
+        let manifest = archive_manifest(Some("seeded-db"), "fake", "fake-checkpoint:whatever");
+        write_archive(&archive, &manifest, b"artifact").await;
+
+        let imported = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect("import must succeed");
+        assert_eq!(imported.checkpoint_ref, "fake-checkpoint:same-digest");
+
+        assert!(
+            backend.state.lock().unwrap().removed_checkpoints.is_empty(),
+            "re-importing an archive that resolves to the SAME ref must never remove it"
+        );
+    }
+
+    // import replace semantics, cross-backend: an existing entry for a DIFFERENT
+    // backend than the one now active is left untouched except for the rewrite —
+    // no foreign remove_checkpoint call, the same gate `checkpoint_named`'s own
+    // replace path applies.
+    #[tokio::test]
+    async fn import_never_calls_remove_checkpoint_on_a_different_backend_entry() {
+        let backend = FakeBackend::named("fake-active");
+        let cache_dir = temp_cache_dir("import-replace-cross-backend");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "other-backend-ref",
+                "fake-other",
+            ))
+            .unwrap();
+
+        let archive = temp_archive_path("import-replace-cross-backend-archive");
+        let manifest = archive_manifest(Some("seeded-db"), "fake-active", "fake-checkpoint:x");
+        write_archive(&archive, &manifest, b"artifact").await;
+
+        let imported = import_from_impl(
+            &archive,
+            &(backend.clone() as Arc<dyn SandboxBackend>),
+            &cache_dir,
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect("import must succeed");
+
+        assert!(
+            backend.state.lock().unwrap().removed_checkpoints.is_empty(),
+            "a different-backend entry's ref must never reach remove_checkpoint"
+        );
+        let entry = checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .read()
+            .expect("the registry entry must be overwritten with the new one");
+        assert_eq!(entry.checkpoint_ref, imported.checkpoint_ref);
+        assert_eq!(entry.backend, "fake-active");
     }
 
     // =============================== runtime copy ===================================

@@ -123,6 +123,46 @@ pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
     ]
 }
 
+/// Builds the argv for `msb snapshot export <ref> <dest>` — the checkpoint-archive
+/// feature's export primitive (`SandboxBackend::export_checkpoint`). Deliberately
+/// never includes `--with-image`: its import fails an integrity check ("raw
+/// manifest digest mismatch") on msb 0.6.6, so archives never bundle the OCI
+/// image — the destination machine pulls it fresh on the restored sandbox's first
+/// boot instead.
+pub fn snapshot_export(snapshot_ref: &str, dest: &Path) -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "export".to_string(),
+        snapshot_ref.to_string(),
+        dest.display().to_string(),
+    ]
+}
+
+/// Builds the argv for `msb snapshot import <archive>` — the checkpoint-archive
+/// feature's import primitive (`SandboxBackend::import_checkpoint`). Takes no ref
+/// argument: msb's import is content-addressed, unpacking under a digest-derived
+/// directory name this backend resolves separately (see
+/// `MsbCliBackend::import_checkpoint`).
+pub fn snapshot_import(archive_path: &Path) -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "import".to_string(),
+        archive_path.display().to_string(),
+    ]
+}
+
+/// Builds the argv for `msb snapshot list --format json` — confirms an imported
+/// snapshot's digest-derived directory name is registered by matching it against
+/// each entry's `name`/`artifact_path` (see `MsbCliBackend::import_checkpoint`).
+pub fn snapshot_list() -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "list".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]
+}
+
 /// Builds the argv for a plain (non-streaming) `msb exec`.
 pub fn exec(name: &str, cmd: &[String]) -> Vec<String> {
     let mut argv = vec!["exec".to_string(), name.to_string(), "--".to_string()];
@@ -366,6 +406,39 @@ mod tests {
         assert_eq!(
             snapshot_inspect("rz-ckpt-deadbeefcafe"),
             vec!["snapshot", "inspect", "rz-ckpt-deadbeefcafe"]
+        );
+    }
+
+    #[test]
+    fn snapshot_export_import_list_spellings() {
+        assert_eq!(
+            snapshot_export(
+                "rz-ckpt-deadbeefcafe",
+                std::path::Path::new("/tmp/cp.archive")
+            ),
+            vec![
+                "snapshot",
+                "export",
+                "rz-ckpt-deadbeefcafe",
+                "/tmp/cp.archive"
+            ]
+        );
+        assert!(
+            !snapshot_export(
+                "rz-ckpt-deadbeefcafe",
+                std::path::Path::new("/tmp/cp.archive")
+            )
+            .contains(&"--with-image".to_string()),
+            "archives must never bundle the OCI image — its import fails an integrity check on \
+             msb 0.6.6"
+        );
+        assert_eq!(
+            snapshot_import(std::path::Path::new("/tmp/cp.archive")),
+            vec!["snapshot", "import", "/tmp/cp.archive"]
+        );
+        assert_eq!(
+            snapshot_list(),
+            vec!["snapshot", "list", "--format", "json"]
         );
     }
 }

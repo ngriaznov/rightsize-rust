@@ -810,6 +810,45 @@ impl SandboxBackend for DockerBackend {
         }
     }
 
+    /// Shells out to the `docker` CLI (`docker save -o <dest> <ref>`) — same
+    /// rationale as [`Self::copy_to_container`]'s own CLI escape hatch: the daemon
+    /// has no single HTTP endpoint for this, and `docker` is already a hard
+    /// requirement for this backend regardless. The checkpoint-archive feature's
+    /// export primitive (`rightsize::Checkpoint::export_to`).
+    async fn export_checkpoint(&self, checkpoint_ref: &str, dest: &Path) -> Result<()> {
+        let args = docker_save_args(checkpoint_ref, dest);
+        let result = run_docker_cli(&args).await?;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "docker save -o {} {checkpoint_ref} failed (exit {}): {}",
+                dest.display(),
+                result.exit_code,
+                result.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `docker load -i <src_file>` — the checkpoint-archive feature's import
+    /// primitive (`rightsize::Checkpoint::import_from`). Unlike microsandbox's
+    /// content-addressed import, `docker load` preserves the tag baked into the
+    /// save file, so the effective ref is simply `ref_hint` (the archive
+    /// manifest's original ref) unchanged — loading over an already-existing tag
+    /// just re-points it.
+    async fn import_checkpoint(&self, src_file: &Path, ref_hint: &str) -> Result<String> {
+        let args = docker_load_args(src_file);
+        let result = run_docker_cli(&args).await?;
+        if result.exit_code != 0 {
+            return Err(RightsizeError::Backend(format!(
+                "docker load -i {} failed (exit {}): {}",
+                src_file.display(),
+                result.exit_code,
+                result.stderr.trim()
+            )));
+        }
+        Ok(ref_hint.to_string())
+    }
+
     /// Shells out to the `docker` CLI (`docker cp <host_path> <id>:<container_path>`)
     /// rather than the daemon HTTP API this backend otherwise speaks exclusively —
     /// the daemon's copy endpoints are tar-archive-in/tar-archive-out, and adding
@@ -890,6 +929,28 @@ fn docker_cp_out_args(container_id: &str, container_path: &str, host_path: &Path
         "cp".to_string(),
         format!("{container_id}:{container_path}"),
         host_path.display().to_string(),
+    ]
+}
+
+/// Builds the argv for `docker save -o <dest> <checkpoint_ref>` — the
+/// checkpoint-archive feature's export primitive
+/// ([`DockerBackend::export_checkpoint`]).
+fn docker_save_args(checkpoint_ref: &str, dest: &Path) -> Vec<String> {
+    vec![
+        "save".to_string(),
+        "-o".to_string(),
+        dest.display().to_string(),
+        checkpoint_ref.to_string(),
+    ]
+}
+
+/// Builds the argv for `docker load -i <src_file>` — the checkpoint-archive
+/// feature's import primitive ([`DockerBackend::import_checkpoint`]).
+fn docker_load_args(src_file: &Path) -> Vec<String> {
+    vec![
+        "load".to_string(),
+        "-i".to_string(),
+        src_file.display().to_string(),
     ]
 }
 
@@ -1799,6 +1860,32 @@ mod tests {
         assert_eq!(
             docker_cp_out_args("daemon-id-1", "/guest/src.txt", Path::new("/host/dst.txt")),
             vec!["cp", "daemon-id-1:/guest/src.txt", "/host/dst.txt"]
+        );
+    }
+
+    // --- checkpoint archive argv construction -----------------------------------
+
+    #[test]
+    fn docker_save_args_spelling() {
+        assert_eq!(
+            docker_save_args(
+                "rightsize/checkpoint:abc123def456",
+                Path::new("/tmp/cp.archive-payload")
+            ),
+            vec![
+                "save",
+                "-o",
+                "/tmp/cp.archive-payload",
+                "rightsize/checkpoint:abc123def456"
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_load_args_spelling() {
+        assert_eq!(
+            docker_load_args(Path::new("/tmp/cp.archive-payload")),
+            vec!["load", "-i", "/tmp/cp.archive-payload"]
         );
     }
 }

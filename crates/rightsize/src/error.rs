@@ -116,8 +116,11 @@ pub enum RightsizeError {
     /// `Container::from_checkpoint(&cp)` was started under a different active
     /// backend than the one that created `cp` (`Checkpoint::backend`) — a
     /// docker-committed image cannot boot as a microsandbox snapshot ref, and vice
-    /// versa. Raised in `Container::start()`, before any backend work. The message
-    /// names both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy.
+    /// versa. Raised in `Container::start()`, before any backend work. The same
+    /// variant is also raised by `Checkpoint::export_to`/`Checkpoint::import_from`
+    /// when the active backend doesn't match the checkpoint's/archive's creator,
+    /// before any backend or filesystem work in either case. The message names
+    /// both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy.
     #[error(
         "{}",
         format_checkpoint_backend_mismatch(active_backend, checkpoint_backend)
@@ -139,6 +142,32 @@ pub enum RightsizeError {
     InvalidCheckpointName {
         /// The rejected name, verbatim.
         name: String,
+    },
+
+    /// `Checkpoint::export_to(...)` was called on a checkpoint whose backend-native
+    /// artifact is no longer there (`SandboxBackend::has_checkpoint` returned
+    /// `false`) — exporting it would either fail partway through or produce an
+    /// archive whose `artifact` member is missing/empty, so this is raised before
+    /// any staging or archive work begins.
+    #[error("{}", format_checkpoint_artifact_missing(checkpoint_ref, backend))]
+    CheckpointArtifactMissing {
+        /// The checkpoint ref that no longer has a backend-native artifact.
+        checkpoint_ref: String,
+        /// The backend it was supposedly created on.
+        backend: String,
+    },
+
+    /// `Checkpoint::import_from(...)` was given a path that isn't a valid rightsize
+    /// checkpoint archive — the file doesn't exist or isn't a tar, it's missing the
+    /// `checkpoint.json` member, that member doesn't parse as JSON, or its
+    /// `rightsizeArchive` field isn't a version this port understands. Raised
+    /// before any backend call or registry write in every case.
+    #[error("{}", format_malformed_archive(path, reason))]
+    MalformedArchive {
+        /// The archive path that was rejected.
+        path: std::path::PathBuf,
+        /// A short phrase naming exactly what's wrong with it.
+        reason: String,
     },
 
     /// The msb toolchain provisioner failed (download, checksum, install).
@@ -185,13 +214,32 @@ fn format_checkpoint_unsupported(backend: &str) -> String {
 }
 
 /// Renders `CheckpointBackendMismatch`'s message: names both the active backend and
-/// the checkpoint's creator, plus the `RIGHTSIZE_BACKEND=<creator>` remedy.
+/// the checkpoint's creator, plus the `RIGHTSIZE_BACKEND=<creator>` remedy. Kept
+/// call-site-neutral (no mention of `from_checkpoint`/`export_to`/`import_from` by
+/// name) since all three raise this same variant.
 fn format_checkpoint_backend_mismatch(active_backend: &str, checkpoint_backend: &str) -> String {
     format!(
-        "Container::from_checkpoint(...) was started under the '{active_backend}' backend, but \
-         this checkpoint was created by the '{checkpoint_backend}' backend — set \
-         RIGHTSIZE_BACKEND={checkpoint_backend} to restore it, or take a fresh checkpoint under \
-         '{active_backend}' instead"
+        "the active backend is '{active_backend}', but this checkpoint was created by the \
+         '{checkpoint_backend}' backend — set RIGHTSIZE_BACKEND={checkpoint_backend} to use it, \
+         or take a fresh checkpoint under '{active_backend}' instead"
+    )
+}
+
+/// Renders `CheckpointArtifactMissing`'s message: the same fact-em-dash-remedy
+/// grammar as [`format_unsupported`].
+fn format_checkpoint_artifact_missing(checkpoint_ref: &str, backend: &str) -> String {
+    format!(
+        "checkpoint '{checkpoint_ref}' has no backend-native artifact left on the '{backend}' \
+         backend — it may already have been removed; there is nothing left to export"
+    )
+}
+
+/// Renders `MalformedArchive`'s message: the archive path plus the specific reason
+/// it was rejected.
+fn format_malformed_archive(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "the checkpoint archive at '{}' is not a usable rightsize archive — {reason}",
+        path.display()
     )
 }
 
@@ -342,5 +390,48 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("Bad Name!"), "{msg}");
         assert!(msg.contains("^[a-z0-9][a-z0-9-]{0,40}$"), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_backend_mismatch_message_is_call_site_neutral() {
+        // Reused unchanged by `Container::from_checkpoint`, `Checkpoint::export_to`,
+        // and `Checkpoint::import_from` — the wording must not imply only one of
+        // those raised it.
+        let e = RightsizeError::CheckpointBackendMismatch {
+            active_backend: "docker".to_string(),
+            checkpoint_backend: "microsandbox".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(!msg.contains("from_checkpoint"), "{msg}");
+        assert!(!msg.contains("export_to"), "{msg}");
+        assert!(!msg.contains("import_from"), "{msg}");
+        assert!(msg.contains("docker"), "{msg}");
+        assert!(msg.contains("microsandbox"), "{msg}");
+        assert!(msg.contains("RIGHTSIZE_BACKEND=microsandbox"), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_artifact_missing_names_the_ref_and_the_backend() {
+        let e = RightsizeError::CheckpointArtifactMissing {
+            checkpoint_ref: "rz-ckpt-deadbeefcafe".to_string(),
+            backend: "microsandbox".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("rz-ckpt-deadbeefcafe"), "{msg}");
+        assert!(msg.contains("microsandbox"), "{msg}");
+    }
+
+    #[test]
+    fn malformed_archive_names_the_path_and_the_reason() {
+        let e = RightsizeError::MalformedArchive {
+            path: std::path::PathBuf::from("/tmp/cp.archive"),
+            reason: "unsupported rightsizeArchive version 2 (expected 1)".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("/tmp/cp.archive"), "{msg}");
+        assert!(
+            msg.contains("unsupported rightsizeArchive version 2 (expected 1)"),
+            "{msg}"
+        );
     }
 }
