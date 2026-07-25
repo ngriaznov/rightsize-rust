@@ -1,17 +1,18 @@
 # Modules
 
-`rightsize-modules` ships eighteen preconfigured containers on top of the
+`rightsize-modules` ships twenty-one preconfigured containers on top of the
 `rightsize` core: Redis, Memcached, ArangoDB, MongoDB, Redpanda, Kafka,
 SpringCloudConfig, PostgreSQL, MySQL, Apache Pinot, RabbitMQ, MariaDB, WireMock,
-ClickHouse, Keycloak, Neo4j, Floci, and Apache Flink. Each module is a thin newtype
-wrapping `Container` — no subclassing, just the spec-customizer and post-start hooks
-the core exposes (see
+ClickHouse, Keycloak, Neo4j, Floci, Apache Flink, Valkey, MinIO, and Cassandra. Each
+module is a thin newtype wrapping `Container` — no subclassing, just the
+spec-customizer and post-start hooks the core exposes (see
 [Containers & Guards](../core-concepts/containers-and-guards.md)) — with connection
 helpers on its guard.
 
 | Module | Helper(s) |
 |---|---|
 | [`RedisContainer`](./redis.md) | `uri()` |
+| [`ValkeyContainer`](./valkey.md) | `uri()` (Redis-protocol-compatible; deliberately returns `redis://`, not `valkey://`) |
 | [`MemcachedContainer`](./memcached.md) | `address()` (protocol-level `VERSION` probe, not a bare port wait) |
 | [`MongoDbContainer`](./mongodb.md) | `connection_string()` (single-node replica set, auto-initiated) |
 | [`ArangoContainer`](./arango.md) | `endpoint()`, `with_root_password(…)` |
@@ -29,6 +30,8 @@ helpers on its guard.
 | [`Neo4jContainer`](./neo4j.md) | `http_url()`, `bolt_url()`, `username()`, `password()`, `with_password(…)` (defaults `with_memory_limit(1024)`) |
 | [`FlociContainer`](./floci.md) | `FlociContainer::aws()`/`azure()`/`gcp()`, `endpoint_url()` |
 | [`FlinkContainer`](./flink.md) | `rest_url()`, `with_task_manager()` (docker only; defaults `with_memory_limit(1024)`) |
+| [`MinioContainer`](./minio.md) | `s3_url()`, `console_url()`, `root_user()`, `root_password()`, `with_root_user`/`with_root_password(…)` (no memory limit set) |
+| [`CassandraContainer`](./cassandra.md) | `contact_point()`, `cql_port()`, `local_datacenter()` (defaults `with_memory_limit(2560)`) |
 
 Backend wiring is a Cargo feature choice, not a runtime one: `backend-msb` and
 `backend-docker` (both on by default) pull in `rightsize-msb` and `rightsize-docker`
@@ -36,7 +39,7 @@ respectively, so you can trim the one you don't need.
 
 ## Anything not on this list
 
-Eighteen modules is not an exhaustive catalog — it's the current coverage,
+Twenty-one modules is not an exhaustive catalog — it's the current coverage,
 growing as needs arise. Anything else is the plain `Container` API (see
 [Containers & Guards](../core-concepts/containers-and-guards.md)); a thin
 wrapper following the existing modules' shape (a newtype over `Container`, a

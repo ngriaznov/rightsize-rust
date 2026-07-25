@@ -28,6 +28,7 @@
 
 - [Modules](./modules/index.md)
   - [RedisContainer](./modules/redis.md)
+  - [ValkeyContainer](./modules/valkey.md)
   - [MemcachedContainer](./modules/memcached.md)
   - [MongoDbContainer](./modules/mongodb.md)
   - [ArangoContainer](./modules/arango.md)
@@ -45,6 +46,8 @@
   - [Neo4jContainer](./modules/neo4j.md)
   - [FlociContainer](./modules/floci.md)
   - [FlinkContainer](./modules/flink.md)
+  - [MinioContainer](./modules/minio.md)
+  - [CassandraContainer](./modules/cassandra.md)
 
 - [Troubleshooting](./troubleshooting.md)
 

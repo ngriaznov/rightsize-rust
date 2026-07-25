@@ -1,9 +1,9 @@
-//! `sandbox-it` integration tests for the simple datastore modules — Redis, Memcached,
-//! Arango, and MongoDB: each module boots for real and
-//! gets a protocol-level smoke check — not a full client-library round-trip, since
-//! none of these four need more than "the server speaks its protocol" to prove the
-//! module's wiring (image, ports, env, wait strategy, and — for Mongo — the
-//! replica-set post-start hook) is correct.
+//! `sandbox-it` integration tests for the simple datastore modules — Redis, Valkey,
+//! Memcached, Arango, and MongoDB: each module boots for real and gets a
+//! protocol-level smoke check — not a full client-library round-trip, since none of
+//! these five need more than "the server speaks its protocol" to prove the module's
+//! wiring (image, ports, env, wait strategy, and — for Mongo — the replica-set
+//! post-start hook) is correct.
 //!
 //! Run for real, once per backend:
 //!
@@ -21,7 +21,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use rightsize_modules::{ArangoContainer, MemcachedContainer, MongoDbContainer, RedisContainer};
+use rightsize_modules::{
+    ArangoContainer, MemcachedContainer, MongoDbContainer, RedisContainer, ValkeyContainer,
+};
 
 macro_rules! require_backend {
     () => {
@@ -55,6 +57,24 @@ async fn redis_boots_and_speaks_the_redis_protocol() {
         .start()
         .await
         .expect("redis must start");
+
+    let addr = guard.uri().replacen("redis://", "", 1);
+    let reply = tcp_roundtrip(&addr, Some(b"PING\r\n"));
+    assert!(reply.contains("PONG"), "unexpected reply: {reply:?}");
+
+    guard.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn valkey_boots_and_speaks_the_redis_protocol() {
+    require_backend!();
+    // Valkey is a protocol-compatible Redis fork — the same raw RESP round-trip the
+    // Redis module gets above proves this module's wiring (image, port, wait
+    // strategy) the same way.
+    let guard = ValkeyContainer::new()
+        .start()
+        .await
+        .expect("valkey must start");
 
     let addr = guard.uri().replacen("redis://", "", 1);
     let reply = tcp_roundtrip(&addr, Some(b"PING\r\n"));

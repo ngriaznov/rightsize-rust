@@ -164,7 +164,7 @@ backend-specific rather than behavioral divergences:
 
 ## Modules
 
-`rightsize-modules` ships eighteen preconfigured containers with sensible waits
+`rightsize-modules` ships twenty-one preconfigured containers with sensible waits
 and connection helpers. Each is a thin newtype wrapping `Container`, so its guard
 exposes typed accessors while the core builders (`with_env`, `waiting_for`, …)
 remain available.
@@ -172,6 +172,7 @@ remain available.
 | Module | Helpers |
 |---|---|
 | `RedisContainer` | `uri()` |
+| `ValkeyContainer` | `uri()` — Redis-protocol-compatible; deliberately returns `redis://`, not `valkey://` |
 | `MemcachedContainer` | `address()` — protocol-level `VERSION` probe, not a bare port wait |
 | `ArangoContainer` | `endpoint()`; `with_root_password(…)` to enable auth (default: no-auth) |
 | `MongoDbContainer` | `connection_string()` — single-node replica set, auto-initiated |
@@ -189,13 +190,15 @@ remain available.
 | `SpringCloudConfigContainer` | `uri()` |
 | `FlociContainer` | `endpoint_url()`; `FlociContainer::aws()`/`azure()`/`gcp()` factories — [floci.io](https://floci.io) cloud emulators (unsigned REST, no SDK needed) |
 | `FlinkContainer` | `rest_url()`; `with_task_manager()` for a full session cluster — **Docker only**¹ |
+| `MinioContainer` | `s3_url()`, `console_url()`, `root_user()`, `root_password()`; `with_root_user`/`with_root_password(…)` — no memory limit set |
+| `CassandraContainer` | `contact_point()`, `cql_port()`, `local_datacenter()` (defaults `with_memory_limit(2560)`) |
 
 Heavyweight JVM images raise their own memory floor via `with_memory_limit` -
-SpringCloudConfig, Keycloak, Neo4j and Flink (1024 MB), Pinot's four-JVM cluster
-(4096 MB). That's baked into the module; you don't set it. Each module's rustdoc
-documents its exact image tag, wait strategy, and the reasoning behind those
-choices - the [module chapter of the book](docs/modules/index.md) collects
-the worked examples.
+SpringCloudConfig, Keycloak, Neo4j and Flink (1024 MB), Cassandra (2560 MB),
+Pinot's four-JVM cluster (4096 MB). That's baked into the module; you don't set it.
+Each module's rustdoc documents its exact image tag, wait strategy, and the
+reasoning behind those choices - the
+[module chapter of the book](docs/modules/index.md) collects the worked examples.
 
 ¹ `with_task_manager()` returns a `Result`: on microsandbox it errs with
 `RightsizeError::UnsupportedByBackend` (the Flink image carries no `nc`/busybox
