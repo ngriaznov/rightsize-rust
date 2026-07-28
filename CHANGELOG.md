@@ -9,6 +9,76 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.6.0] - 2026-07-28
+
+### Upgrading from 0.5.0
+
+Two changes affect existing code.
+
+**Modules no longer pin an image version.** `RedisContainer::new()` previously booted
+`redis:8.6-alpine`; it now boots `redis:latest`. Your tests will run whatever version
+upstream currently publishes, which is the point — the version tracks the image's own
+releases rather than this crate's. To keep a specific version, name it:
+`RedisContainer::with_image("redis:8.6-alpine")`. Redis, Valkey, Postgres, and
+Memcached additionally move from an Alpine variant to the Debian-based `latest`:
+functionally equivalent, noticeably larger to pull.
+
+**`ElasticsearchContainer` has no `new()`.** Elastic publishes no floating tag —
+`elasticsearch:latest`, `:9`, and `:8` are all `404` on Docker Hub — so an explicit
+version is required and there is nothing this module could pick on your behalf:
+`ElasticsearchContainer::with_image("elasticsearch:9.4.4")`.
+
+An explicitly supplied image is also now checked against the repository the module
+understands, when the container starts, so an unrelated image fails immediately with
+`RightsizeError::IncompatibleImage` instead of timing out against the wrong server.
+Constructors stay infallible. If the image really is a drop-in replacement, say so:
+`ImageName::parse("mycorp/pg-hardened:16").as_compatible_substitute_for("postgres")`.
+
+### Added
+
+- **`ImageName`** (`rightsize`) — a parsed Docker image reference, built via
+  `ImageName::parse`. Module constructors take `impl Into<ImageName>` and stay
+  infallible; `start()` checks the supplied image's repository against the one the module
+  understands before any backend is resolved, returning the new typed
+  `RightsizeError::IncompatibleImage` on a mismatch rather than degrading into a bare
+  wait-strategy timeout. `ImageName::as_compatible_substitute_for` is the escape hatch for
+  a private mirror, a hardened rebuild, or a rename. Registry-host stripping follows the
+  Docker convention: the first path segment is a registry only if it contains a `.` or a
+  `:`, or is exactly `localhost`.
+- **`ElasticsearchContainer`** (`rightsize-modules`) — a single-node Elasticsearch
+  container. Elastic publishes no floating tag for this image, so this module has no
+  `new()` — an explicit image is required. Readiness checks plain connectivity rather than
+  cluster health, since a single node's health stays `yellow` forever (no peer to place
+  replica shards on).
+- **`QdrantContainer`** (`rightsize-modules`) — a single-node Qdrant vector database
+  container, defaulting to `qdrant/qdrant:latest`. Readiness is Qdrant's own `/readyz`
+  probe, which answered on the first poll in direct verification; no memory limit is
+  needed.
+
+### Changed
+
+- **Every one of the 21 pre-existing modules now defaults to a floating image reference**
+  instead of a pinned version, and checks any explicitly supplied image against the
+  repository it understands. Most float to `<repository>:latest`; `RabbitMqContainer`
+  floats to `rabbitmq:management` instead, since plain `latest` lacks the management
+  plugin the module is built around. Redis, Valkey, Postgres, and Memcached move from a
+  pinned Alpine variant to the Debian-based `latest`. Each module's measured facts —
+  readiness signal, memory floor, timings — remain attributed to the version that produced
+  them rather than reattributed to `latest`.
+
+### Fixed
+
+- **An `exec` issued immediately after `start()` could fail to reach the guest.** A
+  sandbox reports `Running` before the in-guest agent has created the endpoint `exec`
+  connects to; the gap is invisible whenever a wait strategy runs first, which is every
+  module, but a caller that starts and execs at once could lose the race — reliably so on
+  Windows, where the endpoint is a named pipe. `exec` now retries on that one signature.
+  A guest command's own non-zero exit, and any agent error raised after connecting, still
+  return on the first attempt.
+- **`MongoDbContainer`'s replica-set budget is now 180s**, up from 60s. `rs.initiate`
+  was observed failing at exactly the 60s mark on a loaded Windows CI runner against the
+  floating default, matching the budget MySQL and ClickHouse already carry.
+
 ## [0.5.0] - 2026-07-25
 
 ### Added
@@ -459,7 +529,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.2.0...v0.3.0
