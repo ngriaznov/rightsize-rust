@@ -8,18 +8,32 @@ runtime crate), matching the house convention for HTTP-first modules.
 Defaults to a `test`/`test` user/password pair and a `test` database so
 `http_url()` plus basic auth is usable with zero configuration.
 
-**Default image:** `clickhouse/clickhouse-server:25.8`
+**Default image:** floats to `clickhouse/clickhouse-server:latest` — this module
+previously pinned `clickhouse/clickhouse-server:25.8`.
 **Guest ports:** `8123` (HTTP — what the helpers use), `9000` (native protocol, exposed but not wrapped)
+**Expected repository:** `clickhouse/clickhouse-server`
 
 | Method | On | Effect |
 |---|---|---|
-| `ClickHouseContainer::new()` | builder | Pinned default image, `test`/`test`/`test`. |
-| `ClickHouseContainer::with_image(image)` | builder | Caller-chosen image. |
+| `ClickHouseContainer::new()` | builder | Floating default image, `test`/`test`/`test`. |
+| `ClickHouseContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_username(u)` / `.with_password(p)` / `.with_database(d)` | builder | Override any of the trio before `start()`. |
-| `.start()` | builder → `Result<ClickHouseGuard>` | Boots the container. |
+| `.start()` | builder → `Result<ClickHouseGuard>` | Checks the image's repository, then boots the container. |
 | `.username()` / `.password()` / `.database_name()` | guard | The configured trio. |
 | `.http_url()` | guard | The HTTP interface's base URI — `POST` a SQL body, basic-auth'd. |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `clickhouse/clickhouse-server` before any backend is resolved or any
+sandbox is created, which keeps the constructors infallible like every other
+module's. A mismatch returns `RightsizeError::IncompatibleImage`;
+`ImageName::parse(image).as_compatible_substitute_for("clickhouse/clickhouse-server")`
+is the escape hatch for a verified drop-in replacement from another registry.
+`new()` goes through this same check against its own floating reference, so it
+can never fail in practice.
 
 ## Env var names — verified against a real boot
 

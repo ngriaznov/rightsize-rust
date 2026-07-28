@@ -52,10 +52,31 @@
 //!
 //! Verified end to end: `cqlsh` ran `CREATE KEYSPACE` → `CREATE TABLE` → `INSERT` →
 //! `SELECT`, and the row came back.
+//!
+//! ### Compatibility checking
+//!
+//! [`CassandraContainer::with_image`] parses the supplied image with
+//! [`rightsize::ImageName`] and checks its repository against `cassandra` (registry
+//! host, tag, and digest stripped) before ever touching a backend, returning
+//! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
+//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! `ImageName::parse(image).as_compatible_substitute_for("cassandra")` to override for
+//! a verified drop-in replacement. [`CassandraContainer::new`] goes through the same
+//! check against its own floating reference, so it can never fail in practice.
+//!
+//! ### `new()` floats to `cassandra:latest`
+//!
+//! This module used to pin `cassandra:5.0.8`; `new()` now floats to
+//! `cassandra:latest` so the version tracks upstream rather than this crate's own
+//! release cycle. The `GPG_KEYS`/heap/memory/readiness facts above were all verified
+//! against that `5.0.8` boot specifically — kept unconditionally (the `GPG_KEYS`
+//! override remains required to boot on microsandbox at all, and is a no-op
+//! elsewhere), but do not assume they still hold exactly at whatever version
+//! `latest` resolves to without re-measuring.
 
 use std::time::Duration;
 
-use rightsize::{Container, ContainerGuard, Result, Wait};
+use rightsize::{Container, ContainerGuard, ImageName, Result, Wait};
 
 const CQL_PORT: u16 = 9042;
 
@@ -63,19 +84,29 @@ const CQL_PORT: u16 = 9042;
 /// by this module — see [`CassandraGuard::local_datacenter`].
 const LOCAL_DATACENTER: &str = "datacenter1";
 
+/// The repository this module understands — see the module doc's compatibility
+/// section.
+const EXPECTED_REPOSITORY: &str = "cassandra";
+
 /// A single-node Apache Cassandra container.
-pub struct CassandraContainer(Container);
+pub struct CassandraContainer {
+    container: Container,
+    image: ImageName,
+}
 
 impl CassandraContainer {
-    /// Builds a container from the pinned default image (`cassandra:5.0.8`).
+    /// Builds a container from the floating default image (`cassandra:latest`).
     pub fn new() -> Self {
-        Self::with_image("cassandra:5.0.8")
+        Self::with_image("cassandra:latest")
     }
 
-    /// Builds a container from a caller-chosen image.
-    pub fn with_image(image: &str) -> Self {
-        Self(
-            Container::new(image)
+    /// Builds a container from a caller-chosen image. The repository is checked when
+    /// the container starts, not here, so this constructor stays infallible like every
+    /// other module's — see [`CassandraContainer::start`].
+    pub fn with_image(image: impl Into<ImageName>) -> Self {
+        let image = image.into();
+        Self {
+            container: Container::new(image.as_str())
                 .with_exposed_ports(&[CQL_PORT])
                 // Required to boot on msb at all — see the module doc's GPG_KEYS
                 // section for the exact panic this sidesteps and why it's a no-op on
@@ -88,13 +119,22 @@ impl CassandraContainer {
                     Wait::for_log_message(".*Starting listening for CQL clients.*", 1)
                         .with_startup_timeout(Duration::from_secs(300)),
                 ),
-        )
+            image,
+        }
     }
 
-    /// Boots the container.
+    /// Boots the container, after checking the image is one this module understands.
+    ///
+    /// The compatibility check runs here rather than in the constructors so those stay
+    /// infallible and match every other module in this crate. It is still the first
+    /// thing to happen — before any backend is resolved or any sandbox is created — so
+    /// a mismatched image fails with
+    /// [`rightsize::RightsizeError::IncompatibleImage`] naming both repositories,
+    /// never a bare wait-strategy timeout against the wrong server.
     pub async fn start(self) -> Result<CassandraGuard> {
+        self.image.assert_compatible_with(EXPECTED_REPOSITORY)?;
         crate::register_default_backends();
-        Ok(CassandraGuard(self.0.start().await?))
+        Ok(CassandraGuard(self.container.start().await?))
     }
 }
 
@@ -147,5 +187,37 @@ mod tests {
     fn with_image_smoke() {
         let _ = CassandraContainer::new();
         let _ = CassandraContainer::with_image("cassandra:5.0.8");
+    }
+
+    // The compatibility check runs in `start()`, which needs a live backend, so these
+    // exercise the exact condition `start()` evaluates against the stored image.
+
+    #[test]
+    fn the_floating_default_is_compatible() {
+        CassandraContainer::new()
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("the floating default must satisfy this module's own check");
+    }
+
+    #[test]
+    fn an_incompatible_repository_is_rejected_naming_both() {
+        let err = CassandraContainer::with_image("postgres:16")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect_err("postgres is not cassandra");
+        let msg = err.to_string();
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("cassandra"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_compatible_substitute_passes() {
+        let image = ImageName::parse("mycorp/cassandra-hardened:5.0.8")
+            .as_compatible_substitute_for("cassandra");
+        CassandraContainer::with_image(image)
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a declared compatible substitute must be accepted");
     }
 }

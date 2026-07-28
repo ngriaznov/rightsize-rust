@@ -3,17 +3,32 @@
 A Spring Cloud Config Server container, ready-checked via its actuator health
 endpoint.
 
-**Default image:** `hyness/spring-cloud-config-server:latest`
+**Default image:** floats to `hyness/spring-cloud-config-server:latest` — this
+was already the module's default before compatibility checking existed; only the
+plumbing below is new.
 **Guest port:** `8888`
+**Expected repository:** `hyness/spring-cloud-config-server`
 
 | Method | On | Effect |
 |---|---|---|
-| `SpringCloudConfigContainer::new()` | builder | Pinned default image. |
-| `SpringCloudConfigContainer::with_image(image)` | builder | Caller-chosen image. |
+| `SpringCloudConfigContainer::new()` | builder | Floating default image. |
+| `SpringCloudConfigContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_env(key, value)` | builder | Thin passthrough to `Container::with_env` — see below. |
-| `.start()` | builder → `Result<SpringCloudConfigGuard>` | Boots the container. |
+| `.start()` | builder → `Result<SpringCloudConfigGuard>` | Checks the image's repository, then boots the container. |
 | `.uri()` | guard | Config server base URI, e.g. `http://127.0.0.1:<port>`. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `hyness/spring-cloud-config-server` before any backend is resolved or
+any sandbox is created, which keeps the constructors infallible like every
+other module's. A mismatch returns `RightsizeError::IncompatibleImage`;
+`ImageName::parse(image).as_compatible_substitute_for("hyness/spring-cloud-config-server")`
+is the escape hatch for a verified drop-in replacement from another registry.
+`new()` goes through this same check against its own floating reference, so it
+can never fail in practice.
 
 ## The Paketo memory story
 

@@ -3,18 +3,32 @@
 A single-node Redpanda broker (Kafka API-compatible) with its schema registry
 enabled.
 
-**Default image:** `redpandadata/redpanda:v24.2.4`
+**Default image:** floats to `redpandadata/redpanda:latest` — this module
+previously pinned `redpandadata/redpanda:v24.2.4`.
 **Guest ports:** `9092` (external Kafka), `9093` (internal Kafka), `8081` (schema
 registry)
+**Expected repository:** `redpandadata/redpanda`
 
 | Method | On | Effect |
 |---|---|---|
-| `RedpandaContainer::new()` | builder | Pinned default image. |
-| `RedpandaContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<RedpandaGuard>` | Boots the container. |
+| `RedpandaContainer::new()` | builder | Floating default image. |
+| `RedpandaContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<RedpandaGuard>` | Checks the image's repository, then boots the container. |
 | `.bootstrap_servers()` | guard | `PLAINTEXT://host:port` for the EXTERNAL listener. |
 | `.schema_registry_url()` | guard | Schema registry base URI. |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `redpandadata/redpanda` before any backend is resolved or any sandbox is
+created, which keeps the constructors infallible like every other module's. A
+mismatch returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("redpandadata/redpanda")` is the escape hatch for
+a verified drop-in replacement from another registry. `new()` goes through this
+same check against its own floating reference, so it can never fail in
+practice.
 
 ## The advertised-listener rewrite
 

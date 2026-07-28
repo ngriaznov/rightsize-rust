@@ -5,17 +5,32 @@ via `with_task_manager()` for a real session cluster that can actually run jobs 
 bare JobManager has zero task slots and can only accept/reject submissions, never
 execute them).
 
-**Default image:** `flink:1.20.5`
+**Default image:** floats to `flink:latest` — this module previously pinned
+`flink:1.20.5`.
 **Guest ports:** `8081` (REST), `6123` (RPC — only meaningful once a TaskManager joins)
+**Expected repository:** `flink`
 
 | Method | On | Effect |
 |---|---|---|
-| `FlinkContainer::new()` | builder | Pinned default image, `with_memory_limit(1024)`. |
-| `FlinkContainer::with_image(image)` | builder | Caller-chosen image. |
+| `FlinkContainer::new()` | builder | Floating default image, `with_memory_limit(1024)`. |
+| `FlinkContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_task_manager()` | builder → `Result<Self>` | Adds a companion TaskManager on a shared network for a real session cluster with task slots — **docker only**, see below. |
-| `.start()` | builder → `Result<FlinkGuard>` | Boots the JobManager (and TaskManager, if added). |
+| `.start()` | builder → `Result<FlinkGuard>` | Checks the image's repository, then boots the JobManager (and TaskManager, if added). |
 | `.rest_url()` | guard | The JobManager REST base URI (`/overview`, `/taskmanagers`, job submission, etc). |
 | `.stop()` | guard | Stops and removes both containers (if a TaskManager was added), releases ports, closes the internally-created network. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `flink` before any backend is resolved or any sandbox is created, which
+keeps the constructors infallible like every other module's — this single check
+covers both roles, since `with_task_manager()` boots its companion TaskManager
+from the same stored image. A mismatch returns
+`RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("flink")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## Topology
 

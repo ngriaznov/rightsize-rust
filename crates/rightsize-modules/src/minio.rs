@@ -49,33 +49,58 @@
 //!
 //! No control characters were found in the image's baked env (checked via
 //! `docker image inspect`).
+//!
+//! ### Compatibility checking
+//!
+//! [`MinioContainer::with_image`] parses the supplied image with
+//! [`rightsize::ImageName`] and checks its repository against `minio/minio` (registry
+//! host, tag, and digest stripped) before ever touching a backend, returning
+//! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
+//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! `ImageName::parse(image).as_compatible_substitute_for("minio/minio")` to override
+//! for a verified drop-in replacement. [`MinioContainer::new`] goes through the same
+//! check against its own floating reference, so it can never fail in practice.
+//!
+//! ### `new()` floats to `minio/minio:latest`
+//!
+//! This module used to pin `minio/minio:RELEASE.2025-09-07T16-13-09Z`; `new()` now
+//! floats to `minio/minio:latest` so the version tracks upstream rather than this
+//! crate's own release cycle. The readiness and auth-enforcement facts above were
+//! verified against that `RELEASE.2025-09-07T16-13-09Z` boot specifically.
 
-use rightsize::{Container, ContainerGuard, Result, Wait};
+use rightsize::{Container, ContainerGuard, ImageName, Result, Wait};
 
 const API_PORT: u16 = 9000;
 const CONSOLE_PORT: u16 = 9001;
+
+/// The repository this module understands — see the module doc's compatibility
+/// section.
+const EXPECTED_REPOSITORY: &str = "minio/minio";
 
 /// A single-node MinIO container, its S3 API on port 9000 (what
 /// [`MinioGuard::s3_url`] wraps) and its web console on 9001 (exposed, not wrapped —
 /// see [`MinioGuard::console_url`]).
 pub struct MinioContainer {
     container: Container,
+    image: ImageName,
     root_user: String,
     root_password: String,
 }
 
 impl MinioContainer {
-    /// Builds a container from the pinned default image
-    /// (`minio/minio:RELEASE.2025-09-07T16-13-09Z`).
+    /// Builds a container from the floating default image (`minio/minio:latest`).
     pub fn new() -> Self {
-        Self::with_image("minio/minio:RELEASE.2025-09-07T16-13-09Z")
+        Self::with_image("minio/minio:latest")
     }
 
-    /// Builds a container from a caller-chosen image.
-    pub fn with_image(image: &str) -> Self {
+    /// Builds a container from a caller-chosen image. The repository is checked when
+    /// the container starts, not here, so this constructor stays infallible like every
+    /// other module's — see [`MinioContainer::start`].
+    pub fn with_image(image: impl Into<ImageName>) -> Self {
+        let image = image.into();
         let root_user = "testuser".to_string();
         let root_password = "testpassword".to_string();
-        let container = Container::new(image)
+        let container = Container::new(image.as_str())
             .with_exposed_ports(&[API_PORT, CONSOLE_PORT])
             .with_env("MINIO_ROOT_USER", &root_user)
             .with_env("MINIO_ROOT_PASSWORD", &root_password)
@@ -86,6 +111,7 @@ impl MinioContainer {
             .waiting_for(Wait::for_http("/minio/health/live").for_port(API_PORT));
         Self {
             container,
+            image,
             root_user,
             root_password,
         }
@@ -108,8 +134,16 @@ impl MinioContainer {
         self
     }
 
-    /// Boots the container.
+    /// Boots the container, after checking the image is one this module understands.
+    ///
+    /// The compatibility check runs here rather than in the constructors so those stay
+    /// infallible and match every other module in this crate. It is still the first
+    /// thing to happen — before any backend is resolved or any sandbox is created — so
+    /// a mismatched image fails with
+    /// [`rightsize::RightsizeError::IncompatibleImage`] naming both repositories,
+    /// never a bare wait-strategy timeout against the wrong server.
     pub async fn start(self) -> Result<MinioGuard> {
+        self.image.assert_compatible_with(EXPECTED_REPOSITORY)?;
         crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(MinioGuard {
@@ -195,5 +229,37 @@ mod tests {
             .with_root_password("s3cretpw");
         assert_eq!(c.root_user, "alice");
         assert_eq!(c.root_password, "s3cretpw");
+    }
+
+    // The compatibility check runs in `start()`, which needs a live backend, so these
+    // exercise the exact condition `start()` evaluates against the stored image.
+
+    #[test]
+    fn the_floating_default_is_compatible() {
+        MinioContainer::new()
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("the floating default must satisfy this module's own check");
+    }
+
+    #[test]
+    fn an_incompatible_repository_is_rejected_naming_both() {
+        let err = MinioContainer::with_image("postgres:16")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect_err("postgres is not minio/minio");
+        let msg = err.to_string();
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("minio/minio"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_compatible_substitute_passes() {
+        let image = ImageName::parse("mycorp/minio-hardened:RELEASE.2025-09-07")
+            .as_compatible_substitute_for("minio/minio");
+        MinioContainer::with_image(image)
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a declared compatible substitute must be accepted");
     }
 }

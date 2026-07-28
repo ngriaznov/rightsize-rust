@@ -12,7 +12,11 @@
 //! container's lifecycle past boot: own-run reaping and cross-run reuse, checkpoint
 //! and restore (both ephemeral and named, durable ones any later process can
 //! rediscover), copying files into a running container, live diagnostics, and gating
-//! a start on hardware isolation via `.require_isolation(true)`.
+//! a start on hardware isolation via `.require_isolation(true)`. [`ImageName`] is the
+//! shared image-reference type module constructors take: it parses a repository out
+//! of an explicit image string and checks it against what the module declares it
+//! understands, failing fast rather than letting a mismatched image run all the way
+//! to a wait-strategy timeout.
 
 mod archive;
 pub mod backend;
@@ -25,6 +29,7 @@ mod diagnostics;
 pub mod error;
 mod free_ports;
 mod futures;
+mod image_name;
 pub mod model;
 pub mod mountable_file;
 pub mod network;
@@ -41,6 +46,7 @@ pub use container::{Container, ContainerGuard};
 pub use diagnostics::{DiagnosticsGuard, diagnostics};
 pub use error::{Result, RightsizeError};
 pub use futures::BoxFuture;
+pub use image_name::ImageName;
 pub use model::{ContainerSpec, ExecResult, FileMount, PortBinding};
 pub use mountable_file::MountableFile;
 pub use network::Network;

@@ -4,17 +4,30 @@ A single-node MongoDB container started as a **one-member replica set** (named
 `docker-rs`) — required for transactions and change streams, which is why this
 module doesn't just boot a bare standalone `mongod`.
 
-**Default image:** `mongo:8.0`
+**Default image:** floats to `mongo:latest` — this module previously pinned
+`mongo:8.0`.
 **Guest port:** `27017`
+**Expected repository:** `mongo`
 
 | Method | On | Effect |
 |---|---|---|
-| `MongoDbContainer::new()` | builder | Pinned default image. |
-| `MongoDbContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<MongoDbGuard>` | Boots the container; does not return until the replica set has an elected primary. |
+| `MongoDbContainer::new()` | builder | Floating default image. |
+| `MongoDbContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<MongoDbGuard>` | Checks the image's repository, then boots the container; does not return until the replica set has an elected primary. |
 | `.connection_string()` | guard | `mongodb://host:port/test?directConnection=true`. |
 | `.replica_set_url()` | guard | Alias for `connection_string()`. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `mongo` before any backend is resolved or any sandbox is created, which
+keeps the constructors infallible like every other module's. A mismatch returns
+`RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("mongo")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## The post-start hook
 

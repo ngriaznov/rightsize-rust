@@ -39,6 +39,11 @@ const READINESS_POLL: Duration = Duration::from_millis(300);
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long an exec keeps retrying while the guest agent's endpoint has not appeared
+/// yet, and how long it pauses between attempts — see [`is_agent_endpoint_not_ready`].
+/// Costs nothing on the ordinary path, where the first attempt connects.
+const AGENT_ENDPOINT_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const AGENT_ENDPOINT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACHED_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `msb copy` can move an arbitrarily large directory tree — generous headroom
@@ -310,6 +315,30 @@ fn is_name_conflict(output: &str) -> bool {
     output.to_lowercase().contains("already exists")
 }
 
+/// True if `output` (a `msb exec` invocation's stderr) says msb could not reach the
+/// guest agent's endpoint at all, as distinct from the guest command itself failing.
+///
+/// `start()` returns once msb's own `ls` reports the sandbox `Running`, but Running is
+/// a statement about the sandbox process, not about the in-guest agent having created
+/// the endpoint `msb exec` connects to. The two are ordinarily separated by enough
+/// wall-clock that nothing notices: every module waits on a log line, an HTTP probe, or
+/// a port before anyone execs. A caller that starts a container and immediately execs
+/// has no such gap, and on Windows — where the endpoint is a named pipe rather than a
+/// unix socket — loses the race outright:
+///
+/// ```text
+/// error: agent client error: connect \\.\pipe\msb-agent-<id>: The system cannot find
+/// the file specified. (os error 2)
+/// ```
+///
+/// Captured verbatim from a `windows-2025` hosted runner exec'ing into a sandbox
+/// restored from a checkpoint archive. Matches on msb's own `agent client error`
+/// framing plus `connect`, so a failure *after* the connection is established — a real
+/// agent error worth surfacing — is never mistaken for this.
+fn is_agent_endpoint_not_ready(stderr: &str) -> bool {
+    stderr.contains("agent client error") && stderr.contains("connect")
+}
+
 /// True if `output` (an `msb snapshot inspect` child's combined stdout/stderr) names
 /// a missing snapshot — msb's own "not found" wording, following the same `error:
 /// <noun> not found: <ref>` convention already confirmed for images (see the
@@ -467,12 +496,30 @@ impl SandboxBackend for MsbCliBackend {
         Ok(())
     }
 
+    /// Runs `cmd` in the guest, retrying while msb reports it cannot reach the guest
+    /// agent's endpoint yet (see [`is_agent_endpoint_not_ready`]). A sandbox is
+    /// `Running` before that endpoint necessarily exists, so an exec issued immediately
+    /// after `start()` can arrive first; the retry closes that window rather than
+    /// leaving it for every caller to discover. Only that one signature is retried —
+    /// a guest command's own non-zero exit returns on the first attempt, unchanged.
     async fn exec(&self, handle: &dyn SandboxHandle, cmd: &[String]) -> Result<ExecResult> {
         let argv = commands::exec(handle.id(), cmd);
         let msb = self.msb.clone();
-        tokio::task::spawn_blocking(move || invoke_standalone(&msb, &argv, EXEC_TIMEOUT))
-            .await
-            .map_err(|e| RightsizeError::Backend(format!("exec task panicked: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + AGENT_ENDPOINT_RETRY_BUDGET;
+            loop {
+                let result = invoke_standalone(&msb, &argv, EXEC_TIMEOUT)?;
+                if result.exit_code == 0
+                    || !is_agent_endpoint_not_ready(&result.stderr)
+                    || Instant::now() >= deadline
+                {
+                    return Ok(result);
+                }
+                std::thread::sleep(AGENT_ENDPOINT_RETRY_DELAY);
+            }
+        })
+        .await
+        .map_err(|e| RightsizeError::Backend(format!("exec task panicked: {e}")))?
     }
 
     /// A fresh `msb logs <name> --tail 1000` invocation, same on every platform. This
@@ -1913,6 +1960,44 @@ mod tests {
         ));
         assert!(is_image_cache_corruption(
             "error: cache error at C:\\Users\\runner\\.microsandbox\\cache\\layers\\sha256_deadbeef.tar.gz: No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn is_agent_endpoint_not_ready_matches_the_captured_windows_pipe_failure() {
+        // Captured verbatim from a windows-2025 hosted runner: an exec issued against a
+        // sandbox restored from a checkpoint archive, before the guest agent had created
+        // its named pipe.
+        assert!(is_agent_endpoint_not_ready(
+            "error: agent client error: connect \\\\.\\pipe\\msb-agent-e7779577a75cc1f89f66c534458bf8fd: The system cannot find the file specified. (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn is_agent_endpoint_not_ready_matches_the_unix_socket_shape() {
+        // Same msb framing, unix socket rather than a named pipe — the endpoint is
+        // platform-specific but the "couldn't connect at all" classification is not.
+        assert!(is_agent_endpoint_not_ready(
+            "error: agent client error: connect /run/user/1001/msb-agent-abc123.sock: No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn is_agent_endpoint_not_ready_ignores_a_guest_commands_own_failure() {
+        // A command that ran and failed inside the guest must return on the first
+        // attempt — retrying it would multiply its runtime for no reason.
+        assert!(!is_agent_endpoint_not_ready(
+            "cat: /srv/missing.txt: No such file or directory"
+        ));
+        assert!(!is_agent_endpoint_not_ready(""));
+    }
+
+    #[test]
+    fn is_agent_endpoint_not_ready_ignores_a_post_connect_agent_error() {
+        // Reached the agent, then the agent itself reported a problem — a real error to
+        // surface, not a not-yet-listening endpoint to wait out.
+        assert!(!is_agent_endpoint_not_ready(
+            "error: agent client error: request failed: guest process exited before responding"
         ));
     }
 

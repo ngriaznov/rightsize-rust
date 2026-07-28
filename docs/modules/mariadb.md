@@ -4,18 +4,31 @@ A single-node MariaDB container. Defaults to a `test`/`test`/`test`
 user/password/database trio (plus `MARIADB_ROOT_PASSWORD=test`) so
 `connection_string()` is usable with zero configuration.
 
-**Default image:** `mariadb:11.4`
+**Default image:** floats to `mariadb:latest` — this module previously pinned
+`mariadb:11.4`.
 **Guest port:** `3306`
+**Expected repository:** `mariadb`
 
 | Method | On | Effect |
 |---|---|---|
-| `MariaDbContainer::new()` | builder | Pinned default image, `test`/`test`/`test`. |
-| `MariaDbContainer::with_image(image)` | builder | Caller-chosen image. |
+| `MariaDbContainer::new()` | builder | Floating default image, `test`/`test`/`test`. |
+| `MariaDbContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_username(u)` / `.with_password(p)` / `.with_database(d)` | builder | Override any of the trio before `start()`. |
-| `.start()` | builder → `Result<MariaDbGuard>` | Boots the container. |
+| `.start()` | builder → `Result<MariaDbGuard>` | Checks the image's repository, then boots the container. |
 | `.username()` / `.password()` / `.database_name()` | guard | The configured trio. |
 | `.connection_string()` | guard | `mysql://user:pass@host:port/db` — MariaDB speaks the MySQL wire protocol, so this crate's house `mysql://` scheme applies here too. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `mariadb` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("mariadb")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## Readiness — empirically pinned, following MySqlContainer's precedent exactly
 

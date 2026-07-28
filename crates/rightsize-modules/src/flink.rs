@@ -58,34 +58,62 @@
 //!
 //! No control characters were found in the image's baked env (checked via
 //! `docker image inspect`).
+//!
+//! ### Compatibility checking
+//!
+//! [`FlinkContainer::with_image`] parses the supplied image with
+//! [`rightsize::ImageName`] and checks its repository against `flink` (registry host,
+//! tag, and digest stripped) before ever touching a backend, returning
+//! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
+//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! `ImageName::parse(image).as_compatible_substitute_for("flink")` to override for a
+//! verified drop-in replacement. [`FlinkContainer::new`] goes through the same check
+//! against its own floating reference, so it can never fail in practice. The check
+//! covers both roles: [`FlinkContainer::with_task_manager`] boots its companion
+//! TaskManager from the same stored image, so a single check in `start()` covers both
+//! containers.
+//!
+//! ### `new()` floats to `flink:latest`
+//!
+//! This module used to pin `flink:1.20.5`; `new()` now floats to `flink:latest` so
+//! the version tracks upstream rather than this crate's own release cycle. The
+//! topology, backend-support, and memory facts above were all verified against that
+//! `flink:1.20.5` boot specifically.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use rightsize::{Container, ContainerGuard, Network, Result, RightsizeError, Wait};
+use rightsize::{Container, ContainerGuard, ImageName, Network, Result, RightsizeError, Wait};
 
 const REST_PORT: u16 = 8081;
 const RPC_PORT: u16 = 6123;
 const JOBMANAGER_ALIAS: &str = "jobmanager";
 
+/// The repository this module understands — see the module doc's compatibility
+/// section.
+const EXPECTED_REPOSITORY: &str = "flink";
+
 /// An Apache Flink JobManager, with an optional companion TaskManager (see
 /// [`FlinkContainer::with_task_manager`]).
 pub struct FlinkContainer {
     container: Container,
-    image: String,
+    image: ImageName,
     network: Option<Arc<Network>>,
     task_manager: Option<Container>,
 }
 
 impl FlinkContainer {
-    /// Builds a container from the pinned default image (`flink:1.20.5`).
+    /// Builds a container from the floating default image (`flink:latest`).
     pub fn new() -> Self {
-        Self::with_image("flink:1.20.5")
+        Self::with_image("flink:latest")
     }
 
-    /// Builds a container from a caller-chosen image.
-    pub fn with_image(image: &str) -> Self {
-        let container = Container::new(image)
+    /// Builds a container from a caller-chosen image. The repository is checked when
+    /// the container starts, not here, so this constructor stays infallible like every
+    /// other module's — see [`FlinkContainer::start`].
+    pub fn with_image(image: impl Into<ImageName>) -> Self {
+        let image = image.into();
+        let container = Container::new(image.as_str())
             .with_exposed_ports(&[REST_PORT, RPC_PORT])
             .with_command(&["jobmanager"])
             .with_memory_limit(1024)
@@ -96,7 +124,7 @@ impl FlinkContainer {
             );
         Self {
             container,
-            image: image.to_string(),
+            image,
             network: None,
             task_manager: None,
         }
@@ -134,7 +162,7 @@ impl FlinkContainer {
                 &format!("jobmanager.rpc.address: {JOBMANAGER_ALIAS}"),
             );
         self.task_manager = Some(
-            Container::new(&self.image)
+            Container::new(self.image.as_str())
                 .with_command(&["taskmanager"])
                 .with_network(&net)
                 .with_env(
@@ -152,9 +180,18 @@ impl FlinkContainer {
         Ok(self)
     }
 
-    /// Boots the JobManager, then (if [`FlinkContainer::with_task_manager`] was
-    /// called) the companion TaskManager.
+    /// Boots the JobManager, after checking the image is one this module understands,
+    /// then (if [`FlinkContainer::with_task_manager`] was called) the companion
+    /// TaskManager.
+    ///
+    /// The compatibility check runs here rather than in the constructors so those stay
+    /// infallible and match every other module in this crate. It is still the first
+    /// thing to happen — before any backend is resolved or any sandbox is created — so
+    /// a mismatched image fails with
+    /// [`rightsize::RightsizeError::IncompatibleImage`] naming both repositories,
+    /// never a bare wait-strategy timeout against the wrong server.
     pub async fn start(self) -> Result<FlinkGuard> {
+        self.image.assert_compatible_with(EXPECTED_REPOSITORY)?;
         crate::register_default_backends();
         let jobmanager = self.container.start().await?;
         let task_manager = match self.task_manager {
@@ -230,5 +267,37 @@ mod tests {
     fn with_image_smoke() {
         let _ = FlinkContainer::new();
         let _ = FlinkContainer::with_image("flink:1.20.5");
+    }
+
+    // The compatibility check runs in `start()`, which needs a live backend, so these
+    // exercise the exact condition `start()` evaluates against the stored image.
+
+    #[test]
+    fn the_floating_default_is_compatible() {
+        FlinkContainer::new()
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("the floating default must satisfy this module's own check");
+    }
+
+    #[test]
+    fn an_incompatible_repository_is_rejected_naming_both() {
+        let err = FlinkContainer::with_image("postgres:16")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect_err("postgres is not flink");
+        let msg = err.to_string();
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("flink"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_compatible_substitute_passes() {
+        let image =
+            ImageName::parse("mycorp/flink-hardened:1.20.5").as_compatible_substitute_for("flink");
+        FlinkContainer::with_image(image)
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a declared compatible substitute must be accepted");
     }
 }

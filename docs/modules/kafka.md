@@ -2,16 +2,30 @@
 
 A single-node Kafka broker running in **KRaft mode** — no ZooKeeper.
 
-**Default image:** `apache/kafka:4.0.0`
+**Default image:** floats to `apache/kafka:latest` — this module previously
+pinned `apache/kafka:4.0.0`.
 **Guest port:** `9092`
+**Expected repository:** `apache/kafka`
 
 | Method | On | Effect |
 |---|---|---|
-| `KafkaContainer::new()` | builder | Pinned default image. |
-| `KafkaContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<KafkaGuard>` | Boots the container. |
+| `KafkaContainer::new()` | builder | Floating default image. |
+| `KafkaContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<KafkaGuard>` | Checks the image's repository, then boots the container. |
 | `.bootstrap_servers()` | guard | `PLAINTEXT://host:port` bootstrap address. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `apache/kafka` before any backend is resolved or any sandbox is
+created, which keeps the constructors infallible like every other module's. A
+mismatch returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("apache/kafka")` is the escape hatch for a
+verified drop-in replacement from another registry. `new()` goes through this
+same check against its own floating reference, so it can never fail in
+practice.
 
 ## Defaults baked in
 

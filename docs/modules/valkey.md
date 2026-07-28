@@ -4,16 +4,32 @@ A single-node Valkey container. Valkey is a protocol-compatible Redis fork; this
 module mirrors [`RedisContainer`](./redis.md)'s shape exactly — same wait strategy,
 same lack of a memory-limit override, same single-newtype build.
 
-**Default image:** `valkey/valkey:9.1-alpine`
+**Default image:** floats to `valkey/valkey:latest` — this module previously
+pinned `valkey/valkey:9.1-alpine`; Docker Hub publishes `valkey/valkey:latest` as
+a Debian-based image rather than Alpine, functionally equivalent for this
+module's own use, just a larger pull.
 **Guest port:** `6379`
+**Expected repository:** `valkey/valkey`
 
 | Method | On | Effect |
 |---|---|---|
-| `ValkeyContainer::new()` | builder | Pinned default image. |
-| `ValkeyContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<ValkeyGuard>` | Boots the container. |
+| `ValkeyContainer::new()` | builder | Floating default image (`valkey/valkey:latest`). |
+| `ValkeyContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<ValkeyGuard>` | Checks the image's repository, then boots the container. |
 | `.uri()` | guard | `redis://host:port` connection URI (see below for why the scheme is `redis://`). |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `valkey/valkey` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("valkey/valkey")` is the escape hatch for a
+verified drop-in replacement from another registry. `new()` goes through this
+same check against its own floating reference, so it can never fail in
+practice.
 
 `ValkeyGuard` derefs to `ContainerGuard`, so `exec()`, `logs()`, `get_mapped_port()`,
 etc. are all available directly on it too.

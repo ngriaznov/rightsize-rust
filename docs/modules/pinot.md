@@ -5,17 +5,31 @@ minion, and an embedded ZooKeeper, all as one process tree inside one image,
 started with `QuickStart -type EMPTY` — a clean cluster with no demo tables. This is
 a real-cluster smoke fixture, not a data-loading harness.
 
-**Default image:** `apachepinot/pinot:1.5.1`
+**Default image:** floats to `apachepinot/pinot:latest` — this module previously
+pinned `apachepinot/pinot:1.5.1`.
 **Guest ports:** `9000` (controller REST API), `8000` (broker query API)
+**Expected repository:** `apachepinot/pinot`
 
 | Method | On | Effect |
 |---|---|---|
-| `PinotContainer::new()` | builder | Pinned default image. |
-| `PinotContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<PinotGuard>` | Boots the container (up to 180s timeout). |
+| `PinotContainer::new()` | builder | Floating default image. |
+| `PinotContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<PinotGuard>` | Checks the image's repository, then boots the container (up to 180s timeout). |
 | `.controller_url()` | guard | Controller REST base URI (schema/table/segment admin). |
 | `.broker_url()` | guard | Broker query base URI. |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `apachepinot/pinot` before any backend is resolved or any sandbox is
+created, which keeps the constructors infallible like every other module's. A
+mismatch returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("apachepinot/pinot")` is the escape hatch for a
+verified drop-in replacement from another registry. `new()` goes through this
+same check against its own floating reference, so it can never fail in
+practice.
 
 ## Ports — empirically verified, not the QuickStart docs' assumption
 

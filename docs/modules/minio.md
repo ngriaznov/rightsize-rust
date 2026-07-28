@@ -4,19 +4,32 @@ A single-node MinIO container, an S3-compatible object store. Defaults to a
 `testuser`/`testpassword` root credential pair so `s3_url()` plus that pair is
 usable with zero configuration.
 
-**Default image:** `minio/minio:RELEASE.2025-09-07T16-13-09Z`
+**Default image:** floats to `minio/minio:latest` — this module previously
+pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`.
 **Guest ports:** `9000` (S3 API — what the helpers use), `9001` (web console, exposed but not wrapped)
+**Expected repository:** `minio/minio`
 
 | Method | On | Effect |
 |---|---|---|
-| `MinioContainer::new()` | builder | Pinned default image, `testuser`/`testpassword`. |
-| `MinioContainer::with_image(image)` | builder | Caller-chosen image. |
+| `MinioContainer::new()` | builder | Floating default image, `testuser`/`testpassword`. |
+| `MinioContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_root_user(u)` / `.with_root_password(p)` | builder | Override either credential before `start()`. |
-| `.start()` | builder → `Result<MinioGuard>` | Boots the container. |
+| `.start()` | builder → `Result<MinioGuard>` | Checks the image's repository, then boots the container. |
 | `.root_user()` / `.root_password()` | guard | The configured root credentials. |
 | `.s3_url()` | guard | The S3 API's base URI (port 9000) — sign requests against this with the configured credentials. |
 | `.console_url()` | guard | The web console's base URI (port 9001) — human use only. |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `minio/minio` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("minio/minio")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## The default entrypoint does not serve — a command is required
 

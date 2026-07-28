@@ -36,33 +36,59 @@
 //! No `with_memory_limit` override needed — same InnoDB-footprint precedent as MySQL
 //! 8.4: boots clean on msb's default ~450M microVM RAM (observed ~14.8s IT round-trip
 //! on msb).
+//!
+//! ### Compatibility checking
+//!
+//! [`MariaDbContainer::with_image`] parses the supplied image with
+//! [`rightsize::ImageName`] and checks its repository against `mariadb` (registry
+//! host, tag, and digest stripped) before ever touching a backend, returning
+//! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
+//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! `ImageName::parse(image).as_compatible_substitute_for("mariadb")` to override for a
+//! verified drop-in replacement. [`MariaDbContainer::new`] goes through the same check
+//! against its own floating reference, so it can never fail in practice.
+//!
+//! ### `new()` floats to `mariadb:latest`
+//!
+//! This module used to pin `mariadb:11.4`; `new()` now floats to `mariadb:latest` so
+//! the version tracks upstream rather than this crate's own release cycle. The
+//! readiness log-line shape captured above was verified against that `mariadb:11.4`
+//! boot specifically.
 
 use std::time::Duration;
 
-use rightsize::{Container, ContainerGuard, Result, Wait};
+use rightsize::{Container, ContainerGuard, ImageName, Result, Wait};
 
 const PORT: u16 = 3306;
+
+/// The repository this module understands — see the module doc's compatibility
+/// section.
+const EXPECTED_REPOSITORY: &str = "mariadb";
 
 /// A single-node MariaDB container.
 pub struct MariaDbContainer {
     container: Container,
+    image: ImageName,
     username: String,
     password: String,
     database: String,
 }
 
 impl MariaDbContainer {
-    /// Builds a container from the pinned default image (`mariadb:11.4`).
+    /// Builds a container from the floating default image (`mariadb:latest`).
     pub fn new() -> Self {
-        Self::with_image("mariadb:11.4")
+        Self::with_image("mariadb:latest")
     }
 
-    /// Builds a container from a caller-chosen image.
-    pub fn with_image(image: &str) -> Self {
+    /// Builds a container from a caller-chosen image. The repository is checked when
+    /// the container starts, not here, so this constructor stays infallible like every
+    /// other module's — see [`MariaDbContainer::start`].
+    pub fn with_image(image: impl Into<ImageName>) -> Self {
+        let image = image.into();
         let username = "test".to_string();
         let password = "test".to_string();
         let database = "test".to_string();
-        let container = Container::new(image)
+        let container = Container::new(image.as_str())
             .with_exposed_ports(&[PORT])
             .with_env("MARIADB_USER", &username)
             .with_env("MARIADB_PASSWORD", &password)
@@ -77,6 +103,7 @@ impl MariaDbContainer {
             );
         Self {
             container,
+            image,
             username,
             password,
             database,
@@ -104,8 +131,16 @@ impl MariaDbContainer {
         self
     }
 
-    /// Boots the container.
+    /// Boots the container, after checking the image is one this module understands.
+    ///
+    /// The compatibility check runs here rather than in the constructors so those stay
+    /// infallible and match every other module in this crate. It is still the first
+    /// thing to happen — before any backend is resolved or any sandbox is created — so
+    /// a mismatched image fails with
+    /// [`rightsize::RightsizeError::IncompatibleImage`] naming both repositories,
+    /// never a bare wait-strategy timeout against the wrong server.
     pub async fn start(self) -> Result<MariaDbGuard> {
+        self.image.assert_compatible_with(EXPECTED_REPOSITORY)?;
         crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(MariaDbGuard {
@@ -197,6 +232,38 @@ mod tests {
         assert_eq!(c.username, "alice");
         assert_eq!(c.password, "s3cret");
         assert_eq!(c.database, "app");
+    }
+
+    // The compatibility check runs in `start()`, which needs a live backend, so these
+    // exercise the exact condition `start()` evaluates against the stored image.
+
+    #[test]
+    fn the_floating_default_is_compatible() {
+        MariaDbContainer::new()
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("the floating default must satisfy this module's own check");
+    }
+
+    #[test]
+    fn an_incompatible_repository_is_rejected_naming_both() {
+        let err = MariaDbContainer::with_image("postgres:16")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect_err("postgres is not mariadb");
+        let msg = err.to_string();
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("mariadb"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_compatible_substitute_passes() {
+        let image = ImageName::parse("mycorp/mariadb-hardened:11.4")
+            .as_compatible_substitute_for("mariadb");
+        MariaDbContainer::with_image(image)
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a declared compatible substitute must be accepted");
     }
 
     const CAPTURED_LOG: &str = "\

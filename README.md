@@ -164,7 +164,7 @@ backend-specific rather than behavioral divergences:
 
 ## Modules
 
-`rightsize-modules` ships twenty-one preconfigured containers with sensible waits
+`rightsize-modules` ships twenty-three preconfigured containers with sensible waits
 and connection helpers. Each is a thin newtype wrapping `Container`, so its guard
 exposes typed accessors while the core builders (`with_env`, `waiting_for`, …)
 remain available.
@@ -192,13 +192,26 @@ remain available.
 | `FlinkContainer` | `rest_url()`; `with_task_manager()` for a full session cluster — **Docker only**¹ |
 | `MinioContainer` | `s3_url()`, `console_url()`, `root_user()`, `root_password()`; `with_root_user`/`with_root_password(…)` — no memory limit set |
 | `CassandraContainer` | `contact_point()`, `cql_port()`, `local_datacenter()` (defaults `with_memory_limit(2560)`) |
+| `ElasticsearchContainer` | `rest_url()` — no `new()`; Elastic publishes no floating tag, so `with_image(…)` always requires an explicit version (defaults `with_memory_limit(2560)`) |
+| `QdrantContainer` | `rest_url()` — `new()` floats to `qdrant/qdrant:latest`; no memory limit set |
 
 Heavyweight JVM images raise their own memory floor via `with_memory_limit` -
 SpringCloudConfig, Keycloak, Neo4j and Flink (1024 MB), Cassandra (2560 MB),
-Pinot's four-JVM cluster (4096 MB). That's baked into the module; you don't set it.
-Each module's rustdoc documents its exact image tag, wait strategy, and the
-reasoning behind those choices - the
+Elasticsearch (2560 MB), Pinot's four-JVM cluster (4096 MB). That's baked into
+the module; you don't set it. Each module's rustdoc documents its exact default
+image, wait strategy, and the reasoning behind those choices - the
 [module chapter of the book](docs/modules/index.md) collects the worked examples.
+
+Every module's `with_image` takes `impl Into<ImageName>` and checks the supplied
+image's repository against what that module declares it understands, before
+ever touching a backend - a mismatch fails fast with
+`RightsizeError::IncompatibleImage` naming the supplied repository, the expected
+one, and how to override, rather than surfacing later as a bare wait-strategy
+timeout. `new()` (where one exists) floats each module to `<repository>:latest`
+- `RabbitMqContainer` floats to `rabbitmq:management` instead, since plain
+`rabbitmq:latest` carries no management plugin. See
+[Compatibility checking](docs/modules/index.md#compatibility-checking) in the
+book for the full shape and the escape hatch for a verified drop-in replacement.
 
 ¹ `with_task_manager()` returns a `Result`: on microsandbox it errs with
 `RightsizeError::UnsupportedByBackend` (the Flink image carries no `nc`/busybox

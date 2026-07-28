@@ -170,6 +170,23 @@ pub enum RightsizeError {
         reason: String,
     },
 
+    /// An explicit image was supplied to a module constructor whose repository
+    /// (registry host, tag, and digest all stripped — see [`crate::ImageName`])
+    /// does not match the repository that module declares it understands. Raised by
+    /// [`crate::ImageName::assert_compatible_with`], before any backend work — never
+    /// a bare wait-strategy timeout on an image that was never going to behave like
+    /// the module expects. The escape hatch is
+    /// [`crate::ImageName::as_compatible_substitute_for`], mirroring Testcontainers'
+    /// `asCompatibleSubstituteFor`.
+    #[error("{}", format_incompatible_image(supplied, expected))]
+    IncompatibleImage {
+        /// The supplied image's parsed repository (registry host, tag, and digest
+        /// stripped).
+        supplied: String,
+        /// The repository this module declares it understands.
+        expected: String,
+    },
+
     /// The msb toolchain provisioner failed (download, checksum, install).
     #[error("{0}")]
     Provision(String),
@@ -240,6 +257,18 @@ fn format_malformed_archive(path: &std::path::Path, reason: &str) -> String {
     format!(
         "the checkpoint archive at '{}' is not a usable rightsize archive — {reason}",
         path.display()
+    )
+}
+
+/// Renders `IncompatibleImage`'s message: the same fact-em-dash-remedy grammar as
+/// [`format_unsupported`] — names the supplied repository, the expected one, and how
+/// to override.
+fn format_incompatible_image(supplied: &str, expected: &str) -> String {
+    format!(
+        "image repository '{supplied}' does not match this module's expected repository \
+         '{expected}' — call ImageName::parse(...).as_compatible_substitute_for(\"{expected}\") \
+         if '{supplied}' is a verified drop-in replacement, or supply an image from \
+         '{expected}' instead"
     )
 }
 
@@ -419,6 +448,18 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("rz-ckpt-deadbeefcafe"), "{msg}");
         assert!(msg.contains("microsandbox"), "{msg}");
+    }
+
+    #[test]
+    fn incompatible_image_names_the_supplied_and_expected_repositories_and_the_override() {
+        let e = RightsizeError::IncompatibleImage {
+            supplied: "mysql".to_string(),
+            expected: "postgres".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("mysql"), "{msg}");
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("as_compatible_substitute_for"), "{msg}");
     }
 
     #[test]

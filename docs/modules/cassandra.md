@@ -2,18 +2,31 @@
 
 A single-node Apache Cassandra container.
 
-**Default image:** `cassandra:5.0.8`
+**Default image:** floats to `cassandra:latest` — this module previously pinned
+`cassandra:5.0.8`.
 **Guest port:** `9042` (CQL native protocol)
+**Expected repository:** `cassandra`
 
 | Method | On | Effect |
 |---|---|---|
-| `CassandraContainer::new()` | builder | Pinned default image, `with_memory_limit(2560)`. |
-| `CassandraContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<CassandraGuard>` | Boots the container. |
+| `CassandraContainer::new()` | builder | Floating default image, `with_memory_limit(2560)`. |
+| `CassandraContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<CassandraGuard>` | Checks the image's repository, then boots the container. |
 | `.contact_point()` | guard | `<host>:<port>` CQL contact point, for drivers that take one directly. |
 | `.cql_port()` | guard | The mapped host port for the CQL native protocol. |
 | `.local_datacenter()` | guard | The local datacenter name a driver's load-balancing policy needs (`datacenter1`). |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `cassandra` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("cassandra")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## `GPG_KEYS` must be overridden to a tab-free value — this is not optional
 

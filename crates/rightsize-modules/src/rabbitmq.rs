@@ -40,34 +40,67 @@
 //! warning, "this feature can still be used for now" but a client that declares a
 //! **non-durable, non-exclusive** queue (`durable=false, exclusive=false`) may be
 //! rejected with `reply-code=541 INTERNAL_ERROR` depending on the deployed policy —
-//! reproduced directly against this module's pinned image. Declare durable,
-//! non-exclusive queues (or exclusive transient ones) from client code exercising this
-//! container; this module itself declares no queues.
+//! reproduced directly against this module's previously pinned
+//! `rabbitmq:4-management-alpine` image (see below — `new()` floats since then, but
+//! this behavior is documented RabbitMQ 4.x entrypoint behavior, not something tied to
+//! that specific tag). Declare durable, non-exclusive queues (or exclusive transient
+//! ones) from client code exercising this container; this module itself declares no
+//! queues.
+//!
+//! ### Compatibility checking
+//!
+//! [`RabbitMqContainer::with_image`] parses the supplied image with
+//! [`rightsize::ImageName`] and checks its repository against `rabbitmq` (registry
+//! host, tag, and digest stripped) before ever touching a backend, returning
+//! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
+//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! `ImageName::parse(image).as_compatible_substitute_for("rabbitmq")` to override for
+//! a verified drop-in replacement. [`RabbitMqContainer::new`] goes through the same
+//! check against its own floating reference, so it can never fail in practice.
+//!
+//! ### `new()` floats to `rabbitmq:management`, not `rabbitmq:latest`
+//!
+//! This module used to pin `rabbitmq:4-management-alpine`. Every other module in this
+//! crate that has a `new()` floats to `<repository>:latest`, but plain
+//! `rabbitmq:latest` carries no management plugin at all — this module is built
+//! around it (its readiness wait and every helper below depend on the management API
+//! and its startup log lines). `rabbitmq:management` is the floating tag that keeps
+//! the plugin while still tracking upstream rather than a version pinned to this
+//! crate's own release cycle. The readiness/behavior facts above were verified
+//! against that previous `rabbitmq:4-management-alpine` boot specifically.
 
-use rightsize::{Container, ContainerGuard, Result, Wait};
+use rightsize::{Container, ContainerGuard, ImageName, Result, Wait};
 
 const AMQP_PORT: u16 = 5672;
 const MANAGEMENT_PORT: u16 = 15672;
 
+/// The repository this module understands — see the module doc's compatibility
+/// section.
+const EXPECTED_REPOSITORY: &str = "rabbitmq";
+
 /// A single-node RabbitMQ container with the management plugin enabled.
 pub struct RabbitMqContainer {
     container: Container,
+    image: ImageName,
     username: String,
     password: String,
 }
 
 impl RabbitMqContainer {
-    /// Builds a container from the pinned default image
-    /// (`rabbitmq:4-management-alpine`).
+    /// Builds a container from the floating default image (`rabbitmq:management`) —
+    /// see the module doc for why this is `management`, not `latest`.
     pub fn new() -> Self {
-        Self::with_image("rabbitmq:4-management-alpine")
+        Self::with_image("rabbitmq:management")
     }
 
-    /// Builds a container from a caller-chosen image.
-    pub fn with_image(image: &str) -> Self {
+    /// Builds a container from a caller-chosen image. The repository is checked when
+    /// the container starts, not here, so this constructor stays infallible like every
+    /// other module's — see [`RabbitMqContainer::start`].
+    pub fn with_image(image: impl Into<ImageName>) -> Self {
+        let image = image.into();
         let username = "guest".to_string();
         let password = "guest".to_string();
-        let container = Container::new(image)
+        let container = Container::new(image.as_str())
             .with_exposed_ports(&[AMQP_PORT, MANAGEMENT_PORT])
             .with_env("RABBITMQ_DEFAULT_USER", &username)
             .with_env("RABBITMQ_DEFAULT_PASS", &password)
@@ -76,6 +109,7 @@ impl RabbitMqContainer {
             .waiting_for(Wait::for_log_message(".*Server startup complete.*", 1));
         Self {
             container,
+            image,
             username,
             password,
         }
@@ -95,8 +129,16 @@ impl RabbitMqContainer {
         self
     }
 
-    /// Boots the container.
+    /// Boots the container, after checking the image is one this module understands.
+    ///
+    /// The compatibility check runs here rather than in the constructors so those stay
+    /// infallible and match every other module in this crate. It is still the first
+    /// thing to happen — before any backend is resolved or any sandbox is created — so
+    /// a mismatched image fails with
+    /// [`rightsize::RightsizeError::IncompatibleImage`] naming both repositories,
+    /// never a bare wait-strategy timeout against the wrong server.
     pub async fn start(self) -> Result<RabbitMqGuard> {
+        self.image.assert_compatible_with(EXPECTED_REPOSITORY)?;
         crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(RabbitMqGuard {
@@ -182,5 +224,37 @@ mod tests {
             .with_password("s3cret");
         assert_eq!(c.username, "alice");
         assert_eq!(c.password, "s3cret");
+    }
+
+    // The compatibility check runs in `start()`, which needs a live backend, so these
+    // exercise the exact condition `start()` evaluates against the stored image.
+
+    #[test]
+    fn the_floating_default_is_compatible() {
+        RabbitMqContainer::new()
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("the floating default must satisfy this module's own check");
+    }
+
+    #[test]
+    fn an_incompatible_repository_is_rejected_naming_both() {
+        let err = RabbitMqContainer::with_image("postgres:16")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect_err("postgres is not rabbitmq");
+        let msg = err.to_string();
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("rabbitmq"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_compatible_substitute_passes() {
+        let image = ImageName::parse("mycorp/rabbitmq-hardened:4-management")
+            .as_compatible_substitute_for("rabbitmq");
+        RabbitMqContainer::with_image(image)
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a declared compatible substitute must be accepted");
     }
 }

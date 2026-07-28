@@ -33,15 +33,39 @@
 //! character-boundary checks rather than a regex — predates `Wait::for_log_message`'s
 //! move to a real regex engine (`regex-lite`), and the hand-written version is
 //! unaffected by that swap since it was never routed through the shared matcher.
+//!
+//! ### Compatibility checking
+//!
+//! [`MySqlContainer::with_image`] parses the supplied image with
+//! [`rightsize::ImageName`] and checks its repository against `mysql` (registry host,
+//! tag, and digest stripped) before ever touching a backend, returning
+//! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
+//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! `ImageName::parse(image).as_compatible_substitute_for("mysql")` to override for a
+//! verified drop-in replacement. [`MySqlContainer::new`] goes through the same check
+//! against its own floating reference, so it can never fail in practice.
+//!
+//! ### `new()` floats to `mysql:latest`
+//!
+//! This module used to pin `mysql:8.4`; `new()` now floats to `mysql:latest` so the
+//! version tracks upstream rather than this crate's own release cycle. The readiness
+//! log-line shape captured above was verified against that `mysql:8.4` boot
+//! specifically — say so rather than silently re-attributing it to whatever version
+//! `latest` happens to resolve to.
 
 use std::time::Duration;
 
 use rightsize::wait::{WaitStrategy, WaitTarget};
-use rightsize::{Container, ContainerGuard, Result};
+use rightsize::{Container, ContainerGuard, ImageName, Result};
+
+/// The repository this module understands — see the module doc's compatibility
+/// section.
+const EXPECTED_REPOSITORY: &str = "mysql";
 
 /// A single-node MySQL container.
 pub struct MySqlContainer {
     container: Container,
+    image: ImageName,
     username: String,
     password: String,
     database: String,
@@ -50,17 +74,20 @@ pub struct MySqlContainer {
 impl MySqlContainer {
     const PORT: u16 = 3306;
 
-    /// Builds a container from the pinned default image (`mysql:8.4`).
+    /// Builds a container from the floating default image (`mysql:latest`).
     pub fn new() -> Self {
-        Self::with_image("mysql:8.4")
+        Self::with_image("mysql:latest")
     }
 
-    /// Builds a container from a caller-chosen image.
-    pub fn with_image(image: &str) -> Self {
+    /// Builds a container from a caller-chosen image. The repository is checked when
+    /// the container starts, not here, so this constructor stays infallible like every
+    /// other module's — see [`MySqlContainer::start`].
+    pub fn with_image(image: impl Into<ImageName>) -> Self {
+        let image = image.into();
         let username = "test".to_string();
         let password = "test".to_string();
         let database = "test".to_string();
-        let container = Container::new(image)
+        let container = Container::new(image.as_str())
             .with_exposed_ports(&[Self::PORT])
             .with_env("MYSQL_USER", &username)
             .with_env("MYSQL_PASSWORD", &password)
@@ -75,6 +102,7 @@ impl MySqlContainer {
         // microVM RAM, so no module-level memory floor is warranted here.
         Self {
             container,
+            image,
             username,
             password,
             database,
@@ -102,8 +130,16 @@ impl MySqlContainer {
         self
     }
 
-    /// Boots the container.
+    /// Boots the container, after checking the image is one this module understands.
+    ///
+    /// The compatibility check runs here rather than in the constructors so those stay
+    /// infallible and match every other module in this crate. It is still the first
+    /// thing to happen — before any backend is resolved or any sandbox is created — so
+    /// a mismatched image fails with
+    /// [`rightsize::RightsizeError::IncompatibleImage`] naming both repositories,
+    /// never a bare wait-strategy timeout against the wrong server.
     pub async fn start(self) -> Result<MySqlGuard> {
+        self.image.assert_compatible_with(EXPECTED_REPOSITORY)?;
         crate::register_default_backends();
         let guard = self.container.start().await?;
         Ok(MySqlGuard {
@@ -258,6 +294,38 @@ mod tests {
         assert_eq!(c.username, "alice");
         assert_eq!(c.password, "s3cret");
         assert_eq!(c.database, "app");
+    }
+
+    // The compatibility check runs in `start()`, which needs a live backend, so these
+    // exercise the exact condition `start()` evaluates against the stored image.
+
+    #[test]
+    fn the_floating_default_is_compatible() {
+        MySqlContainer::new()
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("the floating default must satisfy this module's own check");
+    }
+
+    #[test]
+    fn an_incompatible_repository_is_rejected_naming_both() {
+        let err = MySqlContainer::with_image("postgres:16")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect_err("postgres is not mysql");
+        let msg = err.to_string();
+        assert!(msg.contains("postgres"), "{msg}");
+        assert!(msg.contains("mysql"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_compatible_substitute_passes() {
+        let image =
+            ImageName::parse("mycorp/mysql-hardened:8.4").as_compatible_substitute_for("mysql");
+        MySqlContainer::with_image(image)
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a declared compatible substitute must be accepted");
     }
 
     // The exact captured log excerpt from the module doc: four "ready for

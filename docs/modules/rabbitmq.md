@@ -4,19 +4,35 @@ A single-node RabbitMQ container with the management plugin enabled. Defaults to
 `guest`/`guest` credential pair (the image's own default) so `amqp_url()` is usable
 with zero configuration.
 
-**Default image:** `rabbitmq:4-management-alpine`
+**Default image:** floats to `rabbitmq:management` — this module previously
+pinned `rabbitmq:4-management-alpine`. Every other module in this crate that has
+a `new()` floats to `<repository>:latest`, but plain `rabbitmq:latest` carries
+no management plugin at all, and this module is built around it — `management`
+is the floating tag that keeps the plugin.
 **Guest ports:** `5672` (AMQP), `15672` (management)
+**Expected repository:** `rabbitmq`
 
 | Method | On | Effect |
 |---|---|---|
-| `RabbitMqContainer::new()` | builder | Pinned default image, `guest`/`guest`. |
-| `RabbitMqContainer::with_image(image)` | builder | Caller-chosen image. |
+| `RabbitMqContainer::new()` | builder | Floating default image (`rabbitmq:management`), `guest`/`guest`. |
+| `RabbitMqContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_username(u)` / `.with_password(p)` | builder | Override either credential before `start()`. |
-| `.start()` | builder → `Result<RabbitMqGuard>` | Boots the container. |
+| `.start()` | builder → `Result<RabbitMqGuard>` | Checks the image's repository, then boots the container. |
 | `.username()` / `.password()` | guard | The configured credential pair. |
 | `.amqp_url()` | guard | `amqp://user:pass@host:port` — the AMQP listener. |
 | `.management_url()` | guard | The management UI/API base URI. |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `rabbitmq` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("rabbitmq")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## Readiness — verified against a real 4.x boot
 
@@ -48,9 +64,12 @@ RabbitMQ 4.x deprecates `transient_nonexcl_queues` and, per the broker's own sta
 warning, "this feature can still be used for now" — but a client that declares a
 **non-durable, non-exclusive** queue (`durable=false, exclusive=false`) may be
 rejected with `reply-code=541 INTERNAL_ERROR` depending on the deployed policy,
-reproduced directly against this module's pinned image. Declare durable,
-non-exclusive queues (or exclusive transient ones) from client code exercising this
-container; this module itself declares no queues.
+reproduced directly against this module's previously pinned
+`rabbitmq:4-management-alpine` image (see above — `new()` floats since then, but
+this behavior is documented RabbitMQ 4.x entrypoint behavior, not something tied to
+that specific tag). Declare durable, non-exclusive queues (or exclusive transient
+ones) from client code exercising this container; this module itself declares no
+queues.
 
 ## Complete example
 

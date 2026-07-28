@@ -3,16 +3,31 @@
 A single-node Memcached container, ready-checked with a **protocol-level `version`
 probe** instead of the bare listening-port wait.
 
-**Default image:** `memcached:1.6-alpine`
+**Default image:** floats to `memcached:latest` — this module previously pinned
+`memcached:1.6-alpine`; Docker Hub publishes `memcached:latest` as a
+Debian-based image rather than Alpine, functionally equivalent for this
+module's own use, just a larger pull.
 **Guest port:** `11211`
+**Expected repository:** `memcached`
 
 | Method | On | Effect |
 |---|---|---|
-| `MemcachedContainer::new()` | builder | Pinned default image. |
-| `MemcachedContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<MemcachedGuard>` | Boots the container. |
+| `MemcachedContainer::new()` | builder | Floating default image (`memcached:latest`). |
+| `MemcachedContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<MemcachedGuard>` | Checks the image's repository, then boots the container. |
 | `.address()` | guard | `host:port` address of the running container. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `memcached` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("memcached")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## Why not the default wait strategy
 

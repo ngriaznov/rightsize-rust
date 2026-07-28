@@ -6,20 +6,33 @@ house convention for HTTP-first modules ([ClickHouse](./clickhouse.md),
 [Pinot](./pinot.md)). The bolt port (7687) is still exposed and its URI available
 via `bolt_url()` for callers who do want a real driver.
 
-**Default image:** `neo4j:5-community`
+**Default image:** floats to `neo4j:latest` — this module previously pinned
+`neo4j:5-community`.
 **Guest ports:** `7474` (HTTP), `7687` (bolt)
+**Expected repository:** `neo4j`
 
 | Method | On | Effect |
 |---|---|---|
-| `Neo4jContainer::new()` | builder | Pinned default image, `neo4j`/`rightsize-test`, `with_memory_limit(1024)`. |
-| `Neo4jContainer::with_image(image)` | builder | Caller-chosen image. |
+| `Neo4jContainer::new()` | builder | Floating default image, `neo4j`/`rightsize-test`, `with_memory_limit(1024)`. |
+| `Neo4jContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_password(p)` | builder | Overrides the password half before `start()` (the image requires ≥8 characters). |
-| `.start()` | builder → `Result<Neo4jGuard>` | Boots the container. |
+| `.start()` | builder → `Result<Neo4jGuard>` | Checks the image's repository, then boots the container. |
 | `.username()` | guard | The fixed admin username (`neo4j` — no env var to change it). |
 | `.password()` | guard | The configured admin password. |
 | `.http_url()` | guard | The HTTP interface's base URI — Cypher transactions via `POST {http_url}/db/neo4j/tx/commit`. |
 | `.bolt_url()` | guard | The bolt interface's URI, for callers using a real bolt driver. |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `neo4j` before any backend is resolved or any sandbox is created, which
+keeps the constructors infallible like every other module's. A mismatch returns
+`RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("neo4j")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 There's no `with_username` — the username is fixed by the image at `neo4j`.
 

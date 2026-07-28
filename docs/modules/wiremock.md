@@ -4,17 +4,31 @@ A WireMock server container for stubbing HTTP dependencies in integration tests.
 There is no first-class in-process WireMock story for Rust integration tests, so
 this module fills a real gap.
 
-**Default image:** `wiremock/wiremock:3.13.2`
+**Default image:** floats to `wiremock/wiremock:latest` — this module previously
+pinned `wiremock/wiremock:3.13.2`.
 **Guest port:** `8080`
+**Expected repository:** `wiremock/wiremock`
 
 | Method | On | Effect |
 |---|---|---|
-| `WireMockContainer::new()` | builder | Pinned default image. |
-| `WireMockContainer::with_image(image)` | builder | Caller-chosen image. |
-| `.start()` | builder → `Result<WireMockGuard>` | Boots the container. |
+| `WireMockContainer::new()` | builder | Floating default image. |
+| `WireMockContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
+| `.start()` | builder → `Result<WireMockGuard>` | Checks the image's repository, then boots the container. |
 | `.base_url()` | guard | The stub server's base URI — mount stubbed paths under this. |
 | `.admin_url()` | guard | The `/__admin` management API's base URI (stub CRUD, request journal, health). |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `wiremock/wiremock` before any backend is resolved or any sandbox is
+created, which keeps the constructors infallible like every other module's. A
+mismatch returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("wiremock/wiremock")` is the escape hatch for a
+verified drop-in replacement from another registry. `new()` goes through this
+same check against its own floating reference, so it can never fail in
+practice.
 
 ## Readiness — verified against a real 3.13.2 boot
 

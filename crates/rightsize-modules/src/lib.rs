@@ -1,13 +1,13 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-//! `rightsize-modules` ships twenty-one preconfigured containers on top of the
+//! `rightsize-modules` ships twenty-three preconfigured containers on top of the
 //! `rightsize` core: Redis, Memcached, ArangoDB, MongoDB, Redpanda, Kafka,
 //! SpringCloudConfig, PostgreSQL, MySQL, Apache Pinot, RabbitMQ, MariaDB, WireMock,
-//! ClickHouse, Keycloak, Neo4j, Floci, Apache Flink, Valkey, MinIO, and Cassandra. Each
-//! module is a thin newtype wrapping [`rightsize`]'s `Container` builder — no
-//! subclassing, just the spec-customizer and post-start hooks the core exposes — with
-//! connection helpers on its guard.
+//! ClickHouse, Keycloak, Neo4j, Floci, Apache Flink, Valkey, MinIO, Cassandra,
+//! Elasticsearch, and Qdrant. Each module is a thin newtype wrapping [`rightsize`]'s
+//! `Container` builder — no subclassing, just the spec-customizer and post-start
+//! hooks the core exposes — with connection helpers on its guard.
 //!
 //! Backend wiring is a Cargo feature choice, not a runtime one: `backend-msb` and
 //! `backend-docker` (both on by default) pull in `rightsize-msb` and
@@ -39,6 +39,7 @@ pub fn register_default_backends() {
 pub mod arango;
 pub mod cassandra;
 pub mod clickhouse;
+pub mod elasticsearch;
 pub mod flink;
 pub mod floci;
 pub mod kafka;
@@ -51,6 +52,7 @@ pub mod mysql;
 pub mod neo4j;
 pub mod pinot;
 pub mod postgres;
+pub mod qdrant;
 pub mod rabbitmq;
 pub mod redis;
 pub mod redpanda;
@@ -61,6 +63,7 @@ pub mod wiremock;
 pub use arango::{ArangoContainer, ArangoGuard};
 pub use cassandra::{CassandraContainer, CassandraGuard};
 pub use clickhouse::{ClickHouseContainer, ClickHouseGuard};
+pub use elasticsearch::{ElasticsearchContainer, ElasticsearchGuard};
 pub use flink::{FlinkContainer, FlinkGuard};
 pub use floci::{FlociContainer, FlociGuard};
 pub use kafka::{KafkaContainer, KafkaGuard};
@@ -73,6 +76,7 @@ pub use mysql::{MySqlContainer, MySqlGuard};
 pub use neo4j::{Neo4jContainer, Neo4jGuard};
 pub use pinot::{PinotContainer, PinotGuard};
 pub use postgres::{PostgresContainer, PostgresGuard};
+pub use qdrant::{QdrantContainer, QdrantGuard};
 pub use rabbitmq::{RabbitMqContainer, RabbitMqGuard};
 pub use redis::{RedisContainer, RedisGuard};
 pub use redpanda::{RedpandaContainer, RedpandaGuard};

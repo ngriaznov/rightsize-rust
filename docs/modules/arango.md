@@ -3,17 +3,30 @@
 A single-node ArangoDB container. Auth is **disabled by default**
 (`ARANGO_NO_AUTH=1`); call `.with_root_password(...)` to enable it instead.
 
-**Default image:** `arangodb:3.11`
+**Default image:** floats to `arangodb:latest` — this module previously pinned
+`arangodb:3.11`.
 **Guest port:** `8529`
+**Expected repository:** `arangodb`
 
 | Method | On | Effect |
 |---|---|---|
-| `ArangoContainer::new()` | builder | Pinned default image, auth disabled. |
-| `ArangoContainer::with_image(image)` | builder | Caller-chosen image, auth disabled. |
+| `ArangoContainer::new()` | builder | Floating default image, auth disabled. |
+| `ArangoContainer::with_image(image)` | builder | Caller-chosen image, auth disabled, kept verbatim. |
 | `.with_root_password(password)` | builder | Enables auth with the given root password instead of no-auth. |
-| `.start()` | builder → `Result<ArangoGuard>` | Boots the container. |
+| `.start()` | builder → `Result<ArangoGuard>` | Checks the image's repository, then boots the container. |
 | `.endpoint()` | guard | HTTP API base URI, e.g. `http://127.0.0.1:<port>`. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `arangodb` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("arangodb")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## `with_root_password` — why it removes `ARANGO_NO_AUTH` instead of just setting a password
 

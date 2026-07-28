@@ -3,19 +3,35 @@
 A single-node Keycloak container in `start-dev` mode (in-memory H2, no external
 database — fine for tests, never for production).
 
-**Default image:** `quay.io/keycloak/keycloak:26.4`
+**Default image:** floats to `quay.io/keycloak/keycloak:latest` — this module
+previously pinned `quay.io/keycloak/keycloak:26.4`.
 **Guest ports:** `8080` (HTTP / auth server), `9000` (management — health lives here, see below)
+**Expected repository:** `keycloak/keycloak` (the `quay.io` registry host is
+stripped per the Docker convention)
 
 | Method | On | Effect |
 |---|---|---|
-| `KeycloakContainer::new()` | builder | Pinned default image, `admin`/`admin`, `with_memory_limit(1024)`. |
-| `KeycloakContainer::with_image(image)` | builder | Caller-chosen image. |
+| `KeycloakContainer::new()` | builder | Floating default image, `admin`/`admin`, `with_memory_limit(1024)`. |
+| `KeycloakContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_admin_username(u)` / `.with_admin_password(p)` | builder | Override either bootstrap admin credential before `start()`. |
-| `.start()` | builder → `Result<KeycloakGuard>` | Boots the container. |
+| `.start()` | builder → `Result<KeycloakGuard>` | Checks the image's repository, then boots the container. |
 | `.admin_username()` / `.admin_password()` | guard | The configured bootstrap admin credentials. |
 | `.auth_server_url()` | guard | The auth server's base URI (HTTP port) — realm/OIDC endpoints live under this. |
 | `.management_url()` | guard | The management interface's base URI (health/metrics — port 9000, a different port than `auth_server_url()`). |
 | `.stop()` | guard | Stops and removes the container, releases its ports. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository against `keycloak/keycloak` before any
+backend is resolved or any sandbox is created, which keeps the constructors
+infallible like every other module's. The `quay.io` registry host is stripped
+before the comparison — `quay.io/keycloak/keycloak` and `keycloak/keycloak`
+both satisfy the check. A mismatch returns `RightsizeError::IncompatibleImage`;
+`ImageName::parse(image).as_compatible_substitute_for("keycloak/keycloak")` is
+the escape hatch for a verified drop-in replacement from another registry.
+`new()` goes through this same check against its own floating reference, so it
+can never fail in practice.
 
 ## Admin bootstrap env — 26.x renamed these, verified against the pinned tag
 

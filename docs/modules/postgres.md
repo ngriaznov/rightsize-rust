@@ -4,18 +4,33 @@ A single-node PostgreSQL container. Defaults to a `test`/`test`/`test`
 user/password/database trio so `connection_string()` is usable with zero
 configuration.
 
-**Default image:** `postgres:18-alpine`
+**Default image:** floats to `postgres:latest` — this module previously pinned
+`postgres:18-alpine`; Docker Hub publishes `postgres:latest` as a Debian-based
+image rather than Alpine, functionally equivalent for this module's own use,
+just a larger pull.
 **Guest port:** `5432`
+**Expected repository:** `postgres`
 
 | Method | On | Effect |
 |---|---|---|
-| `PostgresContainer::new()` | builder | Pinned default image, `test`/`test`/`test`. |
-| `PostgresContainer::with_image(image)` | builder | Caller-chosen image. |
+| `PostgresContainer::new()` | builder | Floating default image, `test`/`test`/`test`. |
+| `PostgresContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_username(u)` / `.with_password(p)` / `.with_database(d)` | builder | Override any of the trio before `start()`. |
-| `.start()` | builder → `Result<PostgresGuard>` | Boots the container. |
+| `.start()` | builder → `Result<PostgresGuard>` | Checks the image's repository, then boots the container. |
 | `.username()` / `.password()` / `.database_name()` | guard | The configured trio. |
 | `.connection_string()` | guard | `postgres://user:pass@host:port/db`. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `postgres` before any backend is resolved or any sandbox is created,
+which keeps the constructors infallible like every other module's. A mismatch
+returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("postgres")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## Readiness: why `times = 2`
 
@@ -39,6 +54,12 @@ this is the image's own baked value, not anything this module or your test adds.
 Docker is unaffected. The module works around it by overriding the variable to an
 empty string (`.with_env("DOCKER_PG_LLVM_DEPS", "")`) — a no-op for the build the
 image already baked, and harmless on Docker.
+
+This override was measured against the Alpine-tagged manifest specifically; it stays
+in place unconditionally now that `new()` floats to the Debian-based `postgres:latest`
+— it is a documented no-op on any manifest that doesn't carry the tab-bearing value,
+so keeping it costs nothing and protects a caller who supplies an `*-alpine` tag via
+`with_image`.
 
 If you hit `InvalidAscii` on a *different* image under `RIGHTSIZE_BACKEND=microsandbox`,
 suspect a baked env var with a control character the same way — see

@@ -4,18 +4,31 @@ A single-node MySQL container. Defaults to a `test`/`test`/`test`
 user/password/database trio (plus `MYSQL_ROOT_PASSWORD=test`) so
 `connection_string()` is usable with zero configuration.
 
-**Default image:** `mysql:8.4`
+**Default image:** floats to `mysql:latest` — this module previously pinned
+`mysql:8.4`.
 **Guest port:** `3306`
+**Expected repository:** `mysql`
 
 | Method | On | Effect |
 |---|---|---|
-| `MySqlContainer::new()` | builder | Pinned default image, `test`/`test`/`test`. |
-| `MySqlContainer::with_image(image)` | builder | Caller-chosen image. |
+| `MySqlContainer::new()` | builder | Floating default image, `test`/`test`/`test`. |
+| `MySqlContainer::with_image(image)` | builder | Caller-chosen image, kept verbatim. |
 | `.with_username(u)` / `.with_password(p)` / `.with_database(d)` | builder | Override any of the trio before `start()`. |
-| `.start()` | builder → `Result<MySqlGuard>` | Boots the container. |
+| `.start()` | builder → `Result<MySqlGuard>` | Checks the image's repository, then boots the container. |
 | `.username()` / `.password()` / `.database_name()` | guard | The configured trio. |
 | `.connection_string()` | guard | `mysql://user:pass@host:port/db`. |
 | `.stop()` | guard | Stops and removes the container, releases its port. |
+
+## Compatibility checking
+
+`with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
+then checks that image's repository (registry host, tag, and digest stripped)
+against `mysql` before any backend is resolved or any sandbox is created, which
+keeps the constructors infallible like every other module's. A mismatch returns
+`RightsizeError::IncompatibleImage`; `ImageName::parse(image)
+.as_compatible_substitute_for("mysql")` is the escape hatch for a verified
+drop-in replacement from another registry. `new()` goes through this same check
+against its own floating reference, so it can never fail in practice.
 
 ## Readiness — empirically pinned, not guessed
 

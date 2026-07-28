@@ -48,6 +48,8 @@
   - [FlinkContainer](./modules/flink.md)
   - [MinioContainer](./modules/minio.md)
   - [CassandraContainer](./modules/cassandra.md)
+  - [ElasticsearchContainer](./modules/elasticsearch.md)
+  - [QdrantContainer](./modules/qdrant.md)
 
 - [Troubleshooting](./troubleshooting.md)
 

@@ -18,7 +18,7 @@ container, and there's no daemon to install first.
 - A hand-rolled Docker fallback for platforms microVMs can't reach — Intel Macs,
   Windows, Linux without `/dev/kvm` — talking to the daemon over a plain
   `tokio::net::UnixStream`, never `bollard`/`hyper`.
-- Twenty-one preconfigured containers (`rightsize-modules`) for common test
+- Twenty-three preconfigured containers (`rightsize-modules`) for common test
   dependencies — see the [Modules index](./modules/index.md) for the full list.
 
 ```rust,ignore
@@ -86,7 +86,7 @@ ports of this library — see [Cross-Language Parity](./parity.md).
 
 - **Not yet published to crates.io.** Depend on it via a git reference until a
   tagged release exists — see [Getting Started](./getting-started.md).
-- **Twenty-one modules, not an exhaustive catalog.** Anything else is the plain
+- **Twenty-three modules, not an exhaustive catalog.** Anything else is the plain
   `Container` API — a thin wrapper is a small, welcome contribution; see the
   [Modules index](./modules/index.md) for the full list.
 - **No JUnit-style `@Container` test extension.** The RAII guard is the whole API
