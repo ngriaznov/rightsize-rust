@@ -34,7 +34,7 @@ gap. See [Networking](./core-concepts/networking.md#limits-on-the-microvm-backen
 
 ## "Container won't boot on microsandbox but works fine on Docker"
 
-Three distinct, independently observed causes share this symptom. Check them in
+Two distinct, independently observed causes share this symptom. Check them in
 this order:
 
 ### 1. Memory ceiling
@@ -68,17 +68,18 @@ baked, and harmless on Docker. `PostgresContainer` ships this fix already; if a
 <image>` and look at `Config.Env`) for anything with an embedded tab/control
 character and apply the same override.
 
-### 3. Read-only mounts you're relying on
+## "An in-guest write to a mounted file fails with `Read-only file system`"
 
-**Cause:** `FileMount::read_only` is advisory-only on microsandbox 0.6.2 — the
-guest gets a writable mount regardless of the flag. If your test asserts the guest
-*cannot* write to a mounted path, it'll pass on Docker (which enforces it) and fail
-on microsandbox (which doesn't) — or vice versa if your test logic assumes
-writability is blocked.
+**Cause:** the mount was built with `.read_only()`. Both backends enforce the flag
+as a guest-side write block — this is the flag doing its job, not a backend quirk.
+The default mount (`FileMount::new`, and everything made through
+`with_copy_file_to_container`) is read-write, and a guest write reaches the host
+file behind it. See
+[Files & Resources](./core-concepts/files-and-resources.md#mounting-host-files-into-a-container).
 
-**Fix:** don't write a test that depends on guest-side write protection while
-targeting `RIGHTSIZE_BACKEND=microsandbox`. See
-[Backends](./backends.md#backend-differences).
+**Fix:** if the guest genuinely needs to write to that path, drop the `.read_only()`
+call — but remember the write lands on the host file itself; if that's not wanted,
+mount a copy instead.
 
 ## "A no-`nc` image fails to join a network, citing Docker"
 

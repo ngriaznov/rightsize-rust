@@ -16,6 +16,10 @@
 //! shared by construction.
 
 use rightsize::backend::BackendProvider;
+// Feature-gated like the lib's own registration: `rightsize-docker` is a unix-socket
+// client through and through and does not compile on Windows, so a Windows test build
+// selects `--no-default-features --features backend-msb,sandbox-it` and never links it.
+#[cfg(feature = "backend-docker")]
 use rightsize_docker::DockerBackendProvider;
 use rightsize_msb::MsbBackendProvider;
 
@@ -36,14 +40,27 @@ pub fn ensure_registered() {
 pub fn requested_backend_available() -> bool {
     ensure_registered();
     match std::env::var("RIGHTSIZE_BACKEND") {
-        Ok(name) if name.eq_ignore_ascii_case("docker") => DockerBackendProvider.is_supported(),
+        Ok(name) if name.eq_ignore_ascii_case("docker") => docker_supported(),
         Ok(name)
             if name.eq_ignore_ascii_case("microsandbox") || name.eq_ignore_ascii_case("msb") =>
         {
             MsbBackendProvider.is_supported()
         }
         Ok(_) => false, // an explicitly unknown name: let Container::start() surface that error.
-        Err(_) => DockerBackendProvider.is_supported() || MsbBackendProvider.is_supported(),
+        Err(_) => docker_supported() || MsbBackendProvider.is_supported(),
+    }
+}
+
+/// Whether the docker backend is available — unconditionally `false` in a build
+/// without the `backend-docker` feature, where the provider isn't even linked.
+fn docker_supported() -> bool {
+    #[cfg(feature = "backend-docker")]
+    {
+        DockerBackendProvider.is_supported()
+    }
+    #[cfg(not(feature = "backend-docker"))]
+    {
+        false
     }
 }
 

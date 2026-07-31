@@ -198,8 +198,22 @@ async fn checkpoint_archive_survives_removal_of_the_original_and_restores_the_ma
     cleanup.set_imported_ref(imported.checkpoint_ref.clone());
     assert_ne!(
         imported.checkpoint_ref, cp.checkpoint_ref,
-        "msb's import is content-addressed — the effective ref is a resolved digest, never the \
+        "msb's load is content-addressed — the effective ref is a resolved digest, never the \
          original rz-ckpt- name"
+    );
+    // Digest-shaped, not merely different: msb has published both `sha256-<16hex>` (0.6.6)
+    // and a bare 64-hex digest (0.6.8) for a loaded snapshot, so the prefix is optional —
+    // what must hold is that the ref is a content digest. Asserting only "differs from the
+    // original" would accept any renaming msb ever adopts.
+    let digest_body = imported
+        .checkpoint_ref
+        .strip_prefix("sha256-")
+        .unwrap_or(&imported.checkpoint_ref);
+    assert!(
+        (16..=64).contains(&digest_body.len())
+            && digest_body.bytes().all(|b| b.is_ascii_hexdigit()),
+        "expected msb's digest-shaped effective ref, got '{}'",
+        imported.checkpoint_ref
     );
     assert_eq!(imported.backend, "microsandbox");
 

@@ -18,8 +18,8 @@ use rightsize::model::ContainerSpec;
 /// arguments after it.
 ///
 /// When `spec.checkpoint_ref` is set (this container was built from
-/// [`rightsize::Container::from_checkpoint`]), `--snapshot <ref>` replaces the plain
-/// image argument — `--snapshot` exists only on `msb run`, mutually exclusive with
+/// [`rightsize::Container::from_checkpoint`]), `--from-snapshot <ref>` replaces the plain
+/// image argument — `--from-snapshot` exists only on `msb run`, mutually exclusive with
 /// the IMAGE positional, and boots a fresh sandbox from that disk snapshot instead
 /// of pulling an image. Every other flag (name, memory, ports, env, mounts, the
 /// trailing command) stays identical either way.
@@ -42,18 +42,38 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
         argv.push(format!("{k}={v}"));
     }
 
+    // The option block is always spelled out, never left to msb's defaults, for two
+    // reasons on top of each other.
+    //
+    // The access token (`ro`/`rw`) carries `FileMount::read_only`, which msb enforces
+    // as a genuine guest-side write block — and it keeps OUR spec parseable on
+    // Windows. msb stages each mount into a temp directory and canonicalizes it,
+    // which there yields the extended-length `\\?\C:\...` form; its splitter skips a
+    // drive prefix only for a bare drive letter, so with no trailing option block it
+    // splits at the drive's colon and rejects the rest of the path as options.
+    //
+    // `nodev` exists because msb then rebuilds an INTERNAL `tag:staged_path[:opts]`
+    // spec for the same mount, carrying over only the non-default option tokens —
+    // `rw` is its default and is dropped, which on Windows strips the internal spec's
+    // option block and re-creates the exact same drive-colon misparse one layer down
+    // (captured: `--mount "fm_…:\\?\C:\…": expected flag or key=value option`).
+    // `nodev` always survives the carry-over, and for a single-file mount it is
+    // meaningless (no device nodes to block): verified against a real msb 0.6.8 —
+    // `rw,nodev` mounts `rw,nodev` and accepts an in-guest write, `ro,nodev` rejects
+    // one with `Read-only file system`.
     for mount in &spec.mounts {
         argv.push("--mount-file".to_string());
         argv.push(format!(
-            "{}:{}",
+            "{}:{}:{},nodev",
             mount.host_path.display(),
-            mount.guest_path
+            mount.guest_path,
+            if mount.read_only { "ro" } else { "rw" }
         ));
     }
 
     match &spec.checkpoint_ref {
         Some(snapshot_ref) => {
-            argv.push("--snapshot".to_string());
+            argv.push("--from-snapshot".to_string());
             argv.push(snapshot_ref.clone());
         }
         None => argv.push(spec.image.clone()),
@@ -123,7 +143,7 @@ pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
     ]
 }
 
-/// Builds the argv for `msb snapshot export <ref> <dest>` — the checkpoint-archive
+/// Builds the argv for `msb snapshot save <ref> <dest>` — the checkpoint-archive
 /// feature's export primitive (`SandboxBackend::export_checkpoint`). Deliberately
 /// never includes `--with-image`: its import fails an integrity check ("raw
 /// manifest digest mismatch") on msb 0.6.6, so archives never bundle the OCI
@@ -132,13 +152,13 @@ pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
 pub fn snapshot_export(snapshot_ref: &str, dest: &Path) -> Vec<String> {
     vec![
         "snapshot".to_string(),
-        "export".to_string(),
+        "save".to_string(),
         snapshot_ref.to_string(),
         dest.display().to_string(),
     ]
 }
 
-/// Builds the argv for `msb snapshot import <archive>` — the checkpoint-archive
+/// Builds the argv for `msb snapshot load <archive>` — the checkpoint-archive
 /// feature's import primitive (`SandboxBackend::import_checkpoint`). Takes no ref
 /// argument: msb's import is content-addressed, unpacking under a digest-derived
 /// directory name this backend resolves separately (see
@@ -146,7 +166,7 @@ pub fn snapshot_export(snapshot_ref: &str, dest: &Path) -> Vec<String> {
 pub fn snapshot_import(archive_path: &Path) -> Vec<String> {
     vec![
         "snapshot".to_string(),
-        "import".to_string(),
+        "load".to_string(),
         archive_path.display().to_string(),
     ]
 }
@@ -276,7 +296,7 @@ mod tests {
                 "-e",
                 "A=1",
                 "--mount-file",
-                "/tmp/f.conf:/etc/f.conf",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
                 "redis:8.6-alpine",
                 "--",
                 "redis-server",
@@ -285,6 +305,32 @@ mod tests {
             ]
         );
         assert!(!cmd.contains(&"-d".to_string()));
+    }
+
+    #[test]
+    fn mount_file_always_carries_an_explicit_access_token() {
+        // Both spellings matter. `ro` is what makes `read_only` mean anything on this
+        // backend, and an always-present token is what keeps the spec parseable on
+        // Windows, where a bare `host:guest` splits at the drive letter's colon.
+        let mut spec = full_spec();
+        spec.mounts = vec![
+            FileMount::new(PathBuf::from("/tmp/rw.conf"), "/etc/rw.conf".to_string()),
+            FileMount::new(PathBuf::from("/tmp/ro.conf"), "/etc/ro.conf".to_string()).read_only(),
+        ];
+        let cmd = run(&spec);
+        assert!(
+            cmd.contains(&"/tmp/rw.conf:/etc/rw.conf:rw,nodev".to_string()),
+            "{cmd:?}"
+        );
+        assert!(
+            cmd.contains(&"/tmp/ro.conf:/etc/ro.conf:ro,nodev".to_string()),
+            "{cmd:?}"
+        );
+        // Never a two-segment spec, whatever the flag says.
+        assert!(
+            !cmd.iter().any(|a| a == "/tmp/rw.conf:/etc/rw.conf"),
+            "{cmd:?}"
+        );
     }
 
     #[test]
@@ -359,8 +405,8 @@ mod tests {
                 "-e",
                 "A=1",
                 "--mount-file",
-                "/tmp/f.conf:/etc/f.conf",
-                "--snapshot",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
+                "--from-snapshot",
                 "rz-ckpt-deadbeefcafe",
                 "--",
                 "redis-server",
@@ -418,7 +464,7 @@ mod tests {
             ),
             vec![
                 "snapshot",
-                "export",
+                "save",
                 "rz-ckpt-deadbeefcafe",
                 "/tmp/cp.archive"
             ]
@@ -434,7 +480,7 @@ mod tests {
         );
         assert_eq!(
             snapshot_import(std::path::Path::new("/tmp/cp.archive")),
-            vec!["snapshot", "import", "/tmp/cp.archive"]
+            vec!["snapshot", "load", "/tmp/cp.archive"]
         );
         assert_eq!(
             snapshot_list(),

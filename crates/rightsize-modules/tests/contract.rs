@@ -19,7 +19,7 @@
 //! - Logs capture workload stdout and forLogMessage waits on them: [`logs_capture_workload_stdout_and_for_log_message_waits_on_them`]
 //! - Stop terminates and frees the container: [`stop_terminates_and_frees_the_container`]
 //! - withCopyFileToContainer round-trips a bundled resource and a host path: [`with_copy_file_to_container_round_trips_a_bundled_resource_and_a_host_path`]
-//! - withCopyFileToContainer default read-only mount rejects an in-guest write: [`default_read_only_mount_rejects_an_in_guest_write`]
+//! - A builder mount is read-write by default and the guest write reaches the host file: [`a_mount_is_read_write_by_default_and_the_guest_write_reaches_the_host_file`]
 //! - followOutput streams lines in order and close halts delivery: [`follow_output_streams_lines_in_order_and_close_halts_delivery`]
 //! - followOutput delivers a final unterminated line after the workload exits: [`follow_output_delivers_a_final_unterminated_line_after_the_workload_exits_exactly_once`]
 //! - Starting a container writes the reaping run record: [`starting_a_container_writes_the_reaping_run_record`]
@@ -63,8 +63,9 @@
 //! - Copy a guest file out, to an absent parent: [`copy_file_from_container_round_trips_a_guest_file`]
 //! - Copy a guest directory out: [`copy_file_from_container_round_trips_a_guest_directory`]
 //!
-//! `read_only_mount_enforced` is a per-backend override: true on docker (enforced),
-//! false on msb (advisory only on 0.6.2).
+//! Mounts are read-write by default, on both backends alike, and a guest write reaches
+//! the host file behind the mount: see
+//! [`a_mount_is_read_write_by_default_and_the_guest_write_reaches_the_host_file`].
 
 #![cfg(feature = "sandbox-it")]
 
@@ -79,6 +80,11 @@ use std::time::{Duration, Instant};
 use rightsize::backend::{BackendProvider, SandboxBackend};
 use rightsize::model::{ContainerSpec, PortBinding};
 use rightsize::{Container, MountableFile, Wait};
+// Feature-gated like the lib's own registration: `rightsize-docker` is unix-only, and
+// a Windows build of this suite selects `--no-default-features --features
+// backend-msb,sandbox-it` (see the msb-windows CI lane), so the crate is never linked
+// there and only the msb arm of `raw_backend_for` exists.
+#[cfg(feature = "backend-docker")]
 use rightsize_docker::DockerBackendProvider;
 use rightsize_msb::MsbBackendProvider;
 
@@ -89,18 +95,6 @@ macro_rules! require_backend {
             return;
         }
     };
-}
-
-/// Whether the currently-requested backend enforces `FileMount::read_only` as a
-/// guest-side write block. `false` only for msb (see
-/// `default_read_only_mount_rejects_an_in_guest_write` below); everything else
-/// (docker, and an unset `RIGHTSIZE_BACKEND` that resolves to docker by priority)
-/// enforces it.
-fn read_only_mount_enforced() -> bool {
-    !matches!(
-        std::env::var("RIGHTSIZE_BACKEND"),
-        Ok(v) if v.eq_ignore_ascii_case("microsandbox") || v.eq_ignore_ascii_case("msb")
-    )
 }
 
 /// Container publishes a TCP port to host loopback (a Python http.server, `for_http`).
@@ -307,39 +301,63 @@ async fn with_copy_file_to_container_round_trips_a_bundled_resource_and_a_host_p
     std::fs::remove_file(&host_file).ok();
 }
 
-/// Default read-only mount (`FileMount::read_only == true` unless overridden) rejects
-/// an in-guest write — enforced on docker; advisory-only (write succeeds) on msb.
+/// A mount made through the builder is read-write (`FileMount::new`'s default), and the
+/// guest write lands on the host file behind it — identically on both backends. The
+/// mount is a view of the host file, not a copy of it: docker binds the host path
+/// directly and msb hard-links it into its staging directory, so the same inode is on
+/// both sides. Callers who need the host copy protected build the mount with
+/// `FileMount::read_only`.
 #[tokio::test]
-async fn default_read_only_mount_rejects_an_in_guest_write() {
+async fn a_mount_is_read_write_by_default_and_the_guest_write_reaches_the_host_file() {
     require_backend!();
-    let host_file = std::env::temp_dir().join(format!("rightsize-ro-{}.txt", std::process::id()));
+    let host_file = std::env::temp_dir().join(format!("rightsize-rw-{}.txt", std::process::id()));
     std::fs::write(&host_file, "seed\n").unwrap();
+    // Two fixture choices keep this test measuring the mount's access mode and nothing
+    // else — both denials below are EACCES, where a read-only mount denies with EROFS,
+    // so leaving either in place would let a permission failure impersonate `:ro`
+    // (exactly what this test's predecessor did).
+    //
+    // World-writable host file: a docker daemon running rootless or with userns-remap
+    // maps container root to an unprivileged host uid, which mode 0644 would block.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
 
+    // Guest path outside /tmp: alpine's /tmp is a world-writable sticky directory, and
+    // Ubuntu kernels ship fs.protected_regular, which denies the shell redirection's
+    // O_CREAT open of another uid's file in such a directory — for root too, mode bits
+    // notwithstanding. Reproduced directly: root, a 0666 file owned by another uid,
+    // sysctl 2 — `> /tmp/f` is EACCES while the same write to /srv succeeds.
     let c = Container::new("alpine:3.19")
         .with_copy_file_to_container(
             MountableFile::for_host_path(host_file.to_str().unwrap()),
-            "/tmp/ro.txt",
+            "/srv/mounted.txt",
         )
         .with_command(&["sleep", "120"])
         .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
     let guard = c.start().await.expect("container must start");
 
     let write = guard
-        .exec(&["sh", "-c", "echo overwritten > /tmp/ro.txt"])
+        .exec(&["sh", "-c", "echo overwritten > /srv/mounted.txt && sync"])
         .await
         .expect("exec must run");
-    if read_only_mount_enforced() {
-        assert_ne!(
-            write.exit_code, 0,
-            "expected read-only mount to reject the write; stderr={}",
-            write.stderr
-        );
-    } else {
-        assert_eq!(
-            write.exit_code, 0,
-            "msb read-only-mount write behavior changed — update read_only_mount_enforced pin"
-        );
-    }
+    assert_eq!(
+        write.exit_code, 0,
+        "a default mount must accept an in-guest write; stderr={}",
+        write.stderr
+    );
+
+    let read_back = guard
+        .exec(&["cat", "/srv/mounted.txt"])
+        .await
+        .expect("exec must run");
+    assert!(
+        read_back.stdout.contains("overwritten"),
+        "the write must be visible in the guest: {:?}",
+        read_back.stdout
+    );
 
     guard.stop().await.unwrap();
     std::fs::remove_file(&host_file).ok();
@@ -499,15 +517,21 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// both backends so this test can run through the shared contract suite.
 fn raw_backend_for(name: &str) -> Box<dyn SandboxBackend> {
     if name == "docker" {
-        DockerBackendProvider
-            .create()
-            .expect("docker backend must construct")
-    } else {
-        MsbBackendProvider.create().expect(
-            "msb backend must construct — provisioning must already have \
-                     happened via an earlier test in this binary",
-        )
+        #[cfg(feature = "backend-docker")]
+        {
+            return DockerBackendProvider
+                .create()
+                .expect("docker backend must construct");
+        }
+        #[cfg(not(feature = "backend-docker"))]
+        // Unreachable in practice: without the feature, `requested_backend_available`
+        // reports docker unsupported and every test gated on it has already skipped.
+        panic!("docker requested but the backend-docker feature is not compiled in");
     }
+    MsbBackendProvider.create().expect(
+        "msb backend must construct — provisioning must already have \
+                 happened via an earlier test in this binary",
+    )
 }
 
 /// Sweep behavior, run through the shared contract suite so BOTH backends get

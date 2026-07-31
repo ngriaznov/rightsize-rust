@@ -32,13 +32,24 @@ use sha2::{Digest, Sha256};
 use crate::platform::Platform;
 use rightsize::error::{Result, RightsizeError};
 
-/// The pinned microsandbox release this crate provisions. Bumping this is the only
-/// change needed to move the whole workspace to a newer msb — asset names, checksums,
-/// and the install-dir path are all derived from it.
-pub const MSB_VERSION: &str = "0.6.6";
+/// The pinned microsandbox release, as a literal so [`DEFAULT_BASE`] can build the
+/// release URL from it at compile time — `concat!` takes literals, not consts, and a
+/// second hand-written copy of the version is exactly the drift this avoids.
+macro_rules! msb_version {
+    () => {
+        "0.6.8"
+    };
+}
 
-const DEFAULT_BASE: &str =
-    "https://github.com/superradcompany/microsandbox/releases/download/v0.6.6";
+/// The pinned microsandbox release this crate provisions. Bumping [`msb_version`] is the
+/// only change needed to move the whole workspace to a newer msb — the release URL, asset
+/// names, checksums, and the install-dir path are all derived from it.
+pub const MSB_VERSION: &str = msb_version!();
+
+const DEFAULT_BASE: &str = concat!(
+    "https://github.com/superradcompany/microsandbox/releases/download/v",
+    msb_version!()
+);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 

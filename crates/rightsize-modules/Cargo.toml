@@ -1,6 +1,6 @@
 [package]
 name = "rightsize-modules"
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,16 +23,21 @@ backend-docker = ["dep:rightsize-docker"]
 sandbox-it = []
 
 [dependencies]
-rightsize = { path = "../rightsize", version = "0.6.0" }
-rightsize-msb = { path = "../rightsize-msb", version = "0.6.0", optional = true }
-rightsize-docker = { path = "../rightsize-docker", version = "0.6.0", optional = true }
+rightsize = { path = "../rightsize", version = "0.6.1" }
+rightsize-msb = { path = "../rightsize-msb", version = "0.6.1", optional = true }
+rightsize-docker = { path = "../rightsize-docker", version = "0.6.1", optional = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 
+# No rightsize-msb/rightsize-docker dev-dependencies: integration tests already see
+# both through the OPTIONAL regular dependencies whenever the matching backend-*
+# feature is on, and a dev-dependency cannot be optional — an unconditional one here
+# forced rightsize-docker (a unix-socket client that does not compile on Windows)
+# into every test build, defeating `--no-default-features --features
+# backend-msb,sandbox-it`, which is exactly how the Windows CI lane builds the
+# contract suite.
 [dev-dependencies]
-rightsize-msb = { path = "../rightsize-msb" }
-rightsize-docker = { path = "../rightsize-docker" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Parses the reaping ledger's run record in the contract suite instead of
 # substring-matching its (pretty-printed) JSON.

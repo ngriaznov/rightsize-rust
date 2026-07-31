@@ -18,7 +18,7 @@ backends, on every change to a `SandboxBackend` implementation.
 | Lifecycle | Start, stop, and idempotence — a second `stop()` on an already-stopped guard is a no-op, not an error. |
 | Host port mapping | A container's exposed port is published to `127.0.0.1` on both backends, readable back via the guard. |
 | Env / command propagation | Environment variables and a custom command are visible inside the running workload. |
-| File copy-in | A bundled resource and a host path both round-trip into the guest at the requested path at start time (`with_copy_file_to_container`); the default mount is read-only. |
+| File copy-in | A bundled resource and a host path both round-trip into the guest at the requested path at start time (`with_copy_file_to_container`); the default mount is read-write, and a guest write reaches the host file behind it. |
 | Runtime file copy | `copyFileToContainer` / `copyContentToContainer` / `copyFileFromContainer` round-trip files, in-memory content, and directories against a RUNNING container on both backends; destination parents are created automatically; both operations require a running container and fail with a typed error otherwise. |
 | Exec | Real exit codes and stderr come back from an in-guest command. |
 | Logs + follow | Captured stdout, `for_log_message` waiting on it, and `follow_output`'s ordered no-duplicate streaming — including each backend's own follow-channel quirk (msb's watchdog-driven tail replay vs. docker's natural stream close). |

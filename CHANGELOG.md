@@ -9,6 +9,64 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.6.1] - 2026-08-01
+
+### Changed
+
+- **The pinned microsandbox release is now 0.6.8** (was 0.6.6). The provisioner
+  downloads and checksum-verifies it automatically, so no action is needed for the
+  usual setup.
+
+  **If you point `MSB_PATH` at your own msb binary, it must be 0.6.8 or newer.**
+  0.6.8 renamed three CLI surfaces this library drives, and the calls it now emits do
+  not exist in 0.6.6:
+
+  | 0.6.6 | 0.6.8 |
+  |---|---|
+  | `run --snapshot <ref>` | `run --from-snapshot <PATH_OR_NAME>` |
+  | `snapshot export <ref> <dest>` | `snapshot save <SNAPSHOT> <OUT>` |
+  | `snapshot import <archive>` | `snapshot load <ARCHIVE> [DEST]` |
+
+  Checkpoint restore and checkpoint archives are the affected features; both fail
+  outright against an older binary rather than degrading quietly.
+
+- **A loaded snapshot's effective ref is now a bare 64-character digest**, where 0.6.6
+  produced a `sha256-<16hex>` directory name. Nothing in the public API changes — the
+  ref was always opaque and content-addressed — but code that pattern-matched the old
+  shape will need updating.
+
+- **`FileMount::read_only` now defaults to `false`**, with a new
+  `FileMount::read_only()` builder as the opt-in, and the flag is genuinely enforced
+  on the microsandbox backend — it previously never reached msb at all, so every
+  mount there was writable regardless of the flag; the docker backend enforced it all
+  along. What a caller observes: a default `with_copy_file_to_container` mount on
+  docker was read-only before and is writable now — call `.read_only()` to get the
+  old docker behavior, which both backends now honor as a guest-side write block.
+  The mount is a view of the host file, not a copy, so a guest write to a default
+  mount reaches the host file itself.
+
+### Fixed
+
+- The Cassandra module's `GPG_KEYS` override remains required: 0.6.8 still aborts
+  before the VM starts on any image whose baked environment contains a tab, verified
+  directly against this release.
+
+- **File mounts work on Windows.** msb 0.6.7 broke every start-time file mount there:
+  its mount-spec parsing splits a token-less spec at the drive letter's colon — on
+  the CLI spec, and again on an internally rebuilt one. Every mount spec this backend
+  emits now carries an explicit `ro`/`rw` token plus `nodev`, keeping both layers
+  parseable. `nodev` is meaningless for a single-file mount.
+
+- **Checkpoint export works on Windows again.** msb 0.6.7/0.6.8 fail every
+  `snapshot save` there with `Access is denied. (os error 5)`: the finished archive
+  is fsynced through a read-only handle one step before the final rename. When
+  exactly that failure occurs with exactly one finished staging file beside the
+  destination, `Checkpoint::export_to` completes the rename itself. Transparent,
+  Windows-only, and self-disabling once msb fixes the fsync.
+
+- **Container boot rides out msb's transient `install operation in progress`
+  refusal** by polling for up to 30 seconds instead of failing on the first attempt.
+
 ## [0.6.0] - 2026-07-28
 
 ### Upgrading from 0.5.0
@@ -529,7 +587,9 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.0...v0.6.1
+[0.6.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.3.0...v0.4.0

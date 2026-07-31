@@ -23,19 +23,27 @@ pub struct FileMount {
     pub host_path: PathBuf,
     /// The absolute path the file appears at inside the guest.
     pub guest_path: String,
-    /// Whether the guest may only read it. Defaults to `true` — mounts are read-only
-    /// unless a caller opts into read-write explicitly.
+    /// Whether the guest may only read it. Defaults to `false` — the guest may write,
+    /// and on both backends a write reaches the host file itself, so opt into
+    /// [`FileMount::read_only`] when the host copy must not be modified.
     pub read_only: bool,
 }
 
 impl FileMount {
-    /// Builds a `FileMount` with the default `read_only: true`.
+    /// Builds a `FileMount` with the default `read_only: false`.
     pub fn new(host_path: impl Into<PathBuf>, guest_path: impl Into<String>) -> Self {
         Self {
             host_path: host_path.into(),
             guest_path: guest_path.into(),
-            read_only: true,
+            read_only: false,
         }
+    }
+
+    /// Returns a copy of this mount with `read_only` set to `true`, so the guest cannot
+    /// modify the host file behind it.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// Returns a copy of this mount with `read_only` set to `false`.
@@ -98,7 +106,7 @@ pub struct ContainerSpec {
     /// `ref` — the checkpoint feature's own signal to the backend that this spec's
     /// `image` is a checkpoint reference, not an ordinary image. docker ignores this
     /// (the ref already IS a normal image tag; the ordinary create path just works);
-    /// microsandbox, when this is set, boots via `msb run --snapshot <ref>`
+    /// microsandbox, when this is set, boots via `msb run --from-snapshot <ref>`
     /// instead of its normal image boot, keeping every other flag identical.
     /// Deliberately NOT part of the reuse identity hash — reuse and
     /// `from_checkpoint` are not a supported combination (see
@@ -153,16 +161,24 @@ mod tests {
     }
 
     #[test]
-    fn file_mount_defaults_to_read_only() {
+    fn file_mount_defaults_to_read_write() {
         let m = FileMount::new("/host/f.txt", "/guest/f.txt");
-        assert!(m.read_only);
+        assert!(!m.read_only);
         assert_eq!(m.host_path, PathBuf::from("/host/f.txt"));
         assert_eq!(m.guest_path, "/guest/f.txt");
     }
 
     #[test]
+    fn file_mount_read_only_flips_the_flag() {
+        let m = FileMount::new("/host/f.txt", "/guest/f.txt").read_only();
+        assert!(m.read_only);
+    }
+
+    #[test]
     fn file_mount_read_write_flips_the_flag() {
-        let m = FileMount::new("/host/f.txt", "/guest/f.txt").read_write();
+        let m = FileMount::new("/host/f.txt", "/guest/f.txt")
+            .read_only()
+            .read_write();
         assert!(!m.read_only);
     }
 

@@ -77,10 +77,11 @@ it doesn't replace ordinary caution about what you hand it in the first place:
   msb.** Without it, a host or CI runner where msb isn't available (no KVM, no
   supported OS) silently falls back to docker, and the untrusted workload runs with
   weaker guarantees than intended, with nothing failing to say so.
-- **Read-only by default.** File mounts are already read-only unless you explicitly
-  call `.read_write()` on them (see [Files & Resources](./core-concepts/files-and-resources.md))
-  — leave untrusted-code mounts read-only unless the workload genuinely needs to
-  write back.
+- **Mounts are read-write by default — protect them explicitly.** A file mount is a
+  view of the host file, not a copy, so a guest write reaches the host file itself
+  (see [Files & Resources](./core-concepts/files-and-resources.md)). For untrusted
+  workloads, call `.read_only()` on the mount unless the workload genuinely needs to
+  write back — both backends enforce it as a guest-side write block.
 
 ## Interaction with other features
 

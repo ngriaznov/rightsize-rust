@@ -2,13 +2,13 @@
 //! imported checkpoint's DIGEST-DIR NAME is actually registered (see
 //! `MsbCliBackend::import_checkpoint`).
 //!
-//! Per the verified contract: `msb snapshot import <archive>` unpacks under a
+//! Per the verified contract: `msb snapshot load <archive>` unpacks under a
 //! DIGEST-DERIVED directory name (e.g. `sha256-b9c0448ee9d54e33`) that is NOT the
 //! full digest and does NOT preserve the archive's original snapshot name. The
 //! full `sha256:<64hex>` digest does NOT resolve as a snapshot ref at all —
 //! `msb snapshot inspect sha256:<full>` fails "snapshot not found" (msb treats it
 //! as a literal path) — only the digest-dir name resolves for `inspect`, `rm`, and
-//! `run --snapshot`. So the effective ref this backend must return is the
+//! `run --from-snapshot`. So the effective ref this backend must return is the
 //! digest-dir name itself; this module's job is only to confirm it via `msb
 //! snapshot list --format json` (matching it against an entry's `name` or
 //! `artifact_path`) and hand it back unchanged.
@@ -32,7 +32,7 @@ struct SnapshotEntry {
     artifact_path: Option<String>,
 }
 
-/// Confirms `digest_dir_name` (the basename of the path `msb snapshot import`
+/// Confirms `digest_dir_name` (the basename of the path `msb snapshot load`
 /// printed — see `MsbCliBackend::import_checkpoint`) is present in `msb snapshot
 /// list --format json`'s output, matching it against an entry's `name` (an exact
 /// match) or `artifact_path` (matched as one of the path's own components — the

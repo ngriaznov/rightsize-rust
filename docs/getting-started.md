@@ -5,8 +5,8 @@
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = "0.6.0"
-rightsize-modules = "0.6.0"
+rightsize = "0.6.1"
+rightsize-modules = "0.6.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -46,7 +46,7 @@ own runtime before doing anything else:
    with a readable `/dev/kvm`). No match — no `msb` build for this platform — and
    provisioning fails with an actionable error naming `RIGHTSIZE_BACKEND=docker` or
    `MSB_PATH` as the way out.
-2. **Download.** The pinned `msb` release (currently `0.6.6`) is fetched from GitHub
+2. **Download.** The pinned `msb` release (currently `0.6.8`) is fetched from GitHub
    releases: the `msb` binary itself, the matching `libkrunfw` asset, and a
    `checksums.sha256` manifest — three separate downloads, over a small blocking
    `ureq` client (this bootstrap runs before any async work, so a blocking HTTP
@@ -58,7 +58,7 @@ own runtime before doing anything else:
    binary's presence is therefore the commit marker for a *complete* install — if
    the process is killed mid-install, the next run detects the half-finished state
    (missing `bin/msb`) and repairs it, rather than trusting a partial install.
-5. **Cache.** Everything lands under `~/.cache/rightsize/msb/0.6.6/` (or
+5. **Cache.** Everything lands under `~/.cache/rightsize/msb/0.6.8/` (or
    `RIGHTSIZE_CACHE_DIR` if you've set it). Every later test run in every project on
    this machine reuses it — no re-download.
 6. **Cross-process lock.** If two `cargo test` processes race to provision the same

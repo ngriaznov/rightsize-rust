@@ -137,7 +137,7 @@ impl Container {
     /// Sets both `image` and [`crate::model::ContainerSpec::checkpoint_ref`] to
     /// `cp.ref` — docker ignores the latter (the ref already is a normal image tag,
     /// so the ordinary create path just works); microsandbox, when it's set, boots
-    /// via `msb run --snapshot <ref>` instead of its normal image boot. `start()`
+    /// via `msb run --from-snapshot <ref>` instead of its normal image boot. `start()`
     /// refuses before any backend work — [`RightsizeError::CheckpointBackendMismatch`]
     /// — if the active backend's name doesn't match `cp.backend`, and
     /// [`RightsizeError::ReuseCheckpointConflict`] if `.reuse(true)` is also active,
@@ -212,8 +212,12 @@ impl Container {
         self
     }
 
-    /// Mounts `file` read-only into the guest at `guest_path`; takes effect at the next
-    /// `start()`.
+    /// Mounts `file` read-write into the guest at `guest_path` ([`FileMount::new`]'s
+    /// default); takes effect at the next `start()`. The mount is a view of the host
+    /// file, not a copy — docker binds the host path directly, msb hard-links it into
+    /// its staging directory — so a guest write reaches the host file itself, on both
+    /// backends. A mount built with [`FileMount::read_only`] blocks guest writes
+    /// (`Read-only file system`), enforced by both backends.
     pub fn with_copy_file_to_container(mut self, file: MountableFile, guest_path: &str) -> Self {
         self.mounts.push(FileMount::new(file.path(), guest_path));
         self
@@ -1809,7 +1813,7 @@ impl Checkpoint {
     /// Exports this checkpoint to a portable archive at `path`: a plain tar
     /// containing pinned JSON metadata (`checkpoint.json`) plus the backend's own
     /// checkpoint payload (`artifact`), written byte-for-byte exactly as the
-    /// backend CLI produced it (msb's `snapshot export`; docker's `docker save`).
+    /// backend CLI produced it (msb's `snapshot save`; docker's `docker save`).
     /// See the checkpoints docs' "Moving checkpoints between machines" section for
     /// the full story — the destination machine pulls the image fresh on first
     /// boot rather than the archive bundling it, size expectations, and the msb

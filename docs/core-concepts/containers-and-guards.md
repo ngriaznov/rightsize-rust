@@ -33,7 +33,7 @@ The builder surface, as it exists today:
 | `.with_command(&[..])` | Overrides the image's default entrypoint/command. |
 | `.with_network(&net)` | Joins an `Arc<Network>` — see [Networking](./networking.md). |
 | `.with_network_aliases(&[..])` | Names this container is reachable as on its network. |
-| `.with_copy_file_to_container(file, guest_path)` | Mounts a `MountableFile` read-only into the guest — see [Files & Resources](./files-and-resources.md). |
+| `.with_copy_file_to_container(file, guest_path)` | Mounts a `MountableFile` read-write into the guest; the mount is a view of the host file, so guest writes reach it — see [Files & Resources](./files-and-resources.md). |
 | `.waiting_for(strategy)` | Overrides the readiness check; defaults to `Wait::for_listening_port()`. |
 | `.with_memory_limit(megabytes)` | Caps guest memory. Unset means "each backend's own default" — see [Files & Resources](./files-and-resources.md#memory-limits-when-and-why). |
 | `.start()` | Consumes the builder, returns `Result<ContainerGuard>`. |

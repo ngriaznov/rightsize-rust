@@ -53,7 +53,7 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(300);
 /// I/O over a (typically sparse, small) rootfs, but generous headroom matters more
 /// than tightness here since a slow step must not spuriously fail a checkpoint.
 const CHECKPOINT_STEP_TIMEOUT: Duration = Duration::from_secs(120);
-/// `msb snapshot export`/`snapshot import`/`snapshot list` — moving a
+/// `msb snapshot save`/`snapshot load`/`snapshot list` — moving a
 /// (zstd-compressed, typically small) disk snapshot artifact to/from an archive
 /// file. Same generous headroom as [`COPY_TIMEOUT`]: a slow disk must not
 /// spuriously fail an export/import.
@@ -352,7 +352,7 @@ fn is_snapshot_not_found(output: &str) -> bool {
     output.to_lowercase().contains("snapshot not found")
 }
 
-/// True if `output` (an `msb snapshot import` child's combined stdout/stderr)
+/// True if `output` (an `msb snapshot load` child's combined stdout/stderr)
 /// names msb's "already imported" wording — `error: snapshot already exists:
 /// <path>`. For a content-addressed archive this IS success: the artifact is
 /// already sitting there under its digest-derived directory, so
@@ -362,7 +362,90 @@ fn is_snapshot_already_exists(output: &str) -> bool {
     output.to_lowercase().contains("snapshot already exists")
 }
 
-/// Parses the digest-derived directory name `msb snapshot import` unpacked into,
+/// True if `stderr` (an `msb snapshot save` invocation's) carries Windows'
+/// `ERROR_ACCESS_DENIED`, the signature of msb 0.6.7/0.6.8's unconditional
+/// snapshot-save failure on Windows.
+///
+/// msb's own `save_snapshot` writes the finished archive to a staging file beside
+/// the destination, reopens that staging file READ-ONLY, and calls `sync_all` on
+/// the handle before renaming it into place. On Windows `sync_all` is
+/// `FlushFileBuffers`, which requires write access on the handle, so it fails with
+/// error 5 every single time and the rename never runs. `fsync` on a read-only
+/// descriptor is legal on Unix, so Linux and macOS never see this; msb 0.6.6 wrote
+/// straight to the destination with no fsync step at all, which is why it is new.
+/// Captured from a `windows-2025` hosted runner:
+///
+/// ```text
+/// msb snapshot save rz-ckpt-fccd7568-archive C:\Users\RUNNER~1\AppData\Local\Temp\rightsize-archive-export-8980-1-1785507050813959600\artifact failed (exit 1): error: io error: Access is denied. (os error 5)
+/// ```
+///
+/// Matches on the `(os error 5)` suffix, never on the message text: Rust renders
+/// Windows error text through `FormatMessage`, so "Access is denied." is whatever
+/// the machine's display language says, while the numeric suffix is appended by
+/// Rust itself and reads the same on every locale. The closing parenthesis is part
+/// of the needle so a two-digit code in the fifties (`os error 53`, a missing
+/// network path) cannot match on its first digit.
+fn is_archive_fsync_access_denied(stderr: &str) -> bool {
+    stderr.contains("(os error 5)")
+}
+
+/// Moves the staging file msb left behind next to `dest` onto `dest` itself,
+/// finishing the rename msb's own `save_snapshot` was about to perform when its
+/// fsync failed (see [`is_archive_fsync_access_denied`]). Returns whether the
+/// destination is now in place.
+///
+/// msb names that staging file `.<dest file name>.tmp.<msb pid>.<unix nanos>` and
+/// removes it only when the archive WRITE fails — not when the fsync fails. So on
+/// the error this works around, a complete, valid archive is sitting in the
+/// destination's own directory under that name, and putting it where msb meant to
+/// put it is the whole repair.
+///
+/// Requires EXACTLY ONE candidate. Every export this library performs targets a
+/// freshly created staging directory it owns outright (see
+/// `rightsize::archive::TempStagingDir`), so one candidate is what the worked-around
+/// failure always leaves; zero means the archive never got written, and two or more
+/// means something other than this failure produced them — in both cases picking one
+/// would be a guess, so neither is salvaged and the original error stands.
+fn salvage_archive_staging_file(dest: &Path) -> bool {
+    let (Some(parent), Some(dest_name)) = (dest.parent(), dest.file_name()) else {
+        return false;
+    };
+    let Some(dest_name) = dest_name.to_str() else {
+        return false;
+    };
+    let prefix = format!(".{dest_name}.tmp.");
+
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    // Every entry has to be readable, and a matching one has to be a regular file.
+    // An entry this scan skipped could be a second candidate, which would turn an
+    // ambiguous directory into a confident one-candidate salvage; a directory under
+    // the staging name would consume the single-candidate slot outright. Neither is
+    // the failure being worked around, so both decline rather than guess.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        let matches_prefix = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix));
+        if !matches_prefix {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return false;
+        }
+        candidates.push(entry.path());
+    }
+
+    let [candidate] = candidates.as_slice() else {
+        return false;
+    };
+    std::fs::rename(candidate, dest).is_ok()
+}
+
+/// Parses the digest-derived directory name `msb snapshot load` unpacked into,
 /// out of its own printed output — verified contract: on both a fresh import and
 /// an already-exists "success", the last non-empty printed line ends with the
 /// artifact path, and that path's OWN basename (not a file inside it) is the
@@ -381,6 +464,32 @@ fn parse_import_digest_dir_name(output: &str) -> Option<String> {
 /// concurrent invocation's migration transaction to commit; the retry's own `msb run`
 /// startup dwarfs this either way.
 const STATE_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// True if `output` (an `msb run` invocation's combined output) is msb refusing to run
+/// anything while its internal install lock is held. Captured verbatim from a
+/// windows-2025 hosted runner, mid-suite with ordinary boots succeeding on both sides
+/// of the failure:
+///
+/// ```text
+/// error: runtime error: microsandbox install operation in progress until
+/// 2026-07-31 20:35:23.760135600; retry after it completes
+/// ```
+///
+/// The deadline in the message reads ~30 minutes out, but every captured occurrence
+/// cleared within the same run — boots seconds later succeeded — so the boot path
+/// polls briefly (see [`spawn_and_await_running`]) instead of failing on the first
+/// refusal or trusting the deadline. Matches on the stable phrase only; the timestamp
+/// varies per occurrence.
+fn is_msb_install_lock_active(output: &str) -> bool {
+    output.contains("install operation in progress")
+}
+
+/// How long the boot path keeps polling while msb's install-operation lock is held,
+/// and the pause between attempts (see [`is_msb_install_lock_active`]) — observed
+/// clearing within seconds despite the message's ~30-minute deadline, so a short
+/// budget covers the real cases and a lock outliving it is surfaced as stuck.
+const INSTALL_LOCK_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const INSTALL_LOCK_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[async_trait::async_trait]
 impl SandboxBackend for MsbCliBackend {
@@ -713,7 +822,7 @@ impl SandboxBackend for MsbCliBackend {
 
     /// Disk-snapshot checkpointing: `msb stop <name>` → `msb snapshot create --from
     /// <name> rz-ckpt-<nonce>` → `msb rm <name>` → a fresh ATTACHED `msb run
-    /// --snapshot <ref>` re-boot under the same name/ports/env/memory — see
+    /// --from-snapshot <ref>` re-boot under the same name/ports/env/memory — see
     /// `msb_checkpoint_cycle` for the orchestration and its own unit tests for the
     /// failure paths. Runs on a blocking thread, like every other multi-step msb
     /// invocation in this backend. The re-boot reuses [`spawn_and_await_running`],
@@ -815,36 +924,43 @@ impl SandboxBackend for MsbCliBackend {
         )))
     }
 
-    /// `msb snapshot export <ref> <dest>` (never `--with-image` — see
+    /// `msb snapshot save <ref> <dest>` (never `--with-image` — see
     /// `crate::commands::snapshot_export`'s own doc for why) — the
     /// checkpoint-archive feature's export primitive
-    /// (`rightsize::Checkpoint::export_to`).
+    /// (`rightsize::Checkpoint::export_to`), with the Windows salvage described by
+    /// [`salvage_archive_staging_file`] wired in as
+    /// [`msb_export_checkpoint_cycle`]'s recovery step. The Windows gate is
+    /// `cfg!(windows)` rather than `#[cfg(windows)]` so the salvage and its
+    /// classifier stay compiled — and unit-tested — on every host, and only
+    /// whether they are REACHED is platform-specific. Off Windows the fsync msb
+    /// gets wrong is a legal operation, so the failure cannot arise there and
+    /// salvaging would only paper over a genuinely different bug.
     async fn export_checkpoint(&self, checkpoint_ref: &str, dest: &Path) -> Result<()> {
         let msb = self.msb.clone();
         let snapshot_ref = checkpoint_ref.to_string();
         let dest = dest.to_path_buf();
-        let dest_for_error = dest.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            invoke_standalone(
-                &msb,
-                &commands::snapshot_export(&snapshot_ref, &dest),
-                ARCHIVE_TIMEOUT,
-            )
+        tokio::task::spawn_blocking(move || {
+            let mut invoke_export = || {
+                invoke_standalone(
+                    &msb,
+                    &commands::snapshot_export(&snapshot_ref, &dest),
+                    ARCHIVE_TIMEOUT,
+                )
+            };
+            let mut salvage = |dest: &Path| {
+                if cfg!(windows) {
+                    salvage_archive_staging_file(dest)
+                } else {
+                    false
+                }
+            };
+            msb_export_checkpoint_cycle(&mut invoke_export, &mut salvage, &snapshot_ref, &dest)
         })
         .await
-        .map_err(|e| RightsizeError::Backend(format!("checkpoint export task panicked: {e}")))??;
-        if result.exit_code != 0 {
-            return Err(RightsizeError::Backend(format!(
-                "msb snapshot export {checkpoint_ref} {} failed (exit {}): {}",
-                dest_for_error.display(),
-                result.exit_code,
-                result.stderr.trim()
-            )));
-        }
-        Ok(())
+        .map_err(|e| RightsizeError::Backend(format!("checkpoint export task panicked: {e}")))?
     }
 
-    /// `msb snapshot import <src_file>`, treating "already exists" as success,
+    /// `msb snapshot load <src_file>`, treating "already exists" as success,
     /// then `msb snapshot list --format json` to confirm the imported snapshot's
     /// DIGEST-DIR NAME is registered — the checkpoint-archive feature's import
     /// primitive (`rightsize::Checkpoint::import_from`). `ref_hint` (the archive
@@ -921,6 +1037,7 @@ fn shell_single_quote(s: &str) -> String {
 enum PreRunningFailure {
     CacheCorruption { output: String },
     StateDbError { output: String },
+    InstallLockActive { output: String },
     Other(RightsizeError),
 }
 
@@ -945,6 +1062,41 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
     match try_spawn_and_await_running(msb, spec) {
         Ok(child) => Ok(child),
         Err(PreRunningFailure::Other(e)) => Err(e),
+        Err(PreRunningFailure::InstallLockActive { output }) => {
+            // msb refuses `run` outright while its internal install lock is held (see
+            // is_msb_install_lock_active). The message names a deadline ~30 minutes out,
+            // but both captured occurrences cleared within the same test run — boots
+            // seconds later succeeded — so this polls briefly rather than trusting the
+            // deadline. The budget expiring surfaces the last refusal: a lock held that
+            // long really is stuck, and waiting here would only hide it.
+            let deadline = std::time::Instant::now() + INSTALL_LOCK_RETRY_BUDGET;
+            let mut last = output;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(RightsizeError::Backend(format!(
+                        "msb run for sandbox {} was refused for {}s by msb's \
+                         install-operation lock — both observed occurrences cleared within \
+                         seconds, so a lock held this long looks like a genuinely stuck msb \
+                         install on this host.\n{last}",
+                        spec.name,
+                        INSTALL_LOCK_RETRY_BUDGET.as_secs(),
+                    )));
+                }
+                std::thread::sleep(INSTALL_LOCK_RETRY_DELAY);
+                match try_spawn_and_await_running(msb, spec) {
+                    Ok(child) => return Ok(child),
+                    Err(PreRunningFailure::InstallLockActive { output }) => last = output,
+                    Err(PreRunningFailure::Other(e)) => return Err(e),
+                    Err(PreRunningFailure::StateDbError { output })
+                    | Err(PreRunningFailure::CacheCorruption { output }) => {
+                        return Err(RightsizeError::Backend(format!(
+                            "msb run for sandbox {} exited before reaching Running:\n{output}",
+                            spec.name,
+                        )));
+                    }
+                }
+            }
+        }
         Err(PreRunningFailure::StateDbError { output }) => {
             // Usually the startup-migration race, transient by construction (see
             // is_msb_state_db_error): the winning msb invocation's migration commits
@@ -964,7 +1116,12 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
                          host.\nfirst attempt:\n{output}\nafter retry:\n{retry_output}",
                     spec.name,
                 ))),
+                // A different classified transient on the retry is not this arm's to
+                // untangle — surface it plainly rather than nesting retry policies.
                 Err(PreRunningFailure::CacheCorruption {
+                    output: retry_output,
+                })
+                | Err(PreRunningFailure::InstallLockActive {
                     output: retry_output,
                 }) => Err(RightsizeError::Backend(format!(
                     "msb run for sandbox {} exited before reaching Running:\n{retry_output}",
@@ -978,7 +1135,12 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
             match try_spawn_and_await_running(msb, spec) {
                 Ok(child) => Ok(child),
                 Err(PreRunningFailure::Other(e)) => Err(e),
+                // A different classified transient on the retry is not this arm's to
+                // untangle — surface it plainly rather than nesting retry policies.
                 Err(PreRunningFailure::StateDbError {
+                    output: retry_output,
+                })
+                | Err(PreRunningFailure::InstallLockActive {
                     output: retry_output,
                 }) => Err(RightsizeError::Backend(format!(
                     "msb run for sandbox {} exited before reaching Running:\n{retry_output}",
@@ -1055,6 +1217,8 @@ fn try_spawn_and_await_running(
                 PreRunningFailure::CacheCorruption { output }
             } else if is_msb_state_db_error(&output) {
                 PreRunningFailure::StateDbError { output }
+            } else if is_msb_install_lock_active(&output) {
+                PreRunningFailure::InstallLockActive { output }
             } else if is_port_bind_conflict(&output) {
                 PreRunningFailure::Other(RightsizeError::PortBindConflict {
                     message: format!(
@@ -1247,7 +1411,7 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
 /// `ERROR_ACCESS_DENIED` whenever msb runs inside a job object that doesn't grant
 /// breakaway rights, which is exactly a Gradle/cargo test process on a Windows CI
 /// runner. The denial is deterministic, not transient, so no retry fixes it.
-/// Attached `msb run` (this backend's normal boot, including `--snapshot` boots)
+/// Attached `msb run` (this backend's normal boot, including `--from-snapshot` boots)
 /// has no such problem, so once the snapshot exists, the stopped sandbox is
 /// removed and this backend's own create/boot path re-creates it from that
 /// snapshot instead of resuming it.
@@ -1310,6 +1474,40 @@ fn msb_checkpoint_cycle<T>(
     })
 }
 
+/// Orchestrates the checkpoint-archive feature's export: one `msb snapshot save`
+/// via `invoke_export`, and — only when that fails with Windows' access-denied
+/// signature (see [`is_archive_fsync_access_denied`]) — one attempt at `salvage`,
+/// which succeeding means the archive is at `dest` after all. Both are injected,
+/// mirroring [`msb_import_checkpoint_cycle`]'s own shape, so this orchestration is
+/// unit-testable on every platform without a real `msb` binary and without touching
+/// the filesystem.
+///
+/// Any other nonzero exit — and an access-denied exit whose salvage finds nothing to
+/// move — surfaces msb's own exit code and stderr unchanged. The workaround is
+/// self-disabling: once msb fsyncs a writable handle, the error stops occurring and
+/// `salvage` is never reached again, so nothing here is tied to a particular msb
+/// version.
+fn msb_export_checkpoint_cycle(
+    invoke_export: &mut dyn FnMut() -> Result<ExecResult>,
+    salvage: &mut dyn FnMut(&Path) -> bool,
+    checkpoint_ref: &str,
+    dest: &Path,
+) -> Result<()> {
+    let result = invoke_export()?;
+    if result.exit_code == 0 {
+        return Ok(());
+    }
+    if is_archive_fsync_access_denied(&result.stderr) && salvage(dest) {
+        return Ok(());
+    }
+    Err(RightsizeError::Backend(format!(
+        "msb snapshot save {checkpoint_ref} {} failed (exit {}): {}",
+        dest.display(),
+        result.exit_code,
+        result.stderr.trim()
+    )))
+}
+
 /// Orchestrates the checkpoint-archive feature's import cycle: `msb snapshot
 /// import` (treating "already exists" as success — see
 /// [`is_snapshot_already_exists`]) then `msb snapshot list --format json` to
@@ -1333,7 +1531,7 @@ fn msb_import_checkpoint_cycle(
     let combined = format!("{}\n{}", import_result.stdout, import_result.stderr);
     if import_result.exit_code != 0 && !is_snapshot_already_exists(&combined) {
         return Err(RightsizeError::Backend(format!(
-            "msb snapshot import failed (exit {}): {}",
+            "msb snapshot load failed (exit {}): {}",
             import_result.exit_code,
             import_result.stderr.trim()
         )));
@@ -1341,7 +1539,7 @@ fn msb_import_checkpoint_cycle(
 
     let digest_dir_name = parse_import_digest_dir_name(&combined).ok_or_else(|| {
         RightsizeError::Backend(format!(
-            "msb snapshot import succeeded but its output did not end with a recognizable \
+            "msb snapshot load succeeded but its output did not end with a recognizable \
              artifact path to resolve a digest from:\n{combined}"
         ))
     })?;
@@ -2001,6 +2199,240 @@ mod tests {
         ));
     }
 
+    /// The stderr of the failure being worked around, captured verbatim from a
+    /// `windows-2025` hosted runner — every `msb snapshot save` on msb 0.6.7/0.6.8
+    /// ends this way (see [`is_archive_fsync_access_denied`]).
+    const CAPTURED_WINDOWS_SAVE_FAILURE: &str = "msb snapshot save rz-ckpt-fccd7568-archive C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\rightsize-archive-export-8980-1-1785507050813959600\\artifact failed (exit 1): error: io error: Access is denied. (os error 5)";
+
+    #[test]
+    fn is_archive_fsync_access_denied_matches_the_captured_windows_save_failure() {
+        assert!(is_archive_fsync_access_denied(
+            CAPTURED_WINDOWS_SAVE_FAILURE
+        ));
+        // The classifier reads the numeric suffix Rust appends itself, so a machine
+        // whose display language renders the message differently classifies the same.
+        assert!(is_archive_fsync_access_denied(
+            "error: io error: Zugriff verweigert. (os error 5)"
+        ));
+    }
+
+    #[test]
+    fn is_archive_fsync_access_denied_ignores_other_snapshot_save_failures() {
+        // A save that failed for a real reason must surface as itself — nothing to
+        // salvage, and the staging file this workaround looks for was never left.
+        assert!(!is_archive_fsync_access_denied(
+            "error: snapshot not found: rz-ckpt-fccd7568-archive"
+        ));
+        assert!(!is_archive_fsync_access_denied(
+            "error: io error: The system cannot find the path specified. (os error 3)"
+        ));
+        // Shares error 5's leading digit — the needle's closing parenthesis is what
+        // keeps it out.
+        assert!(!is_archive_fsync_access_denied(
+            "error: io error: The network path was not found. (os error 53)"
+        ));
+        assert!(!is_archive_fsync_access_denied(""));
+    }
+
+    #[test]
+    fn salvage_archive_staging_file_moves_the_single_staging_file_onto_the_destination() {
+        let dir = unique_test_dir("archive-salvage-one");
+        let dest = dir.join("artifact");
+        let staging = dir.join(".artifact.tmp.8980.1785507050813959600");
+        std::fs::write(&staging, b"complete archive bytes").unwrap();
+
+        assert!(
+            salvage_archive_staging_file(&dest),
+            "one staging file beside the destination is exactly the shape msb's failed \
+             fsync leaves behind"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"complete archive bytes");
+        assert!(
+            !staging.exists(),
+            "the staging file is moved, not copied — msb's own rename would have \
+             consumed it too"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn salvage_archive_staging_file_reports_failure_when_there_is_no_staging_file() {
+        let dir = unique_test_dir("archive-salvage-none");
+        let dest = dir.join("artifact");
+        // A sibling that is not a staging file for this destination must not tempt it.
+        std::fs::write(dir.join("unrelated"), b"x").unwrap();
+
+        assert!(!salvage_archive_staging_file(&dest));
+        assert!(
+            !dest.exists(),
+            "nothing to salvage means nothing is created either"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn salvage_archive_staging_file_refuses_to_guess_between_two_staging_files() {
+        let dir = unique_test_dir("archive-salvage-two");
+        let dest = dir.join("artifact");
+        let first = dir.join(".artifact.tmp.8980.1785507050813959600");
+        let second = dir.join(".artifact.tmp.9042.1785507061112223344");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        assert!(
+            !salvage_archive_staging_file(&dest),
+            "two candidates is not the failure being worked around; picking one would \
+             be a guess"
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn msb_export_checkpoint_cycle_surfaces_an_unrelated_failure_without_salvaging() {
+        let mut salvage_attempts = 0usize;
+        let result = {
+            let mut invoke_export = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "error: snapshot not found: rz-ckpt-fccd7568-archive".to_string(),
+                })
+            };
+            let mut salvage = |_: &Path| {
+                salvage_attempts += 1;
+                true
+            };
+            msb_export_checkpoint_cycle(
+                &mut invoke_export,
+                &mut salvage,
+                "rz-ckpt-fccd7568-archive",
+                Path::new("/tmp/rightsize-archive-export/artifact"),
+            )
+        };
+        let err = result.expect_err("a failure that isn't the Windows fsync bug must propagate");
+        let message = err.to_string();
+        assert!(
+            message.contains("msb snapshot save rz-ckpt-fccd7568-archive"),
+            "{message}"
+        );
+        assert!(message.contains("exit 1"), "{message}");
+        assert!(
+            message.contains("error: snapshot not found: rz-ckpt-fccd7568-archive"),
+            "{message}"
+        );
+        assert_eq!(
+            salvage_attempts, 0,
+            "salvage is reserved for the one failure it was written for"
+        );
+    }
+
+    /// The captured `msb snapshot save` stderr from a windows-2025 runner, whose
+    /// only distinguishing mark is the errno suffix Rust appends.
+    const WINDOWS_FSYNC_SAVE_STDERR: &str = "error: io error: Access is denied. (os error 5)";
+
+    #[test]
+    fn msb_export_checkpoint_cycle_reports_success_once_the_staging_file_is_salvaged() {
+        let mut salvage_attempts = 0usize;
+        let result = {
+            let mut invoke_export = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: WINDOWS_FSYNC_SAVE_STDERR.to_string(),
+                })
+            };
+            let mut salvage = |_: &Path| {
+                salvage_attempts += 1;
+                true
+            };
+            msb_export_checkpoint_cycle(
+                &mut invoke_export,
+                &mut salvage,
+                "rz-ckpt-fccd7568-archive",
+                Path::new("/tmp/rightsize-archive-export/artifact"),
+            )
+        };
+        result.expect("a salvaged archive is a completed export, not a failure");
+        assert_eq!(salvage_attempts, 1);
+    }
+
+    #[test]
+    fn msb_export_checkpoint_cycle_surfaces_the_original_error_when_the_salvage_declines() {
+        // The predicate matching is not on its own enough: if the staging file is
+        // absent or ambiguous the salvage declines, and msb's own error is still
+        // the truthful outcome.
+        let mut salvage_attempts = 0usize;
+        let result = {
+            let mut invoke_export = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: WINDOWS_FSYNC_SAVE_STDERR.to_string(),
+                })
+            };
+            let mut salvage = |_: &Path| {
+                salvage_attempts += 1;
+                false
+            };
+            msb_export_checkpoint_cycle(
+                &mut invoke_export,
+                &mut salvage,
+                "rz-ckpt-fccd7568-archive",
+                Path::new("/tmp/rightsize-archive-export/artifact"),
+            )
+        };
+        let message = result
+            .expect_err("a declined salvage must not be reported as a successful export")
+            .to_string();
+        assert!(message.contains(WINDOWS_FSYNC_SAVE_STDERR), "{message}");
+        assert_eq!(salvage_attempts, 1);
+    }
+
+    #[test]
+    fn salvage_archive_staging_file_ignores_a_directory_carrying_the_staging_name() {
+        // msb writes a regular file there; a directory under that name would
+        // otherwise consume the single-candidate slot.
+        let dir = unique_test_dir("archive-salvage-dir");
+        let dest = dir.join("artifact");
+        std::fs::create_dir(dir.join(".artifact.tmp.8980.1785507050813959600")).unwrap();
+
+        assert!(!salvage_archive_staging_file(&dest));
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_msb_install_lock_active_matches_the_captured_refusal_verbatim() {
+        // Captured from a windows-2025 hosted runner: `msb run` refused mid-suite while
+        // msb's internal install lock was held, ordinary boots succeeding on both sides.
+        assert!(is_msb_install_lock_active(
+            "error: runtime error: microsandbox install operation in progress until 2026-07-31 20:35:23.760135600; retry after it completes"
+        ));
+        // The deadline timestamp varies per occurrence; the classifier keys on the
+        // stable phrase only.
+        assert!(is_msb_install_lock_active(
+            "error: runtime error: microsandbox install operation in progress until 2027-01-01 00:00:00.000000000; retry after it completes"
+        ));
+    }
+
+    #[test]
+    fn is_msb_install_lock_active_ignores_other_runtime_errors() {
+        assert!(!is_msb_install_lock_active(
+            "error: runtime error: something else entirely"
+        ));
+        assert!(!is_msb_install_lock_active(
+            "error: failed to start \"rz-abc-1\""
+        ));
+        assert!(!is_msb_install_lock_active(""));
+    }
+
     #[test]
     fn is_msb_state_db_error_matches_the_captured_race_shapes_verbatim() {
         // Both captured verbatim from a real msb 0.6.3 Windows binary: the spawned
@@ -2229,7 +2661,6 @@ mod tests {
         script
     }
 
-    #[cfg(unix)]
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2374,7 +2805,7 @@ mod tests {
 
     // ---- checkpoint-archive export/import against a fake msb binary ----
 
-    /// Writes a stub `msb` replacement that answers `snapshot export`, `snapshot
+    /// Writes a stub `msb` replacement that answers `snapshot save`, `snapshot
     /// import`, and `snapshot list --format json` — the three subcommands
     /// `export_checkpoint`/`import_checkpoint` drive. `import_exit_code`/
     /// `import_stderr` let a test choose between a fresh-import success (exit 0)
@@ -2392,11 +2823,11 @@ mod tests {
         let body = format!(
             "#!/bin/sh\n\
              case \"$1 $2\" in\n\
-             \"snapshot export\")\n\
+             \"snapshot save\")\n\
              printf 'fake-export-payload:%s' \"$3\" > \"$4\"\n\
              exit 0\n\
              ;;\n\
-             \"snapshot import\")\n\
+             \"snapshot load\")\n\
              echo '{import_stderr}' 1>&2\n\
              echo 'Imported to /home/u/.microsandbox/snapshots/sha256-fakedigest1234'\n\
              exit {import_exit_code}\n\

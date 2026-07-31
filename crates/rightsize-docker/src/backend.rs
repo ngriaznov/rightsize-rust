@@ -1352,13 +1352,15 @@ mod tests {
     #[test]
     fn build_create_body_honors_mount_read_only_flag() {
         let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        // A plain `new` mount is read-write — the default — and `read_only()` is the
+        // opt-in. Both spellings are pinned so neither default nor override can drift.
         spec.mounts
             .push(rightsize::model::FileMount::new("/host/a", "/guest/a"));
         spec.mounts
-            .push(rightsize::model::FileMount::new("/host/b", "/guest/b").read_write());
+            .push(rightsize::model::FileMount::new("/host/b", "/guest/b").read_only());
         let body = serialize(&spec);
-        assert!(body.contains("/host/a:/guest/a:ro"));
-        assert!(body.contains("/host/b:/guest/b:rw"));
+        assert!(body.contains("/host/a:/guest/a:rw"), "{body}");
+        assert!(body.contains("/host/b:/guest/b:ro"), "{body}");
     }
 
     #[test]

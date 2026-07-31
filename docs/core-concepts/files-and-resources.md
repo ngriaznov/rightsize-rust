@@ -31,12 +31,13 @@ Two constructors:
   loud and specific, not with a generic "file not found" from deep inside the
   backend.
 
-Mounts default to **read-only** (`FileMount::new` sets `read_only: true`); call
-`.read_write()` on the `FileMount` if the guest genuinely needs to write to it. See
-[Backend differences](../backends.md#backend-differences) for a real gap here: on
-microsandbox 0.6.2, `read_only` is currently advisory only — the guest gets a
-writable mount regardless of the flag. Don't rely on guest-side write protection
-under `RIGHTSIZE_BACKEND=microsandbox`; Docker enforces it genuinely.
+Mounts default to **read-write** (`FileMount::new` sets `read_only: false`), and the
+mount is a view of the host file, not a copy of it — the docker backend binds the
+host path directly, the msb backend hard-links it into its staging directory — so a
+guest write reaches the host file itself. If the host copy must not be modified, call
+`.read_only()` on the `FileMount`; both backends then block guest writes (an in-guest
+write fails with `Read-only file system`). `.read_write()` is the explicit spelling
+of the default.
 
 ## Memory limits — when and why
 

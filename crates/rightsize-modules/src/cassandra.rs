@@ -5,7 +5,7 @@
 //! `cassandra:5.0.8`'s baked env includes a `GPG_KEYS` value containing a literal TAB
 //! character (a package-signing key list built with tab-separated continuation,
 //! same shape as the `DOCKER_PG_LLVM_DEPS`/`postgres:*-alpine` case documented on
-//! [`crate::postgres::PostgresContainer`]). msb 0.6.6's krun VMM builder panics on any
+//! [`crate::postgres::PostgresContainer`]). msb's krun VMM builder — 0.6.6 and the pinned 0.6.8 alike — panics on any
 //! baked env value containing a control character, and it panics *before the guest
 //! ever boots* — reproduced directly, identical `msb run` invocation:
 //!

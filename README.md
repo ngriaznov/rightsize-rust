@@ -50,8 +50,8 @@ transport-routing risk.
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = "0.6.0"
-rightsize-modules = "0.6.0"
+rightsize = "0.6.1"
+rightsize-modules = "0.6.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -152,10 +152,10 @@ backend-specific rather than behavioral divergences:
 
 - **Network-alias tunnels on microsandbox have real limits** versus Docker's
   native bridge networking - see [Networking](#networking).
-- **Read-only file mounts aren't enforced in-guest on microsandbox 0.6.2.**
-  `FileMount::read_only` is honored by Docker; on microsandbox the guest currently
-  gets a writable mount regardless. Don't rely on guest-side write protection
-  under `RIGHTSIZE_BACKEND=microsandbox`.
+- **File mounts are read-write by default and behave identically on both
+  backends.** The mount is a view of the host file — a guest write reaches the
+  host file itself. Call `.read_only()` on a `FileMount` to block guest writes;
+  both backends enforce it (`Read-only file system` in-guest).
 - **`follow_output` delivers the same ordered, no-duplicate log stream on both
   backends**, but on microsandbox the final tail can arrive shortly after the
   sandbox reports stopped, rather than exactly at stream EOF (`msb logs -f`

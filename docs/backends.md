@@ -151,11 +151,13 @@ recognize it without string-matching at the core layer.
 The two backends are contract-equivalent on everything the shared suite exercises,
 but a few edges are real, not just timing quirks:
 
-- **Read-only file mounts aren't enforced in-guest on microsandbox 0.6.2.**
-  `FileMount::read_only` is honored by Docker (the bind mount is genuinely read-only
-  inside the container); on microsandbox the guest currently gets a writable mount
-  regardless of the flag. Don't rely on guest-side write protection under
-  `RIGHTSIZE_BACKEND=microsandbox`.
+- **File mounts behave identically on both backends** — a former difference, closed
+  on the pinned msb 0.6.8. The default mount is read-write and is a view of the host
+  file (docker binds the host path directly; microsandbox hard-links it into its
+  staging directory), so a guest write reaches the host file itself. A mount built
+  with `FileMount::read_only` blocks guest writes with `Read-only file system` —
+  enforced in-guest on both backends, where earlier releases documented msb's `ro`
+  as advisory-only.
 - **`follow_output`'s tail-flush on microsandbox is a watchdog, not a stream close.**
   `msb logs -f` doesn't exit when its sandbox stops (a documented gap in msb 0.6.2),
   so this backend polls in the background and replays only the not-yet-delivered tail

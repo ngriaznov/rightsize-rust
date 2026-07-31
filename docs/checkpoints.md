@@ -325,7 +325,7 @@ just writes no registry entry, and `import_from` returns an ephemeral
 `Checkpoint`.
 
 **msb's imported ref is a digest-derived directory name, not the original name.**
-microsandbox's `snapshot import` is content-addressed: the ref an imported
+microsandbox's `snapshot load` is content-addressed: the ref an imported
 checkpoint restores under is the digest-dir name it unpacked into (e.g.
 `sha256-b9c0448ee9d54e33`, visible as such in `Checkpoint::find`/`Checkpoint::list`
 results afterward), never the `rz-ckpt-<12hex>` name the archive was exported
