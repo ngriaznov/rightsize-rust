@@ -380,8 +380,11 @@ fn path_ref_dir(checkpoint_ref: &str) -> Option<PathBuf> {
 
 /// A path ref's own snapshot NAME — what msb itself was given at `snapshot
 /// create` time and still knows it as (`snapshot rm`/`snapshot inspect` both take
-/// this, never the dest-dir path). For a bare-name ref this is a no-op: it's
-/// already just its own basename.
+/// this, never the dest-dir path; `snapshot save` and `run --from-snapshot` are
+/// the opposite — they resolve names against the DEFAULT snapshots directory
+/// only, so a dest-dir artifact reaches them as the full path, verified live
+/// both ways). For a bare-name ref this is a no-op: it's already just its own
+/// basename.
 fn ref_basename(checkpoint_ref: &str) -> String {
     Path::new(checkpoint_ref)
         .file_name()

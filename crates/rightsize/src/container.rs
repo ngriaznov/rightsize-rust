@@ -253,6 +253,8 @@ impl Container {
     /// ceiling and ignores this. The ceiling grows only on an msb reboot, never
     /// shrinks back down. Mutually exclusive with [`Self::with_tmpfs_root`] —
     /// `start()` returns [`RightsizeError::RootDiskConflict`] if both are set.
+    /// msb rejects a root-disk setting on a [`Container::from_checkpoint`]
+    /// restore before boot — the snapshot pins the root disk.
     pub fn with_disk_limit(mut self, megabytes: u64) -> Self {
         self.disk_limit_mb = Some(megabytes);
         self
@@ -267,7 +269,8 @@ impl Container {
     /// in that case — msb's own error at boot is already precise there). Mutually
     /// exclusive with [`Self::with_disk_limit`] —
     /// [`RightsizeError::RootDiskConflict`] if both are set. A tmpfs root is
-    /// ephemeral and cannot be checkpointed.
+    /// ephemeral and cannot be checkpointed, and msb rejects a root-disk
+    /// setting on a [`Container::from_checkpoint`] restore before boot.
     pub fn with_tmpfs_root(mut self, megabytes: u64) -> Self {
         self.tmpfs_root_mb = Some(megabytes);
         self
