@@ -100,10 +100,31 @@ mod tests {
             "ports must not repeat within the process"
         );
 
-        let last = *ports.last().unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", last))
-            .expect("released listener slot must be bindable");
-        assert_eq!(listener.local_addr().unwrap().port(), last);
+        // The property: an allocated port's probe listener is released, so the caller
+        // can bind it. On a shared CI runner any other process may legitimately grab a
+        // port in the gap between the allocator's release and this bind — one AddrInUse
+        // is environmental noise, not a disproof (observed exactly so on a loaded
+        // runner under coverage instrumentation). A fresh allocation is retried a few
+        // times; every attempt failing, or any error other than AddrInUse, still fails.
+        let mut last_err = None;
+        let bound = (0..5).find_map(|_| {
+            let port = pool.allocate().expect("allocate");
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => Some((port, listener)),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    None
+                }
+                Err(e) => panic!("released listener slot must be bindable: {e}"),
+            }
+        });
+        let (port, listener) = bound.unwrap_or_else(|| {
+            panic!(
+                "five consecutive released slots were unbindable — that is the \
+                 allocator holding ports, not neighbor noise: {last_err:?}"
+            )
+        });
+        assert_eq!(listener.local_addr().unwrap().port(), port);
     }
 
     #[test]
