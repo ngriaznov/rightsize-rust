@@ -982,7 +982,7 @@ impl SandboxBackend for MsbCliBackend {
     }
 
     /// `msb snapshot rm <basename>` — best-effort, matching [`Self::remove_by_name`]'s
-    /// own "not found is fine" contract; spike-verified to delete both msb's index
+    /// own "not found is fine" contract; verified live to delete both msb's index
     /// entry and the dest-dir artifact directory for a path ref. `checkpoint_ref`'s
     /// basename is what msb itself knows the snapshot as either way (a bare-name
     /// ref already IS its own basename). Afterwards, if `checkpoint_ref` is a path
