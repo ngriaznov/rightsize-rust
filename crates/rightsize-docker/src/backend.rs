@@ -247,7 +247,10 @@ impl DockerBackend {
 /// `127.0.0.1` — never the wildcard address), read-only/read-write binds, the
 /// `host.docker.internal:host-gateway` extra host (lets a container reach services
 /// running on the host, e.g. a test's own HTTP server, the same way it would under a
-/// real Docker Desktop install), and an optional memory cap.
+/// real Docker Desktop install), and an optional memory cap. `disk_limit_mb`,
+/// `tmpfs_root_mb`, and `network_disabled` are msb-only spec fields and are
+/// deliberately not read here — this backend runs with its normal disk-backed
+/// rootfs and normal networking regardless of their value.
 fn build_create_body(spec: &ContainerSpec) -> CreateContainerBody {
     let env = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
@@ -1361,6 +1364,18 @@ mod tests {
         let body = serialize(&spec);
         assert!(body.contains("/host/a:/guest/a:rw"), "{body}");
         assert!(body.contains("/host/b:/guest/b:ro"), "{body}");
+    }
+
+    #[test]
+    fn build_create_body_ignores_the_msb_only_spec_fields() {
+        let plain = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+
+        let mut with_msb_fields = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        with_msb_fields.disk_limit_mb = Some(2048);
+        with_msb_fields.tmpfs_root_mb = Some(512);
+        with_msb_fields.network_disabled = true;
+
+        assert_eq!(serialize(&plain), serialize(&with_msb_fields));
     }
 
     #[test]

@@ -66,6 +66,21 @@
 //! Mounts are read-write by default, on both backends alike, and a guest write reaches
 //! the host file behind the mount: see
 //! [`a_mount_is_read_write_by_default_and_the_guest_write_reaches_the_host_file`].
+//!
+//! Plus five behaviors for the msb-0.6.8 spec options (`with_disk_limit`,
+//! `with_tmpfs_root`, `with_network_disabled`) — docker ignores all three and runs
+//! with its normal disk-backed rootfs and normal networking, proven by these same
+//! tests running unmodified on both backends:
+//!
+//! - A network-disabled container still serves its published port, and on msb
+//!   cannot reach the public internet: [`a_network_disabled_container_serves_its_published_port`]
+//! - A tmpfs-root container boots and accepts writes: [`a_tmpfs_root_container_boots_and_accepts_writes`]
+//! - A disk-limited container boots: [`a_disk_limited_container_boots`]
+//! - Checkpointing a tmpfs-root container is refused (msb-only — docker ignores
+//!   `tmpfs_root_mb`): [`checkpointing_a_tmpfs_root_container_is_refused`]
+//! - A checkpoint stores its artifact under the cache dir and restores from it
+//!   (msb-only — docker checkpoints are image tags, not filesystem artifacts):
+//!   [`a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_it`]
 
 #![cfg(feature = "sandbox-it")]
 
@@ -1598,4 +1613,208 @@ async fn helper_reuse_stop_semantics() {
 
     // `_cleanup` fires on drop, whether we reach here normally or unwound through
     // a panic above.
+}
+
+// ==================== msb-0.6.8 spec options: disk limit, tmpfs root, ============
+// ==================== network disabled ============================================
+
+/// `with_network_disabled` contract: on BOTH backends the container still starts and
+/// serves its published port (the http.server/`for_http` pattern used at the top of
+/// this file) — a network-disabled container is not an unreachable one. On msb only,
+/// additionally proves the flip side: an exec'd request to the public internet fails,
+/// since docker has no `--net private` equivalent and simply ignores the field.
+#[tokio::test]
+async fn a_network_disabled_container_serves_its_published_port() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+
+    let c = Container::new("python:3.12-alpine")
+        .with_command(&["python", "-m", "http.server", "8000"])
+        .with_exposed_ports(&[8000])
+        .with_network_disabled()
+        .waiting_for(
+            Wait::for_http("/")
+                .for_port(8000)
+                .with_startup_timeout(Duration::from_secs(120)),
+        );
+    let guard = c
+        .start()
+        .await
+        .expect("a network-disabled container must still start and serve its published port");
+
+    let url = format!("http://127.0.0.1:{}/", guard.get_mapped_port(8000).unwrap());
+    let status = support::http_agent()
+        .get(&url)
+        .call()
+        .expect("GET / must succeed")
+        .status();
+    assert_eq!(status.as_u16(), 200);
+
+    if backend_name != "docker" {
+        let probe = guard
+            .exec(&[
+                "python",
+                "-c",
+                "import urllib.request; urllib.request.urlopen('http://example.com', timeout=5)",
+            ])
+            .await
+            .expect("exec must run");
+        assert_ne!(
+            probe.exit_code, 0,
+            "a network-disabled msb container must not reach the public internet: {}",
+            probe.stderr
+        );
+    }
+
+    guard.stop().await.unwrap();
+}
+
+/// `with_tmpfs_root` contract: on BOTH backends the container boots and a guest
+/// write/read round-trips under `/root` — msb backs the root disk with RAM, docker
+/// ignores the field and runs its normal disk-backed rootfs, but a write succeeds
+/// either way.
+#[tokio::test]
+async fn a_tmpfs_root_container_boots_and_accepts_writes() {
+    require_backend!();
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "60"])
+        .with_tmpfs_root(256)
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let guard = c
+        .start()
+        .await
+        .expect("a tmpfs-root container must start on both backends");
+
+    let write = guard
+        .exec(&[
+            "sh",
+            "-c",
+            "echo rz-tmpfs-probe > /root/rz-tmpfs-probe.txt && cat /root/rz-tmpfs-probe.txt",
+        ])
+        .await
+        .expect("exec must run");
+    assert_eq!(write.exit_code, 0, "{}", write.stderr);
+    assert!(write.stdout.contains("rz-tmpfs-probe"), "{}", write.stdout);
+
+    guard.stop().await.unwrap();
+}
+
+/// `with_disk_limit` contract: on BOTH backends the container simply boots — msb
+/// caps the writable root disk at the given size, docker ignores the field entirely.
+#[tokio::test]
+async fn a_disk_limited_container_boots() {
+    require_backend!();
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "30"])
+        .with_disk_limit(1024)
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let guard = c
+        .start()
+        .await
+        .expect("a disk-limited container must start on both backends");
+    guard.stop().await.unwrap();
+}
+
+/// Checkpoint guard contract (msb-only — docker ignores `tmpfs_root_mb` and has no
+/// notion of a RAM-backed root to refuse checkpointing): `checkpoint()` on a
+/// tmpfs-root container refuses with `RightsizeError::TmpfsRootCheckpoint`, before
+/// touching the backend's real checkpoint machinery.
+#[tokio::test]
+async fn checkpointing_a_tmpfs_root_container_is_refused() {
+    require_backend!();
+    if rightsize::backends::active_name() == "docker" {
+        eprintln!(
+            "skipping: tmpfs-root checkpoint refusal is msb-only — docker has no notion of a \
+             RAM-backed root to refuse checkpointing"
+        );
+        return;
+    }
+
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "60"])
+        .with_tmpfs_root(256)
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let guard = c.start().await.expect("tmpfs-root container must start");
+
+    let err = match guard.checkpoint().await {
+        Ok(_) => panic!("checkpoint() must refuse a tmpfs-root container"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, rightsize::RightsizeError::TmpfsRootCheckpoint),
+        "{err}"
+    );
+
+    guard.stop().await.unwrap();
+}
+
+/// Checkpoint dest-dir contract (msb-only — docker checkpoints are image tags, not
+/// filesystem artifacts, so there is no cache-dir path to prove): the ref minted by
+/// `checkpoint()` is an absolute path under `<cache dir>/checkpoints`, that path is a
+/// real directory containing `snapshot.json`, `Container::from_checkpoint` restores a
+/// marker file written before the checkpoint, and `remove_checkpoint` deletes the
+/// artifact directory.
+#[tokio::test]
+async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_it() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+    if backend_name == "docker" {
+        eprintln!(
+            "skipping: checkpoint dest-dir storage is an msb-only mechanic — docker checkpoints \
+             are image tags, not filesystem artifacts"
+        );
+        return;
+    }
+
+    let c = Container::new("alpine:3.19")
+        .with_command(&["sleep", "60"])
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let guard = c.start().await.expect("container must start");
+
+    let write = guard
+        .exec(&[
+            "sh",
+            "-c",
+            "echo rz-destdir-marker > /root/rz-destdir-marker.txt",
+        ])
+        .await
+        .expect("exec must run");
+    assert_eq!(write.exit_code, 0, "{}", write.stderr);
+
+    let cp = guard.checkpoint().await.expect("checkpoint must succeed");
+
+    let ref_path = Path::new(&cp.checkpoint_ref);
+    assert!(ref_path.is_absolute(), "{}", cp.checkpoint_ref);
+    let expected_parent = rightsize::cache_dir::dir().join("checkpoints");
+    assert_eq!(ref_path.parent(), Some(expected_parent.as_path()));
+    assert!(ref_path.is_dir(), "{}", cp.checkpoint_ref);
+    assert!(ref_path.join("snapshot.json").is_file(), "{}", cp.checkpoint_ref);
+
+    guard.stop().await.expect("stop the original container");
+
+    let restored = Container::from_checkpoint(&cp)
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let restored_guard = restored
+        .start()
+        .await
+        .expect("restore from the dest-dir checkpoint must succeed");
+
+    let read = restored_guard
+        .exec(&["cat", "/root/rz-destdir-marker.txt"])
+        .await
+        .expect("exec must run");
+    assert_eq!(read.exit_code, 0, "{}", read.stderr);
+    assert!(read.stdout.contains("rz-destdir-marker"), "{}", read.stdout);
+
+    let raw_backend = raw_backend_for(&backend_name);
+    raw_backend
+        .remove_checkpoint(&cp.checkpoint_ref)
+        .await
+        .expect("remove_checkpoint must succeed");
+    assert!(
+        !ref_path.exists(),
+        "remove_checkpoint must delete the dest-dir artifact directory"
+    );
+
+    restored_guard.stop().await.unwrap();
 }
