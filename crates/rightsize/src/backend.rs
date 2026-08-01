@@ -213,9 +213,13 @@ pub trait SandboxBackend: Send + Sync {
     ///
     /// Each backend picks its own ref shape: docker tags an image
     /// `rightsize/checkpoint:<nonce>` (the container is left undisturbed);
-    /// microsandbox names a disk snapshot `rz-ckpt-<nonce>` (the sandbox is
-    /// stopped, snapshotted, and started back up — see
-    /// [`Capabilities::checkpoint_restarts_workload`]).
+    /// microsandbox's checkpoint artifact is an ABSOLUTE PATH,
+    /// `<cache dir>/checkpoints/rz-ckpt-<nonce>`, not a bare snapshot name — the
+    /// caller (`ContainerGuard::checkpoint`/`checkpoint_named`) mints that full
+    /// path up front, against the same cache-dir override its checkpoint registry
+    /// honors, and hands it down as `nonce` here — and the sandbox is stopped,
+    /// snapshotted at that path, and started back up — see
+    /// [`Capabilities::checkpoint_restarts_workload`].
     ///
     /// Gated by [`Capabilities::checkpoint`] at the CALLER (`ContainerGuard::checkpoint`
     /// checks `capabilities().checkpoint` before ever reaching this method) — this

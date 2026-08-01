@@ -449,29 +449,19 @@ impl Container {
             });
         }
 
-        if self.disk_limit_mb.is_some() && self.tmpfs_root_mb.is_some() {
-            // Checked before any backend work — the root disk cannot be both a
-            // fixed-size ceiling and RAM-backed at once, on either backend.
-            return Err(RightsizeError::RootDiskConflict);
-        }
-
-        if let Some(tmpfs_mb) = self.tmpfs_root_mb {
-            if let Some(memory_mb) = self.memory_limit_mb {
-                // Only validated when a memory limit is actually set — with none,
-                // msb's own default guest memory applies and its own error at boot
-                // is already precise, so there is nothing useful to check here.
-                if tmpfs_mb > memory_mb {
-                    return Err(RightsizeError::TmpfsRootExceedsMemory {
-                        tmpfs_mb,
-                        memory_mb,
-                    });
-                }
-            }
-        }
-
-        if self.network_disabled && self.network.is_some() {
-            return Err(RightsizeError::NetworkDisabledConflict);
-        }
+        // Checked before any backend work — see `validate_spec_conflicts`'s own
+        // doc for exactly what this refuses. The identical check runs again,
+        // against the FINISHED spec, after a spec-customizer (if any) has run
+        // (`create_started_container`/`create_and_start_reuse_sandbox`) — a
+        // customizer can set any of these fields directly on the `ContainerSpec`
+        // it returns, and this pre-flight pass alone cannot see that.
+        validate_spec_conflicts(
+            self.disk_limit_mb,
+            self.tmpfs_root_mb,
+            self.memory_limit_mb,
+            self.network_disabled,
+            self.network.as_ref().map(|n| n.id()),
+        )?;
 
         if self.reuse {
             let reuse_env_enabled = self
@@ -685,6 +675,18 @@ async fn create_started_container(
         // earlier.
         spec.env = dedup_env_last_wins(spec.env);
 
+        // Re-validated against the FINISHED spec — `Container::start()`'s own
+        // pre-flight pass (`validate_spec_conflicts`, above) only ever saw the
+        // builder's own fields; a customizer just ran and can have set any of
+        // these directly on `spec`, reaching the backend unvalidated otherwise.
+        validate_spec_conflicts(
+            spec.disk_limit_mb,
+            spec.tmpfs_root_mb,
+            spec.memory_limit_mb,
+            spec.network_disabled,
+            spec.network_id.as_deref(),
+        )?;
+
         // The reaping ledger's own append-before-create discipline: the name must be
         // recorded as a superset BEFORE the backend actually creates it, so a crash
         // between this line and `backend.create` still leaves a (harmlessly
@@ -777,6 +779,47 @@ fn dedup_env_last_wins(env: Vec<(String, String)>) -> Vec<(String, String)> {
             (k, v)
         })
         .collect()
+}
+
+/// The conflicting-field checks shared between [`Container::start`]'s pre-flight
+/// gate (before any backend work) and the post-spec-customizer re-validation in
+/// [`create_started_container`]/[`create_and_start_reuse_sandbox`]: a
+/// `.with_spec_customizer(...)` hook returns a brand-new `ContainerSpec` and can
+/// set any of these fields directly on it, bypassing the pre-flight checks
+/// entirely — see [`RightsizeError::RootDiskConflict`],
+/// [`RightsizeError::TmpfsRootExceedsMemory`], and
+/// [`RightsizeError::NetworkDisabledConflict`]'s own docs for what each one
+/// means; this is the single place all three are checked, so the pre-flight and
+/// post-customizer callers can never drift apart on what counts as a conflict.
+fn validate_spec_conflicts(
+    disk_limit_mb: Option<u64>,
+    tmpfs_root_mb: Option<u64>,
+    memory_limit_mb: Option<u64>,
+    network_disabled: bool,
+    network_id: Option<&str>,
+) -> Result<()> {
+    if disk_limit_mb.is_some() && tmpfs_root_mb.is_some() {
+        // The root disk cannot be both a fixed-size ceiling and RAM-backed at
+        // once, on either backend.
+        return Err(RightsizeError::RootDiskConflict);
+    }
+    if let Some(tmpfs_mb) = tmpfs_root_mb {
+        if let Some(memory_mb) = memory_limit_mb {
+            // Only validated when a memory limit is actually set — with none,
+            // msb's own default guest memory applies and its own error at boot
+            // is already precise, so there is nothing useful to check here.
+            if tmpfs_mb > memory_mb {
+                return Err(RightsizeError::TmpfsRootExceedsMemory {
+                    tmpfs_mb,
+                    memory_mb,
+                });
+            }
+        }
+    }
+    if network_disabled && network_id.is_some() {
+        return Err(RightsizeError::NetworkDisabledConflict);
+    }
+    Ok(())
 }
 
 fn allocate_ports(exposed_ports: &[u16]) -> Result<Vec<(u16, u16)>> {
@@ -1181,6 +1224,20 @@ async fn create_and_start_reuse_sandbox(
         }
         spec.env = dedup_env_last_wins(spec.env);
 
+        // Re-validated against the FINISHED spec — same rationale as
+        // `create_started_container`'s own post-customizer pass: a customizer
+        // just ran and can have set any of these directly on `spec`.
+        if let Err(e) = validate_spec_conflicts(
+            spec.disk_limit_mb,
+            spec.tmpfs_root_mb,
+            spec.memory_limit_mb,
+            spec.network_disabled,
+            spec.network_id.as_deref(),
+        ) {
+            release_ports(&mapped_ports);
+            return Err(e);
+        }
+
         let handle = match backend.create(spec).await {
             Ok(h) => h,
             Err(e) => {
@@ -1540,6 +1597,7 @@ impl ContainerGuard {
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
         self.ensure_checkpoint_capable()?;
         let handle = self.require_handle()?;
+        self.ensure_checkpoint_target_survives_a_stop(handle)?;
         let nonce = checkpoint::generate_ref_nonce();
         let (checkpoint_ref, spec) = self.checkpoint_core(handle, &nonce).await?;
         Ok(Checkpoint {
@@ -1582,10 +1640,18 @@ impl ContainerGuard {
     /// is no atomic "keep the old one if the new one fails" here, matching the
     /// backend-level reality that the old artifact was already best-effort torn
     /// down before the new one was attempted).
+    ///
+    /// The tmpfs-root refusal below (see
+    /// [`Self::ensure_checkpoint_target_survives_a_stop`]) runs BEFORE any of
+    /// that replace-removal work — a tmpfs-root re-checkpoint that were instead
+    /// refused only once it reached the backend's own `create_checkpoint` would
+    /// have already best-effort destroyed the previous same-name entry above,
+    /// for nothing.
     pub async fn checkpoint_named(&self, name: &str) -> Result<Checkpoint> {
         checkpoint::validate_name(name)?;
         self.ensure_checkpoint_capable()?;
         let handle = self.require_handle()?;
+        self.ensure_checkpoint_target_survives_a_stop(handle)?;
 
         let cache_dir = self
             .checkpoint_cache_dir_override
@@ -1633,11 +1699,72 @@ impl ContainerGuard {
         Ok(())
     }
 
+    /// Refuses a tmpfs-root container BEFORE any of [`Self::checkpoint`]/
+    /// [`Self::checkpoint_named`]'s own remove/registry/backend work, on the
+    /// microsandbox backend specifically — its checkpoint mechanism stops the
+    /// guest before snapshotting it, and a tmpfs root is RAM-backed and gone the
+    /// moment the guest stops, so there is nothing durable left to capture.
+    ///
+    /// This is a hoist of a check `rightsize-msb`'s own `create_checkpoint`
+    /// backend implementation ALSO makes (kept there as a defense-in-depth
+    /// backstop) — the reason it has to be duplicated up here, ahead of
+    /// everything else, is [`Self::checkpoint_named`]'s replace semantics: that
+    /// method best-effort removes the PREVIOUS same-name checkpoint before
+    /// asking the backend to take the new one. If the refusal only ever
+    /// happened inside the backend's own `create_checkpoint`, a doomed
+    /// tmpfs-root re-checkpoint would still have already destroyed the
+    /// previous, perfectly good, checkpoint by the time that refusal fired —
+    /// gating here, before ANY of that removal work runs, is what keeps a
+    /// refused re-checkpoint from being a data-loss bug.
+    ///
+    /// Docker's image commit never stops the container at all, so nothing here
+    /// is at risk on that backend — this only fires for microsandbox.
+    fn ensure_checkpoint_target_survives_a_stop(&self, handle: &dyn SandboxHandle) -> Result<()> {
+        if handle.spec().tmpfs_root_mb.is_some() && self.backend.name() == "microsandbox" {
+            return Err(RightsizeError::TmpfsRootCheckpoint);
+        }
+        Ok(())
+    }
+
+    /// Mints the ref this guard's ACTIVE backend expects to receive for
+    /// `nonce_or_name` in [`Self::checkpoint_core`]'s `create_checkpoint` call.
+    ///
+    /// Every backend but microsandbox gets `nonce_or_name` back UNCHANGED — a
+    /// bare random nonce for [`Self::checkpoint`], the caller-chosen name for
+    /// [`Self::checkpoint_named`] — and formats its own ref shape from it
+    /// (docker: `rightsize/checkpoint:<nonce_or_name>`).
+    ///
+    /// On microsandbox, this mints the FULL ref up front instead:
+    /// `<cache dir>/checkpoints/rz-ckpt-<nonce_or_name>`, an absolute path under
+    /// the SAME effective cache dir [`Self::checkpoint_named`]'s own registry
+    /// uses (`checkpoint_cache_dir_override`, falling back to
+    /// [`crate::cache_dir::dir`]) — this is the override seam's whole point:
+    /// before this, `rightsize-msb`'s backend minted this same path itself,
+    /// unconditionally from the real [`crate::cache_dir::dir`], ignoring
+    /// whatever override a test (or an embedding caller) had set, so a
+    /// test-isolated checkpoint could still leak its backend-native artifact
+    /// into the real cache dir even though its registry entry stayed
+    /// correctly isolated. Minting it here instead means the artifact
+    /// destination and the registry agree on the SAME cache dir, always.
+    ///
+    /// Absolutized via `std::path::absolute` when the resolved cache dir is
+    /// itself relative (a relative `RIGHTSIZE_CACHE_DIR`) — msb's own
+    /// `--dest-dir` flag needs an absolute path.
+    fn microsandbox_checkpoint_ref(&self, nonce_or_name: &str) -> Result<String> {
+        if self.backend.name() != "microsandbox" {
+            return Ok(nonce_or_name.to_string());
+        }
+        mint_microsandbox_checkpoint_ref(
+            self.checkpoint_cache_dir_override.as_deref(),
+            nonce_or_name,
+        )
+    }
+
     /// The machinery [`Self::checkpoint`] and [`Self::checkpoint_named`] share:
     /// the backend `create_checkpoint` call under `nonce_or_name` (a random
-    /// nonce for the former, the caller-chosen name for the latter — both
-    /// backends format whichever bare string they're given into their own ref
-    /// shape identically either way), and, on a backend whose checkpoint
+    /// nonce for the former, the caller-chosen name for the latter), after
+    /// resolving it through [`Self::microsandbox_checkpoint_ref`] (a no-op on
+    /// every backend but microsandbox), and, on a backend whose checkpoint
     /// mechanism restarts the workload
     /// (`capabilities().checkpoint_restarts_workload` — microsandbox's stop/
     /// snapshot/start cycle reboots the guest), re-installing this container's
@@ -1654,10 +1781,8 @@ impl ContainerGuard {
         handle: &dyn SandboxHandle,
         nonce_or_name: &str,
     ) -> Result<(String, ContainerSpec)> {
-        let checkpoint_ref = self
-            .backend
-            .create_checkpoint(handle, nonce_or_name)
-            .await?;
+        let backend_ref = self.microsandbox_checkpoint_ref(nonce_or_name)?;
+        let checkpoint_ref = self.backend.create_checkpoint(handle, &backend_ref).await?;
         if self.backend.capabilities().checkpoint_restarts_workload {
             if !self.network_links.is_empty() {
                 self.backend
@@ -1828,6 +1953,36 @@ impl Drop for ContainerGuard {
             })),
         });
     }
+}
+
+/// Mints microsandbox's absolute checkpoint-artifact ref for `nonce_or_name`:
+/// `<cache dir>/checkpoints/rz-ckpt-<nonce_or_name>`, resolving the effective
+/// cache dir the SAME way [`ContainerGuard::checkpoint_named`]'s own registry
+/// does (`cache_dir_override`, falling back to [`crate::cache_dir::dir`]) — the
+/// pure seam [`ContainerGuard::microsandbox_checkpoint_ref`] delegates to,
+/// factored out as a plain function so this minting logic is unit-testable
+/// without constructing a full guard.
+///
+/// Absolutized via `std::path::absolute` when the resolved cache dir is itself
+/// relative (a relative `RIGHTSIZE_CACHE_DIR`, or an override a caller set to a
+/// relative path) — msb's own `--dest-dir` flag needs an absolute path.
+fn mint_microsandbox_checkpoint_ref(
+    cache_dir_override: Option<&std::path::Path>,
+    nonce_or_name: &str,
+) -> Result<String> {
+    let cache_dir = cache_dir_override
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(crate::cache_dir::dir);
+    let cache_dir = if cache_dir.is_absolute() {
+        cache_dir
+    } else {
+        std::path::absolute(&cache_dir)?
+    };
+    Ok(cache_dir
+        .join("checkpoints")
+        .join(format!("rz-ckpt-{nonce_or_name}"))
+        .display()
+        .to_string())
 }
 
 impl Checkpoint {
@@ -3442,6 +3597,163 @@ mod tests {
             .expect("the registry entry must be overwritten with the new one");
         assert_eq!(entry.checkpoint_ref, replaced.checkpoint_ref);
         assert_eq!(entry.backend, "fake");
+
+        guard.stop().await.unwrap();
+    }
+
+    // Data-loss guard: a tmpfs-root container on the microsandbox backend must be
+    // refused BEFORE checkpoint_named's own replace-removal step ever runs — a
+    // refusal that only fired once the backend's own create_checkpoint was
+    // reached would already have best-effort destroyed the previous same-name
+    // checkpoint for nothing (see `ContainerGuard::ensure_checkpoint_target_survives_a_stop`).
+    #[tokio::test]
+    async fn checkpoint_named_refuses_a_tmpfs_root_microsandbox_container_before_removing_the_previous_entry()
+     {
+        let backend = FakeBackend::named("microsandbox");
+        let cache_dir = temp_cache_dir("checkpoint-named-tmpfs-root-refuses");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "previous-ref",
+                "microsandbox",
+            ))
+            .unwrap();
+
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_tmpfs_root(256)
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+
+        let err = guard
+            .checkpoint_named("seeded-db")
+            .await
+            .expect_err("a tmpfs-root container on microsandbox must be refused");
+        assert!(matches!(err, RightsizeError::TmpfsRootCheckpoint), "{err}");
+
+        assert!(
+            backend.state.lock().unwrap().removed_checkpoints.is_empty(),
+            "the previous same-name checkpoint must never be removed once this gate refuses"
+        );
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "create_checkpoint must never be reached either"
+        );
+
+        let entry = checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .read()
+            .expect("the previous registry entry must survive the refused re-checkpoint");
+        assert_eq!(entry.checkpoint_ref, "previous-ref");
+
+        guard.stop().await.unwrap();
+    }
+
+    // The same gate applies to the unnamed checkpoint() entry point, before ANY
+    // backend call — mirrors the capability-gate tests' own "never reaches the
+    // backend" proof.
+    #[tokio::test]
+    async fn checkpoint_refuses_a_tmpfs_root_microsandbox_container_before_any_backend_call() {
+        let backend = FakeBackend::named("microsandbox");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_tmpfs_root(256);
+        let guard = c.start().await.unwrap();
+
+        let err = guard
+            .checkpoint()
+            .await
+            .expect_err("a tmpfs-root container on microsandbox must be refused");
+        assert!(matches!(err, RightsizeError::TmpfsRootCheckpoint), "{err}");
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "create_checkpoint must never be reached once this gate refuses"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // ---- override seam: microsandbox_checkpoint_ref/mint_microsandbox_checkpoint_ref ----
+
+    #[test]
+    fn mint_microsandbox_checkpoint_ref_uses_the_override_cache_dir_when_given_one() {
+        let cache_dir = temp_cache_dir("mint-microsandbox-ref-override");
+        let ref_str = mint_microsandbox_checkpoint_ref(Some(&cache_dir), "seeded-db")
+            .expect("an absolute override must mint without error");
+        assert_eq!(
+            ref_str,
+            cache_dir
+                .join("checkpoints")
+                .join("rz-ckpt-seeded-db")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn mint_microsandbox_checkpoint_ref_absolutizes_a_relative_cache_dir_override() {
+        // A relative RIGHTSIZE_CACHE_DIR (or an override a caller set to a
+        // relative path) must still yield an ABSOLUTE ref — msb's own
+        // `--dest-dir` flag requires one.
+        let relative = std::path::PathBuf::from("rz-relative-cache-dir-for-this-test-only");
+        let ref_str = mint_microsandbox_checkpoint_ref(Some(&relative), "seeded-db")
+            .expect("a relative override must still be absolutized, not rejected");
+        let ref_path = std::path::Path::new(&ref_str);
+        assert!(ref_path.is_absolute(), "{ref_str}");
+        assert!(
+            ref_str.ends_with(
+                &relative
+                    .join("checkpoints")
+                    .join("rz-ckpt-seeded-db")
+                    .display()
+                    .to_string()
+            ),
+            "{ref_str}"
+        );
+    }
+
+    // The override seam's whole point: checkpoint_named's own registry write and
+    // the microsandbox backend ref this mints both resolve the SAME effective
+    // cache dir, so a test-isolated (or otherwise overridden) cache dir never
+    // leaks the backend-native artifact into the real one while the registry
+    // entry stays correctly isolated — the bug this closes had
+    // `MsbCliBackend::create_checkpoint` minting its own ref straight from
+    // `rightsize::cache_dir::dir()`, unconditionally, ignoring this override
+    // entirely.
+    #[tokio::test]
+    async fn checkpoint_named_on_microsandbox_mints_the_backend_ref_under_the_same_cache_dir_the_registry_uses()
+     {
+        let backend = FakeBackend::named("microsandbox");
+        let cache_dir = temp_cache_dir("checkpoint-named-microsandbox-override-seam");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+
+        let cp = guard.checkpoint_named("seeded-db").await.unwrap();
+
+        let expected_artifact_ref = cache_dir
+            .join("checkpoints")
+            .join("rz-ckpt-seeded-db")
+            .display()
+            .to_string();
+        // FakeBackend::create_checkpoint formats `fake-checkpoint:<whatever it
+        // was given>` — the prefix proves it went through the backend at all,
+        // and the suffix proves core minted the full absolute ref under the
+        // override before ever calling it.
+        assert_eq!(
+            cp.checkpoint_ref,
+            format!("fake-checkpoint:{expected_artifact_ref}")
+        );
+
+        // The artifact ref's own directory and the registry file's directory
+        // are the SAME directory under the override.
+        let artifact_dir = std::path::Path::new(&expected_artifact_ref)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let registry_dir = cache_dir.join("checkpoints");
+        assert_eq!(artifact_dir, registry_dir);
+        assert!(registry_dir.join("seeded-db.json").exists());
 
         guard.stop().await.unwrap();
     }
@@ -5477,6 +5789,85 @@ mod tests {
         guard.stop().await.unwrap();
     }
 
+    // Validation-bypass fix: a spec-customizer can set conflicting fields
+    // directly on the `ContainerSpec` it returns, which `Container::start()`'s
+    // own pre-flight checks (running BEFORE the customizer) never see — the
+    // post-customizer re-validation in `create_started_container` is what
+    // catches these instead of letting them reach `backend.create` unvalidated.
+    #[tokio::test]
+    async fn a_spec_customizer_setting_both_root_disk_fields_is_refused_before_backend_create() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_spec_customizer(|mut spec, _mapped| {
+                spec.disk_limit_mb = Some(512);
+                spec.tmpfs_root_mb = Some(256);
+                spec
+            });
+
+        let err = expect_start_err(
+            c.start().await,
+            "a customizer setting both root-disk fields must be refused",
+        );
+        assert!(matches!(err, RightsizeError::RootDiskConflict), "{err}");
+        assert!(
+            backend.state.lock().unwrap().created.is_empty(),
+            "backend.create must never be reached once the post-customizer re-validation refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spec_customizer_disabling_the_network_while_setting_a_network_id_is_refused_before_backend_create()
+     {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_spec_customizer(|mut spec, _mapped| {
+                spec.network_disabled = true;
+                spec.network_id = Some("some-network".to_string());
+                spec
+            });
+
+        let err = expect_start_err(
+            c.start().await,
+            "a customizer combining network_disabled with a network_id must be refused",
+        );
+        assert!(
+            matches!(err, RightsizeError::NetworkDisabledConflict),
+            "{err}"
+        );
+        assert!(backend.state.lock().unwrap().created.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_spec_customizer_setting_a_tmpfs_root_over_the_memory_limit_is_refused_before_backend_create()
+     {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_memory_limit(128)
+            .with_spec_customizer(|mut spec, _mapped| {
+                spec.tmpfs_root_mb = Some(256);
+                spec
+            });
+
+        let err = expect_start_err(
+            c.start().await,
+            "a customizer setting a tmpfs root over the memory limit must be refused",
+        );
+        assert!(
+            matches!(
+                err,
+                RightsizeError::TmpfsRootExceedsMemory {
+                    tmpfs_mb: 256,
+                    memory_mb: 128
+                }
+            ),
+            "{err}"
+        );
+        assert!(backend.state.lock().unwrap().created.is_empty());
+    }
+
     // U3: exec/get_mapped_port on a not-running guard errors.
     #[tokio::test]
     async fn u3_exec_and_mapped_port_require_a_running_container() {
@@ -6218,5 +6609,41 @@ mod tests {
         }
 
         guard.stop().await.unwrap();
+    }
+
+    // Validation-bypass fix (reuse path): the reuse fresh-create path builds and
+    // applies its own spec-customizer independently of `create_started_container`
+    // (`create_and_start_reuse_sandbox`), so it needs the SAME post-customizer
+    // re-validation — a customizer setting both root-disk fields must be refused
+    // before `backend.create` is ever reached, exactly like the ordinary
+    // (non-reuse) start path.
+    #[tokio::test]
+    async fn reuse_fresh_create_re_validates_a_spec_customizer_setting_both_root_disk_fields() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("reuse-fresh-create-validation-bypass");
+
+        let err = expect_start_err(
+            Container::new("redis:7-alpine")
+                .with_backend(backend.clone())
+                .with_cache_dir_override(cache_dir)
+                .with_reuse_env_override(true)
+                .with_exposed_ports(&[6379])
+                .waiting_for(ReadyImmediately)
+                .reuse(true)
+                .with_spec_customizer(|mut spec, _mapped| {
+                    spec.disk_limit_mb = Some(512);
+                    spec.tmpfs_root_mb = Some(256);
+                    spec
+                })
+                .start()
+                .await,
+            "a customizer setting both root-disk fields must be refused",
+        );
+
+        assert!(matches!(err, RightsizeError::RootDiskConflict), "{err}");
+        assert!(
+            backend.state.lock().unwrap().created.is_empty(),
+            "backend.create must never be reached once the post-customizer re-validation refuses"
+        );
     }
 }

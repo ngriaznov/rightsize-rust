@@ -34,8 +34,10 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
     }
 
     // `--root-disk` covers both a size-capped writable root disk and a tmpfs one —
-    // `ContainerSpec`'s own validation (`Container::start`) already refuses a spec
-    // that sets both, so at most one of these fires.
+    // `ContainerSpec`'s own validation refuses a spec that sets both: `Container::
+    // start`'s pre-flight checks, re-applied (`validate_spec_conflicts`) against
+    // the FINISHED spec after any `.with_spec_customizer(...)` hook runs, so at
+    // most one of these fires even when a customizer built this spec.
     if let Some(mb) = spec.disk_limit_mb {
         argv.push("--root-disk".to_string());
         argv.push(format!("{mb}M"));
@@ -128,26 +130,26 @@ pub fn copy_out(sandbox_name: &str, container_path: &str, host_path: &Path) -> V
 
 /// Builds the argv for `msb snapshot create --from <sandbox> <snapshot>` — requires
 /// the sandbox to be STOPPED first (the checkpoint feature's own responsibility;
-/// this function only builds the argv). `dest_dir`, when given, appends
-/// `--dest-dir <dest_dir>`, storing the snapshot artifact under that directory
-/// instead of msb's own default snapshot store — the checkpoint feature's
-/// dest-dir mechanics (`MsbCliBackend::create_checkpoint`).
-pub fn snapshot_create(
-    sandbox_name: &str,
-    snapshot_name: &str,
-    dest_dir: Option<&Path>,
-) -> Vec<String> {
-    let mut argv = vec![
+/// this function only builds the argv). The plain 2-arg form msb's own default
+/// snapshot store uses; see [`snapshot_create_in`] for the dest-dir variant.
+pub fn snapshot_create(sandbox_name: &str, snapshot_name: &str) -> Vec<String> {
+    vec![
         "snapshot".to_string(),
         "create".to_string(),
         "--from".to_string(),
         sandbox_name.to_string(),
         snapshot_name.to_string(),
-    ];
-    if let Some(dir) = dest_dir {
-        argv.push("--dest-dir".to_string());
-        argv.push(dir.display().to_string());
-    }
+    ]
+}
+
+/// [`snapshot_create`]'s dest-dir counterpart: appends `--dest-dir <dest_dir>`,
+/// storing the snapshot artifact under that directory instead of msb's own
+/// default snapshot store — the checkpoint feature's dest-dir mechanics
+/// (`MsbCliBackend::create_checkpoint`).
+pub fn snapshot_create_in(sandbox_name: &str, snapshot_name: &str, dest_dir: &Path) -> Vec<String> {
+    let mut argv = snapshot_create(sandbox_name, snapshot_name);
+    argv.push("--dest-dir".to_string());
+    argv.push(dest_dir.display().to_string());
     argv
 }
 
@@ -560,7 +562,7 @@ mod tests {
             vec!["copy", "-q", "rz-abc-1:/guest/src.txt", "/host/dst.txt"]
         );
         assert_eq!(
-            snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe", None),
+            snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe"),
             vec![
                 "snapshot",
                 "create",
@@ -570,10 +572,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            snapshot_create(
+            snapshot_create_in(
                 "rz-abc-1",
                 "rz-ckpt-deadbeefcafe",
-                Some(std::path::Path::new("/cache/checkpoints"))
+                std::path::Path::new("/cache/checkpoints")
             ),
             vec![
                 "snapshot",

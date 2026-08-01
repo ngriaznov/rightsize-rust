@@ -352,13 +352,16 @@ fn is_snapshot_not_found(output: &str) -> bool {
     output.to_lowercase().contains("snapshot not found")
 }
 
-/// Mints this backend's checkpoint ref for `nonce_or_name`: an absolute path
-/// under `<cache_dir>/checkpoints/`, whose basename is the actual snapshot name
-/// `msb` is given (`rz-ckpt-<nonce_or_name>`) — the checkpoint dest-dir feature's
-/// ref-minting site (`MsbCliBackend::create_checkpoint`). Pure and
+/// Mints an absolute checkpoint ref for `nonce_or_name`: a path under
+/// `<cache_dir>/checkpoints/`, whose basename is the actual snapshot name `msb`
+/// is given (`rz-ckpt-<nonce_or_name>`) — the same naming convention
+/// `rightsize::ContainerGuard` itself now applies when it mints this ref up
+/// front (see `MsbCliBackend::create_checkpoint`'s doc). Kept here as
+/// `MsbCliBackend::create_checkpoint`'s own defensive fallback for a bare
+/// `nonce_or_name` reaching it directly (never `ContainerGuard`'s own call
+/// path, which always hands down an already-absolute ref). Pure and
 /// `cache_dir`-parameterized so the shape is unit-testable without touching
-/// process env or the filesystem; production passes
-/// [`rightsize::cache_dir::dir`]'s result.
+/// process env or the filesystem.
 fn mint_checkpoint_ref(nonce_or_name: &str, cache_dir: &Path) -> PathBuf {
     cache_dir
         .join("checkpoints")
@@ -873,33 +876,49 @@ impl SandboxBackend for MsbCliBackend {
     /// attached child is swapped to the new one on success; the ledger and this
     /// handle's identity (name, spec) are untouched either way.
     ///
-    /// The returned ref is the ABSOLUTE PATH to the snapshot artifact under
-    /// [`rightsize::cache_dir::dir`] — `<cache dir>/checkpoints/rz-ckpt-<nonce>` —
-    /// not a bare snapshot name, so the artifact lives somewhere every process on
-    /// this host agrees on rather than wherever msb's own default snapshot store
-    /// happens to be. A ref minted before this change is a bare name, not a path,
-    /// and every method here (`has_checkpoint`, `remove_checkpoint`, this method's
-    /// own `--from-snapshot` re-boot) keeps handling that shape too — see
-    /// [`path_ref_dir`].
+    /// The returned ref is the ABSOLUTE PATH to the snapshot artifact — `<cache
+    /// dir>/checkpoints/rz-ckpt-<nonce-or-name>` — not a bare snapshot name, so the
+    /// artifact lives somewhere every process on this host agrees on rather than
+    /// wherever msb's own default snapshot store happens to be. That absolute ref
+    /// is minted by `rightsize::ContainerGuard` itself, one level up, against
+    /// whatever cache-dir override its checkpoint registry is honoring for this
+    /// call (`checkpoint_cache_dir_override`, falling back to
+    /// [`rightsize::cache_dir::dir`]) — `checkpoint_ref` below arrives already
+    /// carrying that finished path, so a test-isolated override reaches this
+    /// artifact's own destination directory too, not just the registry file this
+    /// crate never touches directly. A BARE name (no directory component) is
+    /// minted here instead, purely as a defensive fallback for a caller that
+    /// reaches this SPI method directly rather than through `ContainerGuard` — see
+    /// [`path_ref_dir`], the same absolute-vs-bare branch `has_checkpoint` and
+    /// `remove_checkpoint` already use. A ref minted before dest-dir checkpoints
+    /// existed is a bare name too, and every method here keeps handling that shape
+    /// identically either way.
     ///
     /// A container started with [`ContainerSpec::tmpfs_root_mb`] set is refused
     /// outright, before `handle` is stopped or anything else here runs: its root
     /// disk is RAM-backed and gone the moment the guest stops, so there is nothing
-    /// left to snapshot.
-    async fn create_checkpoint(&self, handle: &dyn SandboxHandle, nonce: &str) -> Result<String> {
+    /// left to snapshot. (`rightsize::ContainerGuard::checkpoint`/`checkpoint_named`
+    /// carry an identical check of their own, run BEFORE any registry work — this
+    /// one stays as a defense-in-depth backstop.)
+    async fn create_checkpoint(
+        &self,
+        handle: &dyn SandboxHandle,
+        checkpoint_ref: &str,
+    ) -> Result<String> {
         if handle.spec().tmpfs_root_mb.is_some() {
             return Err(RightsizeError::TmpfsRootCheckpoint);
         }
 
         let id = handle.id().to_string();
-        let ref_path = mint_checkpoint_ref(nonce, &rightsize::cache_dir::dir());
+        let ref_path = path_ref_dir(checkpoint_ref)
+            .unwrap_or_else(|| mint_checkpoint_ref(checkpoint_ref, &rightsize::cache_dir::dir()));
         let checkpoint_dir = ref_path
             .parent()
-            .expect("mint_checkpoint_ref always nests the ref under a checkpoints/ directory")
+            .expect("an absolute ref path always nests under a checkpoints/ directory")
             .to_path_buf();
         let basename = ref_path
             .file_name()
-            .expect("mint_checkpoint_ref always yields a path with a file name")
+            .expect("an absolute ref path always yields a path with a file name")
             .to_string_lossy()
             .into_owned();
         let snapshot_ref = ref_path.display().to_string();
@@ -1544,7 +1563,7 @@ fn msb_checkpoint_cycle<T>(
         )));
     }
 
-    match invoke(&commands::snapshot_create(name, basename, Some(dest_dir))) {
+    match invoke(&commands::snapshot_create_in(name, basename, dest_dir)) {
         Ok(r) if r.exit_code == 0 => {}
         Ok(r) => {
             return Err(RightsizeError::Backend(format!(
@@ -1945,10 +1964,10 @@ mod tests {
             *log.borrow(),
             vec![
                 commands::stop("rz-abc-1").join(" "),
-                commands::snapshot_create(
+                commands::snapshot_create_in(
                     "rz-abc-1",
                     "rz-ckpt-deadbeefcafe",
-                    Some(Path::new("/cache/checkpoints"))
+                    Path::new("/cache/checkpoints")
                 )
                 .join(" "),
                 commands::rm("rz-abc-1").join(" "),
@@ -2087,11 +2106,15 @@ mod tests {
 
     #[test]
     fn mint_checkpoint_ref_is_an_absolute_path_under_cache_dir_checkpoints() {
-        let cache_dir = Path::new("/home/u/.cache/rightsize");
-        let ref_path = mint_checkpoint_ref("deadbeefcafe", cache_dir);
+        // `std::env::temp_dir()` is absolute on every platform this crate targets
+        // (Unix and Windows alike), unlike a hand-typed Unix literal such as
+        // "/home/u/.cache/rightsize" — `Path::is_absolute()` is false for a bare
+        // leading-slash path on Windows, which needs a drive/prefix component.
+        let cache_dir = std::env::temp_dir().join("rz-msb-mint-checkpoint-ref-cache");
+        let ref_path = mint_checkpoint_ref("deadbeefcafe", &cache_dir);
         assert_eq!(
             ref_path,
-            Path::new("/home/u/.cache/rightsize/checkpoints/rz-ckpt-deadbeefcafe")
+            cache_dir.join("checkpoints").join("rz-ckpt-deadbeefcafe")
         );
         assert!(ref_path.is_absolute());
     }
@@ -2106,10 +2129,14 @@ mod tests {
 
     #[test]
     fn path_ref_dir_recognizes_an_absolute_path_and_rejects_a_bare_name() {
-        assert_eq!(
-            path_ref_dir("/cache/checkpoints/rz-ckpt-deadbeefcafe"),
-            Some(PathBuf::from("/cache/checkpoints/rz-ckpt-deadbeefcafe"))
-        );
+        // Built from `std::env::temp_dir()` rather than a hand-typed Unix literal
+        // like "/cache/checkpoints/rz-ckpt-deadbeefcafe" — `Path::is_absolute()`
+        // is false for a bare leading-slash path on Windows, so a literal like
+        // that would make this test's own assertion fail there.
+        let abs = std::env::temp_dir()
+            .join("checkpoints")
+            .join("rz-ckpt-deadbeefcafe");
+        assert_eq!(path_ref_dir(&abs.display().to_string()), Some(abs.clone()));
         assert_eq!(
             path_ref_dir("rz-ckpt-deadbeefcafe"),
             None,
