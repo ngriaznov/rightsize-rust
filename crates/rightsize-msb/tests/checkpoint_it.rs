@@ -140,8 +140,15 @@ async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() 
         .checkpoint()
         .await
         .expect("checkpoint must succeed on msb via disk snapshot");
+    // The msb ref is the absolute artifact path under <cache_dir>/checkpoints —
+    // created there via --dest-dir and restored by path.
+    let ref_path = std::path::Path::new(&cp.checkpoint_ref);
+    assert!(ref_path.is_absolute(), "{}", cp.checkpoint_ref);
     assert!(
-        cp.checkpoint_ref.starts_with("rz-ckpt-"),
+        ref_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rz-ckpt-")),
         "{}",
         cp.checkpoint_ref
     );

@@ -847,9 +847,11 @@ async fn require_isolation_gates_start_per_backend_hardware_isolation() {
 
 /// checkpoint contract: both real backends succeed and return a well-formed,
 /// backend-specific ref — docker tags `rightsize/checkpoint:<12hex>`, microsandbox
-/// names a snapshot `rz-ckpt-<12hex>` — and `Checkpoint::backend` names the backend
-/// that created it. Cleans up via `SandboxBackend::remove_checkpoint` (SPI-only —
-/// no shelling out to either CLI directly), keeping shared CI backend state clean.
+/// mints an absolute `<cache_dir>/checkpoints/rz-ckpt-<12hex>` artifact path (the
+/// snapshot is created there via `--dest-dir` and restored by path) — and
+/// `Checkpoint::backend` names the backend that created it. Cleans up via
+/// `SandboxBackend::remove_checkpoint` (SPI-only — no shelling out to either CLI
+/// directly), keeping shared CI backend state clean.
 #[tokio::test]
 async fn checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specific_ref() {
     require_backend!();
@@ -866,18 +868,40 @@ async fn checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specifi
         .expect("checkpoint must succeed on both real backends");
     assert_eq!(cp.backend, backend_name);
 
-    let prefix = if backend_name == "docker" {
-        "rightsize/checkpoint:"
+    let artifact_name = if backend_name == "docker" {
+        cp.checkpoint_ref
+            .strip_prefix("rightsize/checkpoint:")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the rightsize/checkpoint: prefix, got {}",
+                    cp.checkpoint_ref
+                )
+            })
+            .to_string()
     } else {
-        "rz-ckpt-"
+        let ref_path = std::path::Path::new(&cp.checkpoint_ref);
+        assert!(
+            ref_path.is_absolute(),
+            "expected an absolute artifact path ref, got {}",
+            cp.checkpoint_ref
+        );
+        assert_eq!(
+            ref_path.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("checkpoints")),
+            "expected the ref to sit in a 'checkpoints' dir: {}",
+            cp.checkpoint_ref
+        );
+        let name = ref_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| panic!("unreadable artifact name in {}", cp.checkpoint_ref));
+        name.strip_prefix("rz-ckpt-")
+            .unwrap_or_else(|| panic!("expected the rz-ckpt- prefix, got {}", cp.checkpoint_ref))
+            .to_string()
     };
-    let tag = cp
-        .checkpoint_ref
-        .strip_prefix(prefix)
-        .unwrap_or_else(|| panic!("expected the {prefix} prefix, got {}", cp.checkpoint_ref));
-    assert_eq!(tag.len(), 12, "{}", cp.checkpoint_ref);
+    assert_eq!(artifact_name.len(), 12, "{}", cp.checkpoint_ref);
     assert!(
-        tag.chars().all(|c| c.is_ascii_hexdigit()),
+        artifact_name.chars().all(|c| c.is_ascii_hexdigit()),
         "{}",
         cp.checkpoint_ref
     );
