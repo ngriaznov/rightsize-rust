@@ -16,11 +16,12 @@
 //!
 //! **Identity**: `sha256` over a canonical (stable key order, no whitespace) JSON
 //! serialization of `{image, env (sorted by key), command, exposedPorts (sorted),
-//! memoryLimitMb, copies: [{guestPath, sha256(content)}] sorted by guestPath}` — this
-//! exact shape and key order is a CROSS-LANGUAGE CONTRACT: the same logical spec
-//! must hash identically in the Kotlin/Node/Rust implementations, pinned by a fixed
-//! vector (see the `pinned_cross_language_vector_hashes_to_the_pinned_value` test
-//! below). The sandbox name is `rz-reuse-<first 12 hex chars of the hash>`. See
+//! memoryLimitMb, diskLimitMb, tmpfsRootMb, networkDisabled, copies:
+//! [{guestPath, sha256(content)}] sorted by guestPath}` — this exact shape and key
+//! order is a CROSS-LANGUAGE CONTRACT: the same logical spec must hash identically
+//! in the Kotlin/Node/Rust implementations, pinned by a fixed vector (see the
+//! `pinned_cross_language_vector_hashes_to_the_pinned_value` test below). The
+//! sandbox name is `rz-reuse-<first 12 hex chars of the hash>`. See
 //! [`compute_identity`].
 
 use std::collections::BTreeMap;
@@ -63,12 +64,20 @@ pub(crate) struct Identity {
 /// spec. Reads every mount's host-side file content to hash it (`copies`) — a
 /// genuine I/O error here (an unreadable mount) is propagated rather than swallowed,
 /// since the same file would fail the container's own start moments later anyway.
+///
+/// `disk_limit_mb`, `tmpfs_root_mb`, and `network_disabled` are hashed exactly like
+/// `memory_limit_mb` — two containers that would boot with a different root-disk
+/// ceiling, tmpfs size, or network posture are not interchangeable for reuse.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_identity(
     image: &str,
     env: &[(String, String)],
     command: &Option<Vec<String>>,
     exposed_ports: &[u16],
     memory_limit_mb: Option<u64>,
+    disk_limit_mb: Option<u64>,
+    tmpfs_root_mb: Option<u64>,
+    network_disabled: bool,
     mounts: &[FileMount],
 ) -> Result<Identity> {
     let mut env_sorted = env.to_vec();
@@ -90,6 +99,9 @@ pub(crate) fn compute_identity(
         command.as_deref().unwrap_or(&[]),
         &ports_sorted,
         memory_limit_mb,
+        disk_limit_mb,
+        tmpfs_root_mb,
+        network_disabled,
         &copies,
     );
     let hash_hex = hex_sha256(canonical.as_bytes());
@@ -100,16 +112,21 @@ pub(crate) fn compute_identity(
 /// Builds the exact canonical JSON string the identity hash is computed over —
 /// hand-assembled (not a `serde_json::Map`, whose default `BTreeMap` backing would
 /// sort keys alphabetically instead of the spec's fixed order) so the top-level key
-/// order (`image`, `env`, `command`, `exposedPorts`, `memoryLimitMb`, `copies`)
-/// matches the cross-language contract exactly, with every scalar/string
-/// individually JSON-encoded via `serde_json::to_string` for correct escaping. No
-/// whitespace anywhere — that's the "canonical" half of the contract.
+/// order (`image`, `env`, `command`, `exposedPorts`, `memoryLimitMb`, `diskLimitMb`,
+/// `tmpfsRootMb`, `networkDisabled`, `copies`) matches the cross-language contract
+/// exactly, with every scalar/string individually JSON-encoded via
+/// `serde_json::to_string` for correct escaping. No whitespace anywhere — that's
+/// the "canonical" half of the contract.
+#[allow(clippy::too_many_arguments)]
 fn canonical_json(
     image: &str,
     env_sorted: &[(String, String)],
     command: &[String],
     ports_sorted: &[u16],
     memory_limit_mb: Option<u64>,
+    disk_limit_mb: Option<u64>,
+    tmpfs_root_mb: Option<u64>,
+    network_disabled: bool,
     copies_sorted: &[(String, String)],
 ) -> String {
     let mut out = String::new();
@@ -150,6 +167,21 @@ fn canonical_json(
         Some(mb) => out.push_str(&mb.to_string()),
         None => out.push_str("null"),
     }
+
+    out.push_str(",\"diskLimitMb\":");
+    match disk_limit_mb {
+        Some(mb) => out.push_str(&mb.to_string()),
+        None => out.push_str("null"),
+    }
+
+    out.push_str(",\"tmpfsRootMb\":");
+    match tmpfs_root_mb {
+        Some(mb) => out.push_str(&mb.to_string()),
+        None => out.push_str("null"),
+    }
+
+    out.push_str(",\"networkDisabled\":");
+    out.push_str(if network_disabled { "true" } else { "false" });
 
     out.push_str(",\"copies\":[");
     for (i, (guest_path, sha)) in copies_sorted.iter().enumerate() {
@@ -349,12 +381,14 @@ mod tests {
     /// spec's "Identity" section must hash to this exact sha256, identically in the
     /// Kotlin/Node/Rust implementations. Computed once (sha256 of the canonical
     /// JSON below) and pinned here so a change to `canonical_json`'s shape that
-    /// breaks cross-language parity fails loudly.
+    /// breaks cross-language parity fails loudly. Extended for the 0.7.0
+    /// `diskLimitMb`/`tmpfsRootMb`/`networkDisabled` fields — same vector as
+    /// before, with those three now present at their defaults.
     ///
     /// Canonical JSON this hashes:
-    /// `{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"copies":[]}`
+    /// `{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"diskLimitMb":null,"tmpfsRootMb":null,"networkDisabled":false,"copies":[]}`
     const PINNED_VECTOR_HASH: &str =
-        "799aad5a3338ce3d36999c7ff2733d4673c0592d417563f334544693ec1907a5";
+        "1a3acb721b9d885d64ce09b8ab0ff6360507d25ba58d5f23718cbf9935d11a32";
 
     fn pinned_vector_identity() -> Identity {
         compute_identity(
@@ -366,6 +400,9 @@ mod tests {
             &None,
             &[6379],
             None,
+            None,
+            None,
+            false,
             &[],
         )
         .unwrap()
@@ -392,11 +429,14 @@ mod tests {
             &[],
             &[6379],
             None,
+            None,
+            None,
+            false,
             &[],
         );
         assert_eq!(
             json,
-            r#"{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"copies":[]}"#
+            r#"{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"diskLimitMb":null,"tmpfsRootMb":null,"networkDisabled":false,"copies":[]}"#
         );
     }
 
@@ -411,6 +451,9 @@ mod tests {
             &None,
             &[6379],
             None,
+            None,
+            None,
+            false,
             &[],
         )
         .unwrap();
@@ -423,6 +466,9 @@ mod tests {
             &None,
             &[6379],
             None,
+            None,
+            None,
+            false,
             &[],
         )
         .unwrap();
@@ -444,6 +490,72 @@ mod tests {
             &None,
             &[6379],
             None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(a.hash_hex, b.hash_hex);
+    }
+
+    #[test]
+    fn a_different_disk_limit_changes_the_hash() {
+        let a = pinned_vector_identity();
+        let b = compute_identity(
+            "redis:7-alpine",
+            &[
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+            &None,
+            &[6379],
+            None,
+            Some(1024),
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(a.hash_hex, b.hash_hex);
+    }
+
+    #[test]
+    fn a_different_tmpfs_root_changes_the_hash() {
+        let a = pinned_vector_identity();
+        let b = compute_identity(
+            "redis:7-alpine",
+            &[
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+            &None,
+            &[6379],
+            None,
+            None,
+            Some(256),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(a.hash_hex, b.hash_hex);
+    }
+
+    #[test]
+    fn a_different_network_disabled_changes_the_hash() {
+        let a = pinned_vector_identity();
+        let b = compute_identity(
+            "redis:7-alpine",
+            &[
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            true,
             &[],
         )
         .unwrap();
@@ -471,6 +583,9 @@ mod tests {
             &None,
             &[],
             None,
+            None,
+            None,
+            false,
             std::slice::from_ref(&mount),
         )
         .unwrap();
@@ -482,6 +597,9 @@ mod tests {
             &None,
             &[],
             None,
+            None,
+            None,
+            false,
             std::slice::from_ref(&mount),
         )
         .unwrap();
@@ -493,7 +611,18 @@ mod tests {
     #[test]
     fn compute_identity_propagates_an_unreadable_mount_as_a_real_error() {
         let mount = FileMount::new("/definitely/does/not/exist/rightsize-reuse", "/guest/f.txt");
-        let err = compute_identity("redis:7-alpine", &[], &None, &[], None, &[mount]).unwrap_err();
+        let err = compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            &[mount],
+        )
+        .unwrap_err();
         // std::io::Error via RightsizeError::Io — just prove it propagates rather
         // than silently hashing to a wrong/empty value.
         assert!(matches!(err, RightsizeError::Io(_)), "{err}");

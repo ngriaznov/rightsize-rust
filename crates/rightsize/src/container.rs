@@ -68,6 +68,9 @@ pub struct Container {
     mounts: Vec<FileMount>,
     wait_strategy: Arc<dyn WaitStrategy>,
     memory_limit_mb: Option<u64>,
+    disk_limit_mb: Option<u64>,
+    tmpfs_root_mb: Option<u64>,
+    network_disabled: bool,
     backend_override: Option<Arc<dyn SandboxBackend>>,
     spec_customizer: Option<Arc<SpecCustomizer>>,
     post_start: Option<Arc<PostStartHook>>,
@@ -104,6 +107,9 @@ impl Container {
             mounts: Vec::new(),
             wait_strategy: Arc::from(Wait::for_listening_port()),
             memory_limit_mb: None,
+            disk_limit_mb: None,
+            tmpfs_root_mb: None,
+            network_disabled: false,
             backend_override: None,
             spec_customizer: None,
             post_start: None,
@@ -239,6 +245,41 @@ impl Container {
     /// backend apply its own default.
     pub fn with_memory_limit(mut self, megabytes: u64) -> Self {
         self.memory_limit_mb = Some(megabytes);
+        self
+    }
+
+    /// Caps the writable root disk at `megabytes` — microsandbox-only
+    /// (`--root-disk <mb>M`); docker runs its normal disk-backed rootfs with no
+    /// ceiling and ignores this. The ceiling grows only on an msb reboot, never
+    /// shrinks back down. Mutually exclusive with [`Self::with_tmpfs_root`] —
+    /// `start()` returns [`RightsizeError::RootDiskConflict`] if both are set.
+    pub fn with_disk_limit(mut self, megabytes: u64) -> Self {
+        self.disk_limit_mb = Some(megabytes);
+        self
+    }
+
+    /// Runs the writable root disk from guest RAM instead of storage, sized at
+    /// `megabytes` — microsandbox-only (`--root-disk tmpfs:<mb>M`); docker runs its
+    /// normal disk-backed rootfs and ignores this. Must not exceed
+    /// [`Self::with_memory_limit`] — `start()` returns
+    /// [`RightsizeError::TmpfsRootExceedsMemory`] when it does (msb's own default
+    /// guest memory is 512M when no memory limit is set, so nothing is validated
+    /// in that case — msb's own error at boot is already precise there). Mutually
+    /// exclusive with [`Self::with_disk_limit`] —
+    /// [`RightsizeError::RootDiskConflict`] if both are set. A tmpfs root is
+    /// ephemeral and cannot be checkpointed.
+    pub fn with_tmpfs_root(mut self, megabytes: u64) -> Self {
+        self.tmpfs_root_mb = Some(megabytes);
+        self
+    }
+
+    /// Blocks public-internet access on microsandbox (`--net private` — published
+    /// ports and private-range links keep working); docker ignores this and runs
+    /// with normal networking. Mutually exclusive with [`Self::with_network`] —
+    /// `start()` returns [`RightsizeError::NetworkDisabledConflict`] if both are
+    /// set.
+    pub fn with_network_disabled(mut self) -> Self {
+        self.network_disabled = true;
         self
     }
 
@@ -408,6 +449,30 @@ impl Container {
             });
         }
 
+        if self.disk_limit_mb.is_some() && self.tmpfs_root_mb.is_some() {
+            // Checked before any backend work — the root disk cannot be both a
+            // fixed-size ceiling and RAM-backed at once, on either backend.
+            return Err(RightsizeError::RootDiskConflict);
+        }
+
+        if let Some(tmpfs_mb) = self.tmpfs_root_mb {
+            if let Some(memory_mb) = self.memory_limit_mb {
+                // Only validated when a memory limit is actually set — with none,
+                // msb's own default guest memory applies and its own error at boot
+                // is already precise, so there is nothing useful to check here.
+                if tmpfs_mb > memory_mb {
+                    return Err(RightsizeError::TmpfsRootExceedsMemory {
+                        tmpfs_mb,
+                        memory_mb,
+                    });
+                }
+            }
+        }
+
+        if self.network_disabled && self.network.is_some() {
+            return Err(RightsizeError::NetworkDisabledConflict);
+        }
+
         if self.reuse {
             let reuse_env_enabled = self
                 .reuse_env_override
@@ -469,6 +534,9 @@ impl Container {
             self.network.as_deref(),
             &self.aliases,
             self.memory_limit_mb,
+            self.disk_limit_mb,
+            self.tmpfs_root_mb,
+            self.network_disabled,
             self.spec_customizer.as_deref(),
             self.reaper_cache_dir_override.as_deref(),
             self.checkpoint_ref.as_deref(),
@@ -562,6 +630,9 @@ async fn create_started_container(
     network: Option<&Network>,
     aliases: &[String],
     memory_limit_mb: Option<u64>,
+    disk_limit_mb: Option<u64>,
+    tmpfs_root_mb: Option<u64>,
+    network_disabled: bool,
     spec_customizer: Option<&SpecCustomizer>,
     reaper_cache_dir_override: Option<&std::path::Path>,
     checkpoint_ref: Option<&str>,
@@ -592,6 +663,9 @@ async fn create_started_container(
             memory_limit_mb,
             keep_alive: false,
             checkpoint_ref: checkpoint_ref.map(ToString::to_string),
+            disk_limit_mb,
+            tmpfs_root_mb,
+            network_disabled,
         };
 
         if let Some(customizer) = spec_customizer {
@@ -855,6 +929,9 @@ async fn start_reuse(
         &container.command,
         &container.exposed_ports,
         container.memory_limit_mb,
+        container.disk_limit_mb,
+        container.tmpfs_root_mb,
+        container.network_disabled,
         &container.mounts,
     )?;
 
@@ -991,6 +1068,9 @@ async fn try_adopt(
         // (`RightsizeError::ReuseCheckpointConflict`) — a reuse sandbox never
         // carries a checkpoint ref.
         checkpoint_ref: None,
+        disk_limit_mb: container.disk_limit_mb,
+        tmpfs_root_mb: container.tmpfs_root_mb,
+        network_disabled: container.network_disabled,
     };
 
     let Ok(Some(handle)) = backend.find_running(&adopted_spec).await else {
@@ -1085,6 +1165,9 @@ async fn create_and_start_reuse_sandbox(
             memory_limit_mb: container.memory_limit_mb,
             keep_alive: true,
             checkpoint_ref: None,
+            disk_limit_mb: container.disk_limit_mb,
+            tmpfs_root_mb: container.tmpfs_root_mb,
+            network_disabled: container.network_disabled,
         };
         if let Some(customizer) = &container.spec_customizer {
             let lookup: std::collections::HashMap<u16, u16> =
@@ -2124,6 +2207,12 @@ fn checkpoint_from_reduced(
             memory_limit_mb: spec.memory_limit_mb,
             keep_alive: false,
             checkpoint_ref: None,
+            // `NamedRegistrySpec` deliberately isn't extended with these — see
+            // the reduced-spec doc above; placeholder defaults, same as `mounts`
+            // and `network_id`.
+            disk_limit_mb: None,
+            tmpfs_root_mb: None,
+            network_disabled: false,
         },
     }
 }
@@ -5152,6 +5241,153 @@ mod tests {
         guard.stop().await.unwrap();
     }
 
+    // Disk-limit knob: with_disk_limit reaches the ContainerSpec; None when unset.
+    #[tokio::test]
+    async fn with_disk_limit_carries_through_to_the_container_spec() {
+        let backend = FakeBackend::new();
+        let limited = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_disk_limit(2048);
+        let guard = limited.start().await.unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().created[0].disk_limit_mb,
+            Some(2048)
+        );
+        guard.stop().await.unwrap();
+
+        let unset = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = unset.start().await.unwrap();
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .created
+                .last()
+                .unwrap()
+                .disk_limit_mb,
+            None
+        );
+        guard.stop().await.unwrap();
+    }
+
+    // Tmpfs-root knob: with_tmpfs_root reaches the ContainerSpec; None when unset.
+    #[tokio::test]
+    async fn with_tmpfs_root_carries_through_to_the_container_spec() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_tmpfs_root(256);
+        let guard = c.start().await.unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().created[0].tmpfs_root_mb,
+            Some(256)
+        );
+        guard.stop().await.unwrap();
+    }
+
+    // Network-disabled knob: with_network_disabled reaches the ContainerSpec; false
+    // when unset.
+    #[tokio::test]
+    async fn with_network_disabled_carries_through_to_the_container_spec() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_network_disabled();
+        let guard = c.start().await.unwrap();
+        assert!(backend.state.lock().unwrap().created[0].network_disabled);
+        guard.stop().await.unwrap();
+
+        let unset = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = unset.start().await.unwrap();
+        assert!(
+            !backend
+                .state
+                .lock()
+                .unwrap()
+                .created
+                .last()
+                .unwrap()
+                .network_disabled
+        );
+        guard.stop().await.unwrap();
+    }
+
+    // with_disk_limit + with_tmpfs_root together is a typed, fail-fast error —
+    // never reaches create().
+    #[tokio::test]
+    async fn disk_limit_plus_tmpfs_root_is_a_typed_error_before_any_create() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_disk_limit(1024)
+            .with_tmpfs_root(512);
+        let err = expect_start_err(c.start().await, "disk limit + tmpfs root must fail fast");
+        assert!(matches!(err, RightsizeError::RootDiskConflict), "{err}");
+        assert!(backend.state.lock().unwrap().created.is_empty());
+    }
+
+    // with_tmpfs_root(t) > with_memory_limit(m) is a typed, fail-fast error.
+    #[tokio::test]
+    async fn tmpfs_root_exceeding_the_memory_limit_is_a_typed_error() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_memory_limit(512)
+            .with_tmpfs_root(1024);
+        let err = expect_start_err(
+            c.start().await,
+            "tmpfs root exceeding the memory limit must fail fast",
+        );
+        assert!(
+            matches!(
+                err,
+                RightsizeError::TmpfsRootExceedsMemory {
+                    tmpfs_mb: 1024,
+                    memory_mb: 512,
+                }
+            ),
+            "{err}"
+        );
+        assert!(backend.state.lock().unwrap().created.is_empty());
+    }
+
+    // No memory limit at all: a tmpfs root of any size, however large, is never
+    // validated here — msb's own error at boot time is already precise.
+    #[tokio::test]
+    async fn tmpfs_root_without_a_memory_limit_is_not_validated() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_tmpfs_root(u64::MAX);
+        let guard = c
+            .start()
+            .await
+            .expect("no memory limit set means no tmpfs-vs-memory validation");
+        guard.stop().await.unwrap();
+    }
+
+    // with_network_disabled + with_network(...) is a typed, fail-fast error —
+    // never reaches ensure_network or create().
+    #[tokio::test]
+    async fn network_disabled_plus_a_network_is_a_typed_error() {
+        let backend = FakeBackend::new();
+        let net = Arc::new(Network::new_network());
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_network(&net)
+            .with_network_disabled();
+        let err = expect_start_err(
+            c.start().await,
+            "network_disabled + a joined network must fail fast",
+        );
+        assert!(
+            matches!(err, RightsizeError::NetworkDisabledConflict),
+            "{err}"
+        );
+        assert!(backend.state.lock().unwrap().created.is_empty());
+    }
+
     // dedup_env_last_wins in isolation — last value wins, key keeps the position
     // of its FIRST occurrence: an insertion-ordered map's put never moves an
     // existing key.
@@ -5554,9 +5790,18 @@ mod tests {
     async fn adopt_path_registry_hit_running_and_wait_ok_skips_create_and_uses_registry_ports() {
         let backend = ReuseFakeBackend::new();
         let cache_dir = temp_cache_dir("adopt-hit");
-        let identity =
-            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
-                .unwrap();
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
 
         // A previous process already created, started, and registered this
         // sandbox, then exited cleanly (reuse containers are never torn down by
@@ -5601,9 +5846,18 @@ mod tests {
     async fn stale_registry_not_running_removes_and_creates_fresh_and_rewrites_registry() {
         let backend = ReuseFakeBackend::new();
         let cache_dir = temp_cache_dir("adopt-stale");
-        let identity =
-            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
-                .unwrap();
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
 
         crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
             .write_atomic(&sample_registry_entry(&identity, 40321))
@@ -5648,9 +5902,18 @@ mod tests {
     async fn corrupted_registry_json_falls_back_to_fresh_create() {
         let backend = ReuseFakeBackend::new();
         let cache_dir = temp_cache_dir("adopt-corrupt");
-        let identity =
-            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
-                .unwrap();
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
 
         let reuse_dir = cache_dir.join("reuse");
         std::fs::create_dir_all(&reuse_dir).unwrap();
@@ -5763,9 +6026,18 @@ mod tests {
     async fn name_collision_on_create_retries_the_adopt_path_once() {
         let backend = ReuseFakeBackend::new();
         let cache_dir = temp_cache_dir("collision");
-        let identity =
-            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
-                .unwrap();
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
 
         // Deliberately NOT marked running yet: this call's own crash-mid-boot
         // orphan check (find_running, right before create) must see nothing and
@@ -5823,9 +6095,18 @@ mod tests {
     async fn fresh_create_removes_a_running_but_unregistered_orphan_before_creating() {
         let backend = ReuseFakeBackend::new();
         let cache_dir = temp_cache_dir("orphan-recovery");
-        let identity =
-            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
-                .unwrap();
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
 
         // No registry file at all — but a sandbox under the identity's name is
         // already running, exactly as a crash-mid-boot orphan would leave it.
@@ -5865,9 +6146,18 @@ mod tests {
     async fn adopt_with_a_verified_registry_never_calls_remove_by_name() {
         let backend = ReuseFakeBackend::new();
         let cache_dir = temp_cache_dir("orphan-recovery-adopt");
-        let identity =
-            crate::reuse::compute_identity("redis:7-alpine", &[], &None, &[6379], None, &[])
-                .unwrap();
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
 
         backend.mark_running(&identity.name);
         crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)

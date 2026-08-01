@@ -89,6 +89,53 @@ pub enum RightsizeError {
     )]
     ReuseCheckpointConflict,
 
+    /// `.with_disk_limit(...)` was combined with `.with_tmpfs_root(...)` on the
+    /// same container. Raised in `Container::start()`, before any backend work —
+    /// the root disk is either a fixed-size ceiling or RAM-backed, never both.
+    #[error(
+        "with_disk_limit() cannot be combined with with_tmpfs_root() — the root disk is \
+         either size-capped or RAM-backed, not both; drop one"
+    )]
+    RootDiskConflict,
+
+    /// `.with_tmpfs_root(tmpfs_mb)` was combined with `.with_memory_limit(memory_mb)`
+    /// where the tmpfs root would exceed the memory ceiling — a tmpfs root lives
+    /// inside guest memory, so it cannot be larger than the memory the guest is
+    /// allowed. Raised in `Container::start()`, before any backend work. Not
+    /// raised when no memory limit is set at all — msb's own error at boot time is
+    /// already precise for that case.
+    #[error(
+        "with_tmpfs_root({tmpfs_mb}) exceeds with_memory_limit({memory_mb}) — a tmpfs root \
+         lives in guest memory and must fit inside it"
+    )]
+    TmpfsRootExceedsMemory {
+        /// The requested tmpfs root size, in megabytes.
+        tmpfs_mb: u64,
+        /// The configured memory limit, in megabytes.
+        memory_mb: u64,
+    },
+
+    /// `.with_network_disabled()` was combined with `.with_network(...)` on the
+    /// same container. Raised in `Container::start()`, before any backend work —
+    /// a network-disabled container has nothing to join a network with.
+    #[error(
+        "with_network_disabled() cannot be combined with with_network() — a \
+         network-disabled container cannot join a network; drop one"
+    )]
+    NetworkDisabledConflict,
+
+    /// `ContainerGuard::checkpoint()`/`checkpoint_named()` was called on a
+    /// container started with `.with_tmpfs_root(...)` — a tmpfs root is
+    /// RAM-backed and gone the moment the guest stops, so there is nothing
+    /// durable left to snapshot. Raised by the msb backend, first thing in its
+    /// checkpoint path, before the guest is ever stopped.
+    #[error(
+        "this container uses a tmpfs root (with_tmpfs_root), which is ephemeral and cannot \
+         be checkpointed — use with_disk_limit or the default root disk for checkpointable \
+         containers"
+    )]
+    TmpfsRootCheckpoint,
+
     /// `.require_isolation(true)` was set on a `Container` but the active backend's
     /// `capabilities().hardware_isolated` is `false` — e.g. the docker backend, which
     /// shares the host kernel. Raised in `Container::start()`, before any
@@ -409,6 +456,41 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains(".reuse(true)"), "{msg}");
         assert!(msg.contains("from_checkpoint"), "{msg}");
+    }
+
+    #[test]
+    fn root_disk_conflict_names_both_builders() {
+        let e = RightsizeError::RootDiskConflict;
+        let msg = e.to_string();
+        assert!(msg.contains("with_disk_limit()"), "{msg}");
+        assert!(msg.contains("with_tmpfs_root()"), "{msg}");
+    }
+
+    #[test]
+    fn tmpfs_root_exceeds_memory_names_both_values() {
+        let e = RightsizeError::TmpfsRootExceedsMemory {
+            tmpfs_mb: 1024,
+            memory_mb: 512,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("with_tmpfs_root(1024)"), "{msg}");
+        assert!(msg.contains("with_memory_limit(512)"), "{msg}");
+    }
+
+    #[test]
+    fn network_disabled_conflict_names_both_builders() {
+        let e = RightsizeError::NetworkDisabledConflict;
+        let msg = e.to_string();
+        assert!(msg.contains("with_network_disabled()"), "{msg}");
+        assert!(msg.contains("with_network()"), "{msg}");
+    }
+
+    #[test]
+    fn tmpfs_root_checkpoint_names_the_offending_builder() {
+        let e = RightsizeError::TmpfsRootCheckpoint;
+        let msg = e.to_string();
+        assert!(msg.contains("with_tmpfs_root"), "{msg}");
+        assert!(msg.contains("checkpoint"), "{msg}");
     }
 
     #[test]

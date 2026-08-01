@@ -279,6 +279,9 @@ mod tests {
             memory_limit_mb: None,
             keep_alive: false,
             checkpoint_ref: None,
+            disk_limit_mb: None,
+            tmpfs_root_mb: None,
+            network_disabled: false,
         }
     }
 

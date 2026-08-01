@@ -112,6 +112,31 @@ pub struct ContainerSpec {
     /// `from_checkpoint` are not a supported combination (see
     /// `RightsizeError::ReuseCheckpointConflict`). Defaults to `None`.
     pub checkpoint_ref: Option<String>,
+    /// A writable-root-disk ceiling in megabytes — microsandbox-only (emits
+    /// `--root-disk <mb>M`); docker runs its normal disk-backed rootfs with no
+    /// ceiling and ignores this field. Grows only on an msb reboot — the guest
+    /// filesystem never shrinks back down. Mutually exclusive with
+    /// `tmpfs_root_mb`, enforced at `Container::start()` before any backend call
+    /// (`RightsizeError::RootDiskConflict`). Part of the reuse identity hash,
+    /// exactly like `memory_limit_mb`. Defaults to `None`.
+    pub disk_limit_mb: Option<u64>,
+    /// A RAM-backed writable rootfs in megabytes — microsandbox-only (emits
+    /// `--root-disk tmpfs:<mb>M`); docker runs its normal disk-backed rootfs and
+    /// ignores this field. Must not exceed `memory_limit_mb` when the latter is
+    /// set, and is mutually exclusive with `disk_limit_mb` — both enforced at
+    /// `Container::start()` before any backend call
+    /// (`RightsizeError::TmpfsRootExceedsMemory`, `RightsizeError::RootDiskConflict`).
+    /// A tmpfs root is ephemeral and cannot be checkpointed
+    /// (`RightsizeError::TmpfsRootCheckpoint`). Part of the reuse identity hash,
+    /// exactly like `memory_limit_mb`. Defaults to `None`.
+    pub tmpfs_root_mb: Option<u64>,
+    /// Blocks public-internet access on microsandbox (emits `--net private` —
+    /// published ports and private-range links keep working); docker ignores this
+    /// field and runs with normal networking. Mutually exclusive with
+    /// `network_id`, enforced at `Container::start()` before any backend call
+    /// (`RightsizeError::NetworkDisabledConflict`). Part of the reuse identity
+    /// hash, exactly like `memory_limit_mb`. Defaults to `false`.
+    pub network_disabled: bool,
 }
 
 impl ContainerSpec {
@@ -135,6 +160,9 @@ impl ContainerSpec {
             memory_limit_mb: None,
             keep_alive: false,
             checkpoint_ref: None,
+            disk_limit_mb: None,
+            tmpfs_root_mb: None,
+            network_disabled: false,
         }
     }
 }
@@ -158,6 +186,9 @@ mod tests {
         assert_eq!(spec.memory_limit_mb, None);
         assert!(!spec.keep_alive);
         assert!(spec.checkpoint_ref.is_none());
+        assert_eq!(spec.disk_limit_mb, None);
+        assert_eq!(spec.tmpfs_root_mb, None);
+        assert!(!spec.network_disabled);
     }
 
     #[test]
