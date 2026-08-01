@@ -628,8 +628,11 @@ async fn create_started_container(
         let handle = match backend.create(spec).await {
             Ok(h) => h,
             Err(e) => {
-                // This attempt never produced a live sandbox — undo the ledger append
-                // above so a discarded name doesn't sit in `.sandboxes` forever.
+                // This attempt never produced a live sandbox — give its ports back to
+                // the pool (the reuse path's create branch already does; without this
+                // they stay issued for the life of the process) and undo the ledger
+                // append above so a discarded name doesn't sit in `.sandboxes` forever.
+                release_ports(&mapped_ports);
                 crate::reaper::after_stop(
                     &attempt_name,
                     attempt_keep_alive,
@@ -2336,6 +2339,10 @@ mod tests {
         hardware_isolated: bool,
         checkpoint_capable: bool,
         checkpoint_restarts_workload: bool,
+        /// When true, `create` itself fails outright (after recording the
+        /// attempted spec, so a test can read the ports the attempt carried) —
+        /// the "failed create releases its ports" test's fixture.
+        fail_create: bool,
         /// When true, `create_checkpoint` fails outright — the
         /// "checkpoint_named writes no registry entry on backend failure" test's
         /// fixture.
@@ -2368,6 +2375,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2383,6 +2391,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2398,6 +2407,23 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
+                fail_create_checkpoint: false,
+                fail_export_checkpoint: false,
+                probe_result: StdMutex::new(Some(true)),
+                import_effective_ref: StdMutex::new(None),
+                name: "fake",
+            })
+        }
+        fn failing_create() -> Arc<Self> {
+            Arc::new(Self {
+                state: StdMutex::new(FakeBackendState::default()),
+                fail_install_network_links: false,
+                fail_ensure_network: false,
+                hardware_isolated: false,
+                checkpoint_capable: false,
+                checkpoint_restarts_workload: false,
+                fail_create: true,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2415,6 +2441,7 @@ mod tests {
                 hardware_isolated: true,
                 checkpoint_capable: false,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2433,6 +2460,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2452,6 +2480,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: true,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2471,6 +2500,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2488,6 +2518,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: true,
                 fail_export_checkpoint: false,
                 probe_result: StdMutex::new(Some(true)),
@@ -2506,6 +2537,7 @@ mod tests {
                 hardware_isolated: false,
                 checkpoint_capable: true,
                 checkpoint_restarts_workload: false,
+                fail_create: false,
                 fail_create_checkpoint: false,
                 fail_export_checkpoint: true,
                 probe_result: StdMutex::new(Some(true)),
@@ -2543,6 +2575,11 @@ mod tests {
         }
         async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
             self.state.lock().unwrap().created.push(spec.clone());
+            if self.fail_create {
+                return Err(RightsizeError::Backend(
+                    "injected create failure".to_string(),
+                ));
+            }
             Ok(Box::new(FakeHandle {
                 id: spec.name.clone(),
                 spec,
@@ -4695,6 +4732,36 @@ mod tests {
             !free_ports().issued_view().contains(&port),
             "port {port} must be released by the wait-strategy-failure cleanup path"
         );
+    }
+
+    // A failed `backend.create` must give the attempt's host ports back to the
+    // pool — proven against FreePorts' own issued_view() via the ports the fake
+    // backend recorded on the attempted spec. Without the release in the
+    // create-error branch, the ports stay issued for the life of the process.
+    #[tokio::test]
+    async fn a_failed_create_releases_its_allocated_host_ports() {
+        let backend = FakeBackend::failing_create();
+        let c = Container::new("redis:8.6-alpine")
+            .with_backend(backend.clone())
+            .with_exposed_ports(&[6379, 6380]);
+
+        let err = expect_start_err(c.start().await, "injected create failure must fail start()");
+        assert!(err.to_string().contains("injected create failure"), "{err}");
+
+        let attempts = backend.state.lock().unwrap().created.clone();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "a create failure is not a port-bind conflict and must not retry"
+        );
+        assert_eq!(attempts[0].ports.len(), 2);
+        for binding in &attempts[0].ports {
+            assert!(
+                !free_ports().issued_view().contains(&binding.host_port),
+                "host port {} must be released after the failed create",
+                binding.host_port
+            );
+        }
     }
 
     // U5 (injection point 2/2): install_network_links failure stops the container too,
