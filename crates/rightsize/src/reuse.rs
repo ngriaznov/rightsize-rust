@@ -16,8 +16,9 @@
 //!
 //! **Identity**: `sha256` over a canonical (stable key order, no whitespace) JSON
 //! serialization of `{image, env (sorted by key), command, exposedPorts (sorted),
-//! memoryLimitMb, diskLimitMb, tmpfsRootMb, networkDisabled, copies:
-//! [{guestPath, sha256(content)}] sorted by guestPath}` — this exact shape and key
+//! memoryLimitMb, copies: [{guestPath, sha256(content)}] sorted by guestPath,
+//! then diskLimitMb/tmpfsRootMb/networkDisabled — each omitted entirely at its
+//! default}` — this exact shape and key
 //! order is a CROSS-LANGUAGE CONTRACT: the same logical spec must hash identically
 //! in the Kotlin/Node/Rust implementations, pinned by a fixed vector (see the
 //! `pinned_cross_language_vector_hashes_to_the_pinned_value` test below). The
@@ -65,9 +66,11 @@ pub(crate) struct Identity {
 /// genuine I/O error here (an unreadable mount) is propagated rather than swallowed,
 /// since the same file would fail the container's own start moments later anyway.
 ///
-/// `disk_limit_mb`, `tmpfs_root_mb`, and `network_disabled` are hashed exactly like
-/// `memory_limit_mb` — two containers that would boot with a different root-disk
-/// ceiling, tmpfs size, or network posture are not interchangeable for reuse.
+/// `disk_limit_mb`, `tmpfs_root_mb`, and `network_disabled` enter the hash the
+/// moment they are set — two containers that would boot with a different root-disk
+/// ceiling, tmpfs size, or network posture are not interchangeable for reuse. At
+/// their defaults they are omitted from the canonical JSON entirely, so a spec that
+/// never touches them hashes as it did before the fields existed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_identity(
     image: &str,
@@ -112,8 +115,9 @@ pub(crate) fn compute_identity(
 /// Builds the exact canonical JSON string the identity hash is computed over —
 /// hand-assembled (not a `serde_json::Map`, whose default `BTreeMap` backing would
 /// sort keys alphabetically instead of the spec's fixed order) so the top-level key
-/// order (`image`, `env`, `command`, `exposedPorts`, `memoryLimitMb`, `diskLimitMb`,
-/// `tmpfsRootMb`, `networkDisabled`, `copies`) matches the cross-language contract
+/// order (`image`, `env`, `command`, `exposedPorts`, `memoryLimitMb`, `copies`,
+/// then `diskLimitMb`/`tmpfsRootMb`/`networkDisabled` — each omitted at its
+/// default) matches the cross-language contract
 /// exactly, with every scalar/string individually JSON-encoded via
 /// `serde_json::to_string` for correct escaping. No whitespace anywhere — that's
 /// the "canonical" half of the contract.
@@ -168,21 +172,6 @@ fn canonical_json(
         None => out.push_str("null"),
     }
 
-    out.push_str(",\"diskLimitMb\":");
-    match disk_limit_mb {
-        Some(mb) => out.push_str(&mb.to_string()),
-        None => out.push_str("null"),
-    }
-
-    out.push_str(",\"tmpfsRootMb\":");
-    match tmpfs_root_mb {
-        Some(mb) => out.push_str(&mb.to_string()),
-        None => out.push_str("null"),
-    }
-
-    out.push_str(",\"networkDisabled\":");
-    out.push_str(if network_disabled { "true" } else { "false" });
-
     out.push_str(",\"copies\":[");
     for (i, (guest_path, sha)) in copies_sorted.iter().enumerate() {
         if i > 0 {
@@ -194,7 +183,24 @@ fn canonical_json(
         out.push_str(&json_string(sha));
         out.push('}');
     }
-    out.push_str("]}");
+    out.push(']');
+
+    // Unlike `memoryLimitMb` (always rendered, `null` when unset), these three are
+    // omitted entirely at their defaults, so a spec that never touches them renders
+    // — and hashes — byte-for-byte as it did before the fields existed, keeping the
+    // pinned cross-language vector pinned. A set value still changes the hash.
+    if let Some(mb) = disk_limit_mb {
+        out.push_str(",\"diskLimitMb\":");
+        out.push_str(&mb.to_string());
+    }
+    if let Some(mb) = tmpfs_root_mb {
+        out.push_str(",\"tmpfsRootMb\":");
+        out.push_str(&mb.to_string());
+    }
+    if network_disabled {
+        out.push_str(",\"networkDisabled\":true");
+    }
+    out.push('}');
     out
 }
 
@@ -381,14 +387,14 @@ mod tests {
     /// spec's "Identity" section must hash to this exact sha256, identically in the
     /// Kotlin/Node/Rust implementations. Computed once (sha256 of the canonical
     /// JSON below) and pinned here so a change to `canonical_json`'s shape that
-    /// breaks cross-language parity fails loudly. Extended for the 0.7.0
-    /// `diskLimitMb`/`tmpfsRootMb`/`networkDisabled` fields — same vector as
-    /// before, with those three now present at their defaults.
+    /// breaks cross-language parity fails loudly. `diskLimitMb`/`tmpfsRootMb`/
+    /// `networkDisabled` are omitted at their defaults, so this vector — which
+    /// predates those fields — hashes exactly as it always has.
     ///
     /// Canonical JSON this hashes:
-    /// `{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"diskLimitMb":null,"tmpfsRootMb":null,"networkDisabled":false,"copies":[]}`
+    /// `{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"copies":[]}`
     const PINNED_VECTOR_HASH: &str =
-        "1a3acb721b9d885d64ce09b8ab0ff6360507d25ba58d5f23718cbf9935d11a32";
+        "799aad5a3338ce3d36999c7ff2733d4673c0592d417563f334544693ec1907a5";
 
     fn pinned_vector_identity() -> Identity {
         compute_identity(
@@ -436,7 +442,26 @@ mod tests {
         );
         assert_eq!(
             json,
-            r#"{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"diskLimitMb":null,"tmpfsRootMb":null,"networkDisabled":false,"copies":[]}"#
+            r#"{"image":"redis:7-alpine","env":{"A":"1","B":"2"},"command":[],"exposedPorts":[6379],"memoryLimitMb":null,"copies":[]}"#
+        );
+    }
+
+    #[test]
+    fn set_root_disk_and_network_fields_render_after_copies() {
+        let json = canonical_json(
+            "redis:7-alpine",
+            &[],
+            &[],
+            &[],
+            None,
+            Some(1024),
+            Some(512),
+            true,
+            &[],
+        );
+        assert_eq!(
+            json,
+            r#"{"image":"redis:7-alpine","env":{},"command":[],"exposedPorts":[],"memoryLimitMb":null,"copies":[],"diskLimitMb":1024,"tmpfsRootMb":512,"networkDisabled":true}"#
         );
     }
 
