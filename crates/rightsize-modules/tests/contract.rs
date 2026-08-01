@@ -1788,7 +1788,11 @@ async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_
     let expected_parent = rightsize::cache_dir::dir().join("checkpoints");
     assert_eq!(ref_path.parent(), Some(expected_parent.as_path()));
     assert!(ref_path.is_dir(), "{}", cp.checkpoint_ref);
-    assert!(ref_path.join("snapshot.json").is_file(), "{}", cp.checkpoint_ref);
+    assert!(
+        ref_path.join("snapshot.json").is_file(),
+        "{}",
+        cp.checkpoint_ref
+    );
 
     guard.stop().await.expect("stop the original container");
 
