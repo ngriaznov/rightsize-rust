@@ -9,6 +9,15 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.6.2] - 2026-08-01
+
+### Fixed
+
+- A failed container create no longer leaks its pre-allocated host ports: the
+  create-error path now returns them to the in-process allocator, as the reuse
+  path already did. Without this, every failed create attempt permanently
+  retired its ports from the pool for the life of the process.
+
 ## [0.6.1] - 2026-08-01
 
 ### Changed
@@ -587,8 +596,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.1...HEAD
-[0.6.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.0...v0.6.1
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ngriaznov/rightsize-rust/compare/v0.4.0...v0.5.0
