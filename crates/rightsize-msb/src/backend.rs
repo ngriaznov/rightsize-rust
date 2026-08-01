@@ -520,7 +520,12 @@ const STATE_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// ```text
 /// error: runtime error: microsandbox install operation in progress until
 /// 2026-07-31 20:35:23.760135600; retry after it completes
+/// error: runtime error: another microsandbox install operation is in progress
+/// until 2026-08-01 19:26:19.025098100
 /// ```
+///
+/// Two phrasings, one condition — msb words the refusal differently depending on
+/// which side holds the lock, so the match tolerates the optional "is".
 ///
 /// The deadline in the message reads ~30 minutes out, but every captured occurrence
 /// cleared within the same run — boots seconds later succeeded — so the boot path
@@ -529,6 +534,7 @@ const STATE_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// varies per occurrence.
 fn is_msb_install_lock_active(output: &str) -> bool {
     output.contains("install operation in progress")
+        || output.contains("install operation is in progress")
 }
 
 /// How long the boot path keeps polling while msb's install-operation lock is held,
@@ -2813,6 +2819,12 @@ mod tests {
         // stable phrase only.
         assert!(is_msb_install_lock_active(
             "error: runtime error: microsandbox install operation in progress until 2027-01-01 00:00:00.000000000; retry after it completes"
+        ));
+        // The second phrasing, also captured from a windows-2025 hosted runner: msb
+        // words the refusal with an "is" (and no retry hint) when the other side
+        // holds the lock.
+        assert!(is_msb_install_lock_active(
+            "error: runtime error: another microsandbox install operation is in progress until 2026-08-01 19:26:19.025098100"
         ));
     }
 
