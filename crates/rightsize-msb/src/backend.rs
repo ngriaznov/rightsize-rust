@@ -352,6 +352,47 @@ fn is_snapshot_not_found(output: &str) -> bool {
     output.to_lowercase().contains("snapshot not found")
 }
 
+/// Mints this backend's checkpoint ref for `nonce_or_name`: an absolute path
+/// under `<cache_dir>/checkpoints/`, whose basename is the actual snapshot name
+/// `msb` is given (`rz-ckpt-<nonce_or_name>`) — the checkpoint dest-dir feature's
+/// ref-minting site (`MsbCliBackend::create_checkpoint`). Pure and
+/// `cache_dir`-parameterized so the shape is unit-testable without touching
+/// process env or the filesystem; production passes
+/// [`rightsize::cache_dir::dir`]'s result.
+fn mint_checkpoint_ref(nonce_or_name: &str, cache_dir: &Path) -> PathBuf {
+    cache_dir
+        .join("checkpoints")
+        .join(format!("rz-ckpt-{nonce_or_name}"))
+}
+
+/// `checkpoint_ref` is a "path ref" — a ref minted by this backend's own
+/// `mint_checkpoint_ref` (this version and later) rather than a bare snapshot
+/// name minted before it — iff it's an absolute path. Every checkpoint method
+/// here branches on this to keep handling both shapes: a bare-name ref minted
+/// before this change must keep working everywhere.
+fn path_ref_dir(checkpoint_ref: &str) -> Option<PathBuf> {
+    let path = Path::new(checkpoint_ref);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// A path ref's own snapshot NAME — what msb itself was given at `snapshot
+/// create` time and still knows it as (`snapshot rm`/`snapshot inspect` both take
+/// this, never the dest-dir path). For a bare-name ref this is a no-op: it's
+/// already just its own basename.
+fn ref_basename(checkpoint_ref: &str) -> String {
+    Path::new(checkpoint_ref)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| checkpoint_ref.to_string())
+}
+
+/// `dir` (a path ref's artifact directory) holds a real checkpoint iff it exists
+/// AND contains `snapshot.json` — [`MsbCliBackend::has_checkpoint`]'s filesystem
+/// check for a path ref, no `msb` call involved.
+fn path_ref_artifact_exists(dir: &Path) -> bool {
+    dir.is_dir() && dir.join("snapshot.json").is_file()
+}
+
 /// True if `output` (an `msb snapshot load` child's combined stdout/stderr)
 /// names msb's "already imported" wording — `error: snapshot already exists:
 /// <path>`. For a content-addressed archive this IS success: the artifact is
@@ -821,24 +862,51 @@ impl SandboxBackend for MsbCliBackend {
     }
 
     /// Disk-snapshot checkpointing: `msb stop <name>` → `msb snapshot create --from
-    /// <name> rz-ckpt-<nonce>` → `msb rm <name>` → a fresh ATTACHED `msb run
-    /// --from-snapshot <ref>` re-boot under the same name/ports/env/memory — see
-    /// `msb_checkpoint_cycle` for the orchestration and its own unit tests for the
-    /// failure paths. Runs on a blocking thread, like every other multi-step msb
-    /// invocation in this backend. The re-boot reuses [`spawn_and_await_running`],
-    /// this backend's own normal boot path (already the shape `Container::
-    /// from_checkpoint`'s restores use) — see the module docs for why an msb
-    /// `start` resume is not used here. The handle's held attached child is
-    /// swapped to the new one on success; the ledger and this handle's identity
-    /// (name, spec) are untouched either way.
+    /// <name> rz-ckpt-<nonce> --dest-dir <cache>/checkpoints` → `msb rm <name>` → a
+    /// fresh ATTACHED `msb run --from-snapshot <ref>` re-boot under the same
+    /// name/ports/env/memory — see `msb_checkpoint_cycle` for the orchestration and
+    /// its own unit tests for the failure paths. Runs on a blocking thread, like
+    /// every other multi-step msb invocation in this backend. The re-boot reuses
+    /// [`spawn_and_await_running`], this backend's own normal boot path (already
+    /// the shape `Container::from_checkpoint`'s restores use) — see the module
+    /// docs for why an msb `start` resume is not used here. The handle's held
+    /// attached child is swapped to the new one on success; the ledger and this
+    /// handle's identity (name, spec) are untouched either way.
+    ///
+    /// The returned ref is the ABSOLUTE PATH to the snapshot artifact under
+    /// [`rightsize::cache_dir::dir`] — `<cache dir>/checkpoints/rz-ckpt-<nonce>` —
+    /// not a bare snapshot name, so the artifact lives somewhere every process on
+    /// this host agrees on rather than wherever msb's own default snapshot store
+    /// happens to be. A ref minted before this change is a bare name, not a path,
+    /// and every method here (`has_checkpoint`, `remove_checkpoint`, this method's
+    /// own `--from-snapshot` re-boot) keeps handling that shape too — see
+    /// [`path_ref_dir`].
+    ///
+    /// A container started with [`ContainerSpec::tmpfs_root_mb`] set is refused
+    /// outright, before `handle` is stopped or anything else here runs: its root
+    /// disk is RAM-backed and gone the moment the guest stops, so there is nothing
+    /// left to snapshot.
     async fn create_checkpoint(&self, handle: &dyn SandboxHandle, nonce: &str) -> Result<String> {
+        if handle.spec().tmpfs_root_mb.is_some() {
+            return Err(RightsizeError::TmpfsRootCheckpoint);
+        }
+
         let id = handle.id().to_string();
-        let snapshot_name = format!("rz-ckpt-{nonce}");
+        let ref_path = mint_checkpoint_ref(nonce, &rightsize::cache_dir::dir());
+        let checkpoint_dir = ref_path
+            .parent()
+            .expect("mint_checkpoint_ref always nests the ref under a checkpoints/ directory")
+            .to_path_buf();
+        let basename = ref_path
+            .file_name()
+            .expect("mint_checkpoint_ref always yields a path with a file name")
+            .to_string_lossy()
+            .into_owned();
+        let snapshot_ref = ref_path.display().to_string();
         let msb = self.msb.clone();
         let mut reboot_spec = handle.spec().clone();
-        reboot_spec.checkpoint_ref = Some(snapshot_name.clone());
+        reboot_spec.checkpoint_ref = Some(snapshot_ref.clone());
         let name_for_thread = id.clone();
-        let snapshot_for_thread = snapshot_name.clone();
         // Taken now (not inside the blocking closure) so a panic there can't leave
         // this handle's `HandleState` holding a stale reference to a child this
         // method is already about to replace.
@@ -850,6 +918,12 @@ impl SandboxBackend for MsbCliBackend {
             .and_then(|state| state.attached.take());
 
         let new_child = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&checkpoint_dir).map_err(|e| {
+                RightsizeError::Backend(format!(
+                    "could not create checkpoint directory {}: {e}",
+                    checkpoint_dir.display()
+                ))
+            })?;
             let mut invoke =
                 |args: &[String]| invoke_standalone(&msb, args, CHECKPOINT_STEP_TIMEOUT);
             let mut reboot = || spawn_and_await_running(&msb, &reboot_spec);
@@ -857,7 +931,8 @@ impl SandboxBackend for MsbCliBackend {
                 &mut invoke,
                 &mut reboot,
                 &name_for_thread,
-                &snapshot_for_thread,
+                &basename,
+                &checkpoint_dir,
             );
             // The cycle's own `stop` step already halted the sandbox by the time
             // this returns — reap the previously-attached child (this handle's
@@ -875,22 +950,37 @@ impl SandboxBackend for MsbCliBackend {
         if let Some(state) = handles.get_mut(&id) {
             state.attached = Some(new_child);
         }
-        Ok(snapshot_name)
+        Ok(snapshot_ref)
     }
 
-    /// `msb snapshot rm <ref>` — best-effort, matching [`Self::remove_by_name`]'s
-    /// own "not found is fine" contract.
+    /// `msb snapshot rm <basename>` — best-effort, matching [`Self::remove_by_name`]'s
+    /// own "not found is fine" contract; spike-verified to delete both msb's index
+    /// entry and the dest-dir artifact directory for a path ref. `checkpoint_ref`'s
+    /// basename is what msb itself knows the snapshot as either way (a bare-name
+    /// ref already IS its own basename). Afterwards, if `checkpoint_ref` is a path
+    /// ref and its artifact directory is somehow still there (msb's index having
+    /// lost track of it), this best-effort recursively deletes it too.
     async fn remove_checkpoint(&self, checkpoint_ref: &str) -> Result<()> {
         let msb = self.msb.clone();
-        let snapshot_ref = checkpoint_ref.to_string();
+        let basename = ref_basename(checkpoint_ref);
+        let artifact_dir = path_ref_dir(checkpoint_ref);
         let _ = tokio::task::spawn_blocking(move || {
-            invoke_standalone(&msb, &commands::snapshot_rm(&snapshot_ref), STOP_TIMEOUT)
+            let result = invoke_standalone(&msb, &commands::snapshot_rm(&basename), STOP_TIMEOUT);
+            if let Some(dir) = &artifact_dir {
+                if dir.exists() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+            result
         })
         .await;
         Ok(())
     }
 
-    /// `msb snapshot inspect <ref>` — the named-checkpoint existence probe
+    /// A path ref (see [`path_ref_dir`]) is checked on the filesystem instead —
+    /// its artifact directory existing AND containing `snapshot.json` — with no
+    /// `msb` call at all. A bare-name ref falls through to `msb snapshot inspect
+    /// <ref>` — the named-checkpoint existence probe
     /// (`SandboxBackend::has_checkpoint`, `Checkpoint::find`'s staleness check).
     /// Exit 0 -> `Ok(true)`. A nonzero exit whose output names msb's "not found"
     /// wording (see [`is_snapshot_not_found`]) -> `Ok(false)`. Any other nonzero
@@ -898,6 +988,15 @@ impl SandboxBackend for MsbCliBackend {
     /// `RightsizeError::Backend` — this SPI forbids a probe failure from resolving
     /// to "absent."
     async fn has_checkpoint(&self, checkpoint_ref: &str) -> Result<bool> {
+        if let Some(dir) = path_ref_dir(checkpoint_ref) {
+            let exists = tokio::task::spawn_blocking(move || path_ref_artifact_exists(&dir))
+                .await
+                .map_err(|e| {
+                    RightsizeError::Backend(format!("checkpoint probe task panicked: {e}"))
+                })?;
+            return Ok(exists);
+        }
+
         let msb = self.msb.clone();
         let snapshot_ref = checkpoint_ref.to_string();
         let result = tokio::task::spawn_blocking(move || {
@@ -1394,16 +1493,18 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
 }
 
 /// Orchestrates the checkpoint feature's stop → snapshot → rm → re-boot cycle
-/// against `name` (a running sandbox), taking a snapshot named `snapshot_name`,
-/// via `invoke` (the plain one-shot `stop`/`snapshot create`/`rm` commands) and
-/// `reboot` (the actual re-boot of a fresh attached sandbox from that snapshot,
-/// under the same name). Both are injected rather than hardcoded — `invoke` as a
-/// pure argv-in/`ExecResult`-out closure, `reboot` generic over its success type
-/// `T` (production instantiates it with [`spawn_and_await_running`], returning the
-/// live [`Child`] this backend needs to hold; tests instantiate it with a bare
-/// `Result<()>`) — so this orchestration logic (the ordering, and which steps
-/// short-circuit which) is unit-testable without a real `msb` binary or child
-/// process.
+/// against `name` (a running sandbox), taking a snapshot named `basename` and
+/// storing its artifact under `dest_dir`, via `invoke` (the plain one-shot
+/// `stop`/`snapshot create`/`rm` commands) and `reboot` (the actual re-boot of a
+/// fresh attached sandbox from that snapshot, under the same name). Both are
+/// injected rather than hardcoded — `invoke` as a pure argv-in/`ExecResult`-out
+/// closure, `reboot` generic over its success type `T` (production instantiates
+/// it with [`spawn_and_await_running`], returning the live [`Child`] this backend
+/// needs to hold; tests instantiate it with a bare `Result<()>`) — so this
+/// orchestration logic (the ordering, and which steps short-circuit which) is
+/// unit-testable without a real `msb` binary or child process. `dest_dir`
+/// already exists by the time this runs — [`MsbCliBackend::create_checkpoint`]
+/// creates it first.
 ///
 /// This replaces the former `msb stop` → `msb snapshot create` → `msb start`
 /// cycle: `msb start` is `Sandbox::start_detached` in upstream microsandbox, whose
@@ -1423,14 +1524,16 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
 ///   best-effort restart-for-the-caller here, since that restart would be exactly
 ///   the broken `msb start` call this cycle no longer makes.
 /// - A failure to reboot after a successful snapshot (whether `rm` silently failed
-///   to free the name, or the reboot itself failed) surfaces an error naming
-///   `snapshot_name` and `Container::from_checkpoint(...)` as the recovery path —
-///   the sandbox is gone, but its state lives on in the snapshot.
+///   to free the name, or the reboot itself failed) surfaces an error naming the
+///   full checkpoint ref (`dest_dir`/`basename`) and
+///   `Container::from_checkpoint(...)` as the recovery path — the sandbox is
+///   gone, but its state lives on in the snapshot.
 fn msb_checkpoint_cycle<T>(
     invoke: &mut dyn FnMut(&[String]) -> Result<ExecResult>,
     reboot: &mut dyn FnMut() -> Result<T>,
     name: &str,
-    snapshot_name: &str,
+    basename: &str,
+    dest_dir: &Path,
 ) -> Result<T> {
     let stop = invoke(&commands::stop(name))?;
     if stop.exit_code != 0 {
@@ -1441,20 +1544,23 @@ fn msb_checkpoint_cycle<T>(
         )));
     }
 
-    match invoke(&commands::snapshot_create(name, snapshot_name)) {
+    match invoke(&commands::snapshot_create(name, basename, Some(dest_dir))) {
         Ok(r) if r.exit_code == 0 => {}
         Ok(r) => {
             return Err(RightsizeError::Backend(format!(
-                "msb snapshot create --from {name} {snapshot_name} failed (exit {}): {} — the \
-                 sandbox is left stopped; run `msb start {name}` by hand to bring it back up",
+                "msb snapshot create --from {name} {basename} --dest-dir {} failed (exit {}): \
+                 {} — the sandbox is left stopped; run `msb start {name}` by hand to bring it \
+                 back up",
+                dest_dir.display(),
                 r.exit_code,
                 r.stderr.trim()
             )));
         }
         Err(e) => {
             return Err(RightsizeError::Backend(format!(
-                "msb snapshot create --from {name} {snapshot_name} failed: {e} — the sandbox is \
-                 left stopped; run `msb start {name}` by hand to bring it back up"
+                "msb snapshot create --from {name} {basename} --dest-dir {} failed: {e} — the \
+                 sandbox is left stopped; run `msb start {name}` by hand to bring it back up",
+                dest_dir.display()
             )));
         }
     }
@@ -1465,10 +1571,11 @@ fn msb_checkpoint_cycle<T>(
     // consequence (a lingering sandbox collides on the name) as the error below.
     let _ = invoke(&commands::rm(name));
 
+    let checkpoint_ref = dest_dir.join(basename).display().to_string();
     reboot().map_err(|e| {
         RightsizeError::Backend(format!(
-            "re-booting sandbox {name} from checkpoint {snapshot_name} failed ({e}) — the \
-             sandbox was removed but its state is preserved in checkpoint {snapshot_name}, \
+            "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
+             sandbox was removed but its state is preserved in checkpoint {checkpoint_ref}, \
              restorable via Container::from_checkpoint(...)"
         ))
     })
@@ -1825,14 +1932,25 @@ mod tests {
                 log.borrow_mut().push("reboot".to_string());
                 Ok(())
             };
-            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                Path::new("/cache/checkpoints"),
+            )
         };
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             *log.borrow(),
             vec![
                 commands::stop("rz-abc-1").join(" "),
-                commands::snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe").join(" "),
+                commands::snapshot_create(
+                    "rz-abc-1",
+                    "rz-ckpt-deadbeefcafe",
+                    Some(Path::new("/cache/checkpoints"))
+                )
+                .join(" "),
                 commands::rm("rz-abc-1").join(" "),
                 "reboot".to_string(),
             ]
@@ -1864,7 +1982,13 @@ mod tests {
                 reboot_called = true;
                 Ok(())
             };
-            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                Path::new("/cache/checkpoints"),
+            )
         };
         let err = result.expect_err("a failed snapshot step must propagate as an error");
         let msg = err.to_string();
@@ -1899,7 +2023,13 @@ mod tests {
                 reboot_called = true;
                 Ok(())
             };
-            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                Path::new("/cache/checkpoints"),
+            )
         };
         assert!(result.is_err());
         assert_eq!(
@@ -1924,12 +2054,26 @@ mod tests {
                 })
             };
             let mut reboot = || -> Result<()> { Err(RightsizeError::Backend("boom".to_string())) };
-            msb_checkpoint_cycle(&mut invoke, &mut reboot, "rz-abc-1", "rz-ckpt-deadbeefcafe")
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                Path::new("/cache/checkpoints"),
+            )
         };
         let err = result.expect_err("a failed reboot must surface, not be swallowed");
         let msg = err.to_string();
         assert!(msg.contains("boom"), "{msg}");
-        assert!(msg.contains("rz-ckpt-deadbeefcafe"), "{msg}");
+        assert!(
+            msg.contains(
+                &Path::new("/cache/checkpoints")
+                    .join("rz-ckpt-deadbeefcafe")
+                    .display()
+                    .to_string()
+            ),
+            "{msg}"
+        );
         assert!(msg.contains("Container::from_checkpoint"), "{msg}");
         assert_eq!(
             calls.len(),
@@ -1937,6 +2081,226 @@ mod tests {
             "rm must still be attempted before a reboot failure surfaces: {calls:?}"
         );
         assert_eq!(calls[2], commands::rm("rz-abc-1"));
+    }
+
+    // ---- checkpoint dest-dir ref shape: minting, path-vs-bare-name, basename ----
+
+    #[test]
+    fn mint_checkpoint_ref_is_an_absolute_path_under_cache_dir_checkpoints() {
+        let cache_dir = Path::new("/home/u/.cache/rightsize");
+        let ref_path = mint_checkpoint_ref("deadbeefcafe", cache_dir);
+        assert_eq!(
+            ref_path,
+            Path::new("/home/u/.cache/rightsize/checkpoints/rz-ckpt-deadbeefcafe")
+        );
+        assert!(ref_path.is_absolute());
+    }
+
+    #[test]
+    fn mint_checkpoint_ref_carries_a_caller_chosen_name_through_unchanged() {
+        // `checkpoint_named` passes its caller-chosen name, not a random nonce —
+        // this must land in the ref exactly like a nonce would.
+        let ref_path = mint_checkpoint_ref("seeded-db", Path::new("/cache"));
+        assert_eq!(ref_path, Path::new("/cache/checkpoints/rz-ckpt-seeded-db"));
+    }
+
+    #[test]
+    fn path_ref_dir_recognizes_an_absolute_path_and_rejects_a_bare_name() {
+        assert_eq!(
+            path_ref_dir("/cache/checkpoints/rz-ckpt-deadbeefcafe"),
+            Some(PathBuf::from("/cache/checkpoints/rz-ckpt-deadbeefcafe"))
+        );
+        assert_eq!(
+            path_ref_dir("rz-ckpt-deadbeefcafe"),
+            None,
+            "a bare name minted before dest-dir checkpoints must not be mistaken for a path ref"
+        );
+    }
+
+    #[test]
+    fn ref_basename_extracts_the_snapshot_name_from_a_path_ref_and_is_a_no_op_on_a_bare_name() {
+        assert_eq!(
+            ref_basename("/cache/checkpoints/rz-ckpt-deadbeefcafe"),
+            "rz-ckpt-deadbeefcafe"
+        );
+        assert_eq!(ref_basename("rz-ckpt-deadbeefcafe"), "rz-ckpt-deadbeefcafe");
+    }
+
+    #[test]
+    fn path_ref_artifact_exists_requires_both_the_directory_and_snapshot_json() {
+        let dir = unique_test_dir("artifact-exists");
+        let artifact_dir = dir.join("rz-ckpt-deadbeefcafe");
+
+        assert!(
+            !path_ref_artifact_exists(&artifact_dir),
+            "a directory that was never created is not an artifact"
+        );
+
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        assert!(
+            !path_ref_artifact_exists(&artifact_dir),
+            "a directory with no snapshot.json is not a complete artifact"
+        );
+
+        std::fs::write(artifact_dir.join("snapshot.json"), b"{}").unwrap();
+        assert!(path_ref_artifact_exists(&artifact_dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- checkpoint dest-dir mechanics: create_checkpoint/has_checkpoint/
+    // remove_checkpoint against a fake `msb`, or against no `msb` at all when the
+    // path-ref branch never needs one ----
+
+    #[tokio::test]
+    async fn create_checkpoint_on_a_tmpfs_root_container_refuses_before_touching_msb() {
+        let backend = MsbCliBackend::new(PathBuf::from("/definitely/not/a/real/msb"));
+        let handle = Handle {
+            spec: ContainerSpec {
+                tmpfs_root_mb: Some(256),
+                ..ContainerSpec::new("rz-abc-1", "alpine:3.19", "abc")
+            },
+        };
+
+        let err = backend
+            .create_checkpoint(&handle, "deadbeefcafe")
+            .await
+            .expect_err("a tmpfs-root container must never reach msb");
+        assert!(
+            matches!(err, RightsizeError::TmpfsRootCheckpoint),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_checkpoint_on_a_path_ref_is_true_when_the_artifact_dir_has_snapshot_json() {
+        let dir = unique_test_dir("has-checkpoint-path-ref-true");
+        let artifact_dir = dir.join("checkpoints").join("rz-ckpt-deadbeefcafe");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("snapshot.json"), b"{}").unwrap();
+        // No msb binary at this path — a path-ref probe must never invoke it.
+        let backend = MsbCliBackend::new(PathBuf::from("/definitely/not/a/real/msb"));
+
+        let present = backend
+            .has_checkpoint(&artifact_dir.display().to_string())
+            .await
+            .expect("a path-ref probe never touches msb, so a bogus msb path can't fail it");
+        assert!(present);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn has_checkpoint_on_a_path_ref_is_false_when_snapshot_json_is_missing() {
+        let dir = unique_test_dir("has-checkpoint-path-ref-incomplete");
+        let artifact_dir = dir.join("checkpoints").join("rz-ckpt-deadbeefcafe");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let backend = MsbCliBackend::new(PathBuf::from("/definitely/not/a/real/msb"));
+
+        let present = backend
+            .has_checkpoint(&artifact_dir.display().to_string())
+            .await
+            .unwrap();
+        assert!(!present);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn has_checkpoint_on_a_path_ref_is_false_when_the_directory_does_not_exist() {
+        let backend = MsbCliBackend::new(PathBuf::from("/definitely/not/a/real/msb"));
+        let missing = std::env::temp_dir().join("rz-msb-checkpoint-does-not-exist-4f2c9a");
+
+        let present = backend
+            .has_checkpoint(&missing.display().to_string())
+            .await
+            .unwrap();
+        assert!(!present);
+    }
+
+    /// Writes a stub `msb` replacement that logs its full argv, space-joined, as
+    /// one line per invocation to `calls.log` beside the script itself — every
+    /// caller of this stub only needs to assert on that log, not juggle a
+    /// separate state file.
+    #[cfg(unix)]
+    fn write_argv_logging_stub(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-log-argv.sh");
+        let body = "#!/bin/sh\n\
+             echo \"$@\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             exit 0\n";
+        std::fs::write(&script, body).expect("write argv-logging stub msb script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod argv-logging stub msb script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn has_checkpoint_on_a_bare_name_ref_still_goes_through_snapshot_inspect() {
+        let dir = unique_test_dir("has-checkpoint-bare-name");
+        let script = write_argv_logging_stub(&dir);
+        let backend = MsbCliBackend::new(script);
+
+        // The stub exits 0 unconditionally, so a bare-name ref reaching it at all
+        // is what this test is confirming — the path-ref branch must not have
+        // swallowed it.
+        let present = backend
+            .has_checkpoint("rz-ckpt-deadbeefcafe")
+            .await
+            .unwrap();
+        assert!(present);
+
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(log.trim(), "snapshot inspect rz-ckpt-deadbeefcafe");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_checkpoint_on_a_path_ref_invokes_snapshot_rm_with_the_basename_and_clears_the_leftover_artifact_dir()
+     {
+        let dir = unique_test_dir("remove-checkpoint-path-ref");
+        let script = write_argv_logging_stub(&dir);
+        let backend = MsbCliBackend::new(script);
+
+        let artifact_dir = dir.join("checkpoints").join("rz-ckpt-deadbeefcafe");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("snapshot.json"), b"{}").unwrap();
+
+        backend
+            .remove_checkpoint(&artifact_dir.display().to_string())
+            .await
+            .unwrap();
+
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(log.trim(), "snapshot rm rz-ckpt-deadbeefcafe");
+        assert!(
+            !artifact_dir.exists(),
+            "a leftover path-ref artifact dir must be cleaned up after snapshot rm"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_checkpoint_on_a_bare_name_ref_invokes_snapshot_rm_with_the_ref_unchanged() {
+        let dir = unique_test_dir("remove-checkpoint-bare-name");
+        let script = write_argv_logging_stub(&dir);
+        let backend = MsbCliBackend::new(script);
+
+        backend
+            .remove_checkpoint("rz-ckpt-deadbeefcafe")
+            .await
+            .unwrap();
+
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(log.trim(), "snapshot rm rz-ckpt-deadbeefcafe");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- checkpoint-archive import: digest parsing + already-exists handling ----

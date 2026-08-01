@@ -11,11 +11,12 @@ use std::path::Path;
 
 use rightsize::model::ContainerSpec;
 
-/// Builds the argv for `msb run`, in the pinned order: name, memory (if set), ports,
-/// env, mounts, image-or-snapshot, then `-- <command>` iff `spec.command` is `Some`
-/// — a `None` command means "run the image's default `ENTRYPOINT`/`CMD`", which
-/// requires omitting the trailing `--` entirely rather than passing it with no
-/// arguments after it.
+/// Builds the argv for `msb run`, in the pinned order: name, memory (if set),
+/// root-disk (if a disk limit or tmpfs root is set), net (if network is disabled),
+/// ports, env, mounts, image-or-snapshot, then `-- <command>` iff `spec.command`
+/// is `Some` — a `None` command means "run the image's default
+/// `ENTRYPOINT`/`CMD`", which requires omitting the trailing `--` entirely rather
+/// than passing it with no arguments after it.
 ///
 /// When `spec.checkpoint_ref` is set (this container was built from
 /// [`rightsize::Container::from_checkpoint`]), `--from-snapshot <ref>` replaces the plain
@@ -30,6 +31,22 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
     if let Some(mb) = spec.memory_limit_mb {
         argv.push("-m".to_string());
         argv.push(format!("{mb}M"));
+    }
+
+    // `--root-disk` covers both a size-capped writable root disk and a tmpfs one —
+    // `ContainerSpec`'s own validation (`Container::start`) already refuses a spec
+    // that sets both, so at most one of these fires.
+    if let Some(mb) = spec.disk_limit_mb {
+        argv.push("--root-disk".to_string());
+        argv.push(format!("{mb}M"));
+    }
+    if let Some(mb) = spec.tmpfs_root_mb {
+        argv.push("--root-disk".to_string());
+        argv.push(format!("tmpfs:{mb}M"));
+    }
+    if spec.network_disabled {
+        argv.push("--net".to_string());
+        argv.push("private".to_string());
     }
 
     for port in &spec.ports {
@@ -111,15 +128,27 @@ pub fn copy_out(sandbox_name: &str, container_path: &str, host_path: &Path) -> V
 
 /// Builds the argv for `msb snapshot create --from <sandbox> <snapshot>` — requires
 /// the sandbox to be STOPPED first (the checkpoint feature's own responsibility;
-/// this function only builds the argv).
-pub fn snapshot_create(sandbox_name: &str, snapshot_name: &str) -> Vec<String> {
-    vec![
+/// this function only builds the argv). `dest_dir`, when given, appends
+/// `--dest-dir <dest_dir>`, storing the snapshot artifact under that directory
+/// instead of msb's own default snapshot store — the checkpoint feature's
+/// dest-dir mechanics (`MsbCliBackend::create_checkpoint`).
+pub fn snapshot_create(
+    sandbox_name: &str,
+    snapshot_name: &str,
+    dest_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut argv = vec![
         "snapshot".to_string(),
         "create".to_string(),
         "--from".to_string(),
         sandbox_name.to_string(),
         snapshot_name.to_string(),
-    ]
+    ];
+    if let Some(dir) = dest_dir {
+        argv.push("--dest-dir".to_string());
+        argv.push(dir.display().to_string());
+    }
+    argv
 }
 
 /// Builds the argv for `msb snapshot rm <snapshot>` — the checkpoint feature's
@@ -364,6 +393,98 @@ mod tests {
     }
 
     #[test]
+    fn run_command_includes_root_disk_when_disk_limit_is_set_absent_when_none() {
+        let mut spec = full_spec();
+        spec.disk_limit_mb = Some(2048);
+        let with_limit = run(&spec);
+        assert_eq!(
+            with_limit,
+            vec![
+                "run",
+                "--name",
+                "rz-abc-1",
+                "--root-disk",
+                "2048M",
+                "-p",
+                "12345:6379",
+                "-e",
+                "A=1",
+                "--mount-file",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
+                "redis:8.6-alpine",
+                "--",
+                "redis-server",
+                "--port",
+                "6379",
+            ]
+        );
+
+        let without_limit = run(&full_spec());
+        assert!(!without_limit.contains(&"--root-disk".to_string()));
+    }
+
+    #[test]
+    fn run_command_includes_tmpfs_root_disk_when_tmpfs_root_is_set() {
+        let mut spec = full_spec();
+        spec.tmpfs_root_mb = Some(512);
+        let cmd = run(&spec);
+        let index = cmd
+            .iter()
+            .position(|a| a == "--root-disk")
+            .expect("expected --root-disk flag");
+        assert_eq!(cmd[index + 1], "tmpfs:512M");
+    }
+
+    #[test]
+    fn run_command_includes_net_private_when_network_disabled_absent_when_false() {
+        let mut spec = full_spec();
+        spec.network_disabled = true;
+        let disabled = run(&spec);
+        let index = disabled
+            .iter()
+            .position(|a| a == "--net")
+            .expect("expected --net flag");
+        assert_eq!(disabled[index + 1], "private");
+
+        let enabled = run(&full_spec());
+        assert!(!enabled.contains(&"--net".to_string()));
+    }
+
+    #[test]
+    fn run_command_orders_root_disk_and_net_between_memory_and_ports() {
+        let mut spec = full_spec();
+        spec.memory_limit_mb = Some(1024);
+        spec.disk_limit_mb = Some(2048);
+        spec.network_disabled = true;
+        let cmd = run(&spec);
+        assert_eq!(
+            cmd,
+            vec![
+                "run",
+                "--name",
+                "rz-abc-1",
+                "-m",
+                "1024M",
+                "--root-disk",
+                "2048M",
+                "--net",
+                "private",
+                "-p",
+                "12345:6379",
+                "-e",
+                "A=1",
+                "--mount-file",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
+                "redis:8.6-alpine",
+                "--",
+                "redis-server",
+                "--port",
+                "6379",
+            ]
+        );
+    }
+
+    #[test]
     fn exec_logs_stop_rm_ls_spellings() {
         assert_eq!(
             exec("rz-abc-1", &["redis-cli".to_string(), "ping".to_string()]),
@@ -439,13 +560,29 @@ mod tests {
             vec!["copy", "-q", "rz-abc-1:/guest/src.txt", "/host/dst.txt"]
         );
         assert_eq!(
-            snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe"),
+            snapshot_create("rz-abc-1", "rz-ckpt-deadbeefcafe", None),
             vec![
                 "snapshot",
                 "create",
                 "--from",
                 "rz-abc-1",
                 "rz-ckpt-deadbeefcafe"
+            ]
+        );
+        assert_eq!(
+            snapshot_create(
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                Some(std::path::Path::new("/cache/checkpoints"))
+            ),
+            vec![
+                "snapshot",
+                "create",
+                "--from",
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                "--dest-dir",
+                "/cache/checkpoints"
             ]
         );
         assert_eq!(
