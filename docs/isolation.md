@@ -82,6 +82,11 @@ it doesn't replace ordinary caution about what you hand it in the first place:
   (see [Files & Resources](./core-concepts/files-and-resources.md)). For untrusted
   workloads, call `.read_only()` on the mount unless the workload genuinely needs to
   write back — both backends enforce it as a guest-side write block.
+- **Block egress it doesn't need.** `.with_network_disabled()` blocks a container's
+  outbound access to the public internet while published ports keep serving —
+  microsandbox-only, see [Networking](./core-concepts/networking.md#blocking-public-internet-access).
+  On docker this flag is ignored, another reason to prefer `require_isolation(true)`
+  over hoping the active backend happens to be msb.
 
 ## Interaction with other features
 

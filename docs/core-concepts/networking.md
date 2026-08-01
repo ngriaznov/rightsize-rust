@@ -81,6 +81,31 @@ on this backend, not a timing quirk that will resolve itself with retries — pi
 test to fit inside these bounds (they cover this project's own contract suite, which
 is mostly one-shot config-fetch-shaped traffic).
 
+## Blocking public-internet access
+
+`.with_network_disabled()` blocks a container's outbound access to the public
+internet — microsandbox-only (`--net private`); **docker ignores this flag
+entirely**, since there's no portable way to block egress on that backend while
+keeping published ports reachable.
+
+```rust,ignore
+use rightsize::Container;
+
+let sandboxed = Container::new("untrusted/plugin-runner:latest")
+    .with_network_disabled()
+    .with_exposed_ports(&[8080])
+    .start()
+    .await?;
+```
+
+On microsandbox, published ports keep serving inbound connections and outbound
+connections to private (RFC 1918) address ranges keep working — only outbound
+connections to the public internet fail.
+
+Mutually exclusive with `.with_network(&net)` — a network-disabled container has
+nothing to join a network with, so `start()` returns
+`RightsizeError::NetworkDisabledConflict` if both are set on the same container.
+
 ## Alias resolution is registration-order-independent for readers
 
 `Network::resolve` just checks "is any registered member carrying this alias" — it

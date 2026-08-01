@@ -36,6 +36,9 @@ The builder surface, as it exists today:
 | `.with_copy_file_to_container(file, guest_path)` | Mounts a `MountableFile` read-write into the guest; the mount is a view of the host file, so guest writes reach it — see [Files & Resources](./files-and-resources.md). |
 | `.waiting_for(strategy)` | Overrides the readiness check; defaults to `Wait::for_listening_port()`. |
 | `.with_memory_limit(megabytes)` | Caps guest memory. Unset means "each backend's own default" — see [Files & Resources](./files-and-resources.md#memory-limits-when-and-why). |
+| `.with_disk_limit(megabytes)` | Caps the writable root disk. microsandbox-only; docker ignores it — see [Files & Resources](./files-and-resources.md#disk-sizing--with_disk_limit--with_tmpfs_root). |
+| `.with_tmpfs_root(megabytes)` | Runs the writable root disk from guest RAM. microsandbox-only; docker ignores it — see [Files & Resources](./files-and-resources.md#disk-sizing--with_disk_limit--with_tmpfs_root). |
+| `.with_network_disabled()` | Blocks public-internet access, keeping published ports and private-range links working. microsandbox-only; docker ignores it — see [Networking](./networking.md#blocking-public-internet-access). |
 | `.start()` | Consumes the builder, returns `Result<ContainerGuard>`. |
 
 `Container::start()` **consumes** the builder — there's no mutate-in-place `start()`

@@ -94,3 +94,42 @@ the image's own baked `JAVA_OPTS`/heap flags request, and set
 `.with_memory_limit(...)` above that with real headroom, the same way these two
 modules did. See [Troubleshooting](../troubleshooting.md) for the matching
 symptom→fix entry.
+
+## Disk sizing — `with_disk_limit` / `with_tmpfs_root`
+
+Two more sizing knobs, both microsandbox-only — docker runs its normal
+disk-backed rootfs with no ceiling and ignores either one:
+
+```rust,ignore
+use rightsize::Container;
+
+// A size-capped writable root disk.
+let capped = Container::new("postgres:16-alpine")
+    .with_disk_limit(4096)
+    .start()
+    .await?;
+
+// A RAM-backed writable root disk — faster ephemeral containers, no disk residue.
+let tmpfs = Container::new("redis:7-alpine")
+    .with_tmpfs_root(256)
+    .start()
+    .await?;
+```
+
+`.with_disk_limit(megabytes)` caps the writable root disk (`--root-disk <mb>M`).
+The ceiling grows on an msb reboot but never shrinks back down.
+
+`.with_tmpfs_root(megabytes)` runs the writable root disk from guest RAM instead
+of storage (`--root-disk tmpfs:<mb>M`), so it must fit inside guest memory: with
+no `.with_memory_limit(...)` set, msb's own default guest memory is 512M and
+nothing is validated on this side (msb's own boot-time error is already precise
+for that case); with both set, `start()` returns
+`RightsizeError::TmpfsRootExceedsMemory` if the tmpfs root exceeds the memory
+limit. A tmpfs root is also ephemeral — it's gone the moment the guest stops —
+so it can't be checkpointed; see
+[Checkpoint / Restore](../checkpoints.md#api) for the refusal.
+
+The two are mutually exclusive with each other — `start()` returns
+`RightsizeError::RootDiskConflict` if both are set on the same container — and
+msb rejects either one on a [`Container::from_checkpoint`](../checkpoints.md)
+restore before boot, since the snapshot already pins the root disk.

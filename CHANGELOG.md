@@ -7,7 +7,57 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`Container::with_disk_limit(megabytes)`** caps the writable root disk
+  (`--root-disk <mb>M`) — microsandbox-only; docker runs its normal disk-backed
+  rootfs with no ceiling and ignores this. The ceiling grows on an msb reboot but
+  never shrinks back down. Mutually exclusive with `with_tmpfs_root` —
+  `RightsizeError::RootDiskConflict` at `start()` if both are set.
+- **`Container::with_tmpfs_root(megabytes)`** runs the writable root disk from
+  guest RAM instead of storage (`--root-disk tmpfs:<mb>M`) — faster, ephemeral
+  containers with no disk residue. microsandbox-only; docker ignores it. Must fit
+  inside guest memory: msb defaults to 512M when no `with_memory_limit` is set,
+  and `RightsizeError::TmpfsRootExceedsMemory` fires at `start()` when both are
+  set and the tmpfs root exceeds the memory limit. A tmpfs root is ephemeral and
+  cannot be checkpointed — `checkpoint()`/`checkpoint_named()` return
+  `RightsizeError::TmpfsRootCheckpoint` before touching anything, and a refused
+  named re-checkpoint leaves the existing checkpoint intact. msb also rejects any
+  root-disk setting on a `Container::from_checkpoint` restore before boot — the
+  snapshot pins the root disk.
+- **`Container::with_network_disabled()`** blocks public-internet access on
+  microsandbox (`--net private`): published ports keep serving and private-range
+  network links keep working, but outbound connections to the public internet
+  fail. Docker ignores this flag entirely — there's no portable way to block
+  egress while keeping published ports on that backend. Mutually exclusive with
+  `with_network` — `RightsizeError::NetworkDisabledConflict` at `start()` if both
+  are set.
+
+### Changed
+
+- **microsandbox checkpoint artifacts now live under
+  `<cache dir>/checkpoints/`** (`~/.cache/rightsize` on macOS/Linux,
+  `%LOCALAPPDATA%\rightsize` on Windows), created via msb's `--dest-dir` rather
+  than its default snapshot store. `Checkpoint::checkpoint_ref` for msb is now
+  the absolute artifact path — the ref remains an opaque string, so no caller
+  code needs to change, but a bare-name ref from an earlier release still
+  restores. The snapshot still shows up in `msb snapshot list` (msb keeps its
+  own global index); removing it through this library's `Checkpoint::remove`
+  cleans up both the artifact and the registry entry.
+- **`ContainerSpec` gained three public fields**: `disk_limit_mb`,
+  `tmpfs_root_mb`, `network_disabled`. Code constructing a `ContainerSpec`
+  struct literal directly needs to add them; `ContainerSpec::new` keeps working
+  unchanged.
+- **`rightsize-msb`'s `commands::snapshot_create` kept its existing two-argument
+  form** and gained a separate `commands::snapshot_create_in` that takes a
+  destination directory, backing the checkpoint storage change above.
+
+### Fixed
+
+- The boot-retry classifier for msb's install-lock refusal now also recognizes
+  its second phrasing — `another microsandbox install operation is in progress
+  until <ts>` — instead of failing the boot on it; the retry already handled
+  the first phrasing (`install operation in progress until <ts>`).
 
 ## [0.6.2] - 2026-08-01
 

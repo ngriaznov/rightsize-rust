@@ -293,6 +293,12 @@ Violations fail fast with an actionable error.
   backend that doesn't provide hardware isolation, instead of silently running
   an untrusted workload wherever `RIGHTSIZE_BACKEND` happened to resolve. See
   [Isolation Requirement](docs/isolation.md).
+- **Root-disk sizing and network egress control.** `.with_disk_limit(mb)` caps
+  the writable root disk, `.with_tmpfs_root(mb)` runs it from guest RAM instead,
+  and `.with_network_disabled()` blocks outbound public-internet access while
+  published ports keep serving - all three microsandbox-only, ignored on
+  docker. See [Files & Resources](docs/core-concepts/files-and-resources.md#disk-sizing--with_disk_limit--with_tmpfs_root)
+  and [Networking](docs/core-concepts/networking.md#blocking-public-internet-access).
 - **Checkpoint / restore.** `guard.checkpoint()` captures a running container's
   filesystem - an image commit on docker, a disk snapshot on microsandbox -
   and `Container::from_checkpoint(&cp)` restores as many sandboxes from it as

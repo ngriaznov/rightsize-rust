@@ -73,8 +73,14 @@ let restored = Container::from_checkpoint(&checkpoint).start().await?;
 ```
 
 `checkpoint()` requires the guard to be currently running — calling it on a stopped
-or never-started guard is a state error, the same shape as `exec`/`logs`. On
-success it returns a `Checkpoint`:
+or never-started guard is a state error, the same shape as `exec`/`logs`. A
+container started with [`with_tmpfs_root`](./core-concepts/files-and-resources.md#disk-sizing--with_disk_limit--with_tmpfs_root)
+refuses outright: its root disk is RAM-backed and gone the moment the guest
+stops, so `checkpoint()`/`checkpoint_named()` return
+`RightsizeError::TmpfsRootCheckpoint` before touching anything — before the
+guest is even stopped, and, for a named checkpoint that would have replaced an
+existing one, before that existing checkpoint is touched either. On success it
+returns a `Checkpoint`:
 
 ```rust,ignore
 pub struct Checkpoint {
@@ -110,12 +116,28 @@ membership, and aliases. A checkpoint already has whatever those mounts wrote ba
 directly into its filesystem, and network topology has no well-defined meaning to
 replay across a restore.
 
+On microsandbox, the restore also carries the checkpoint's own root disk as-is —
+the snapshot pins it — so `with_disk_limit`/`with_tmpfs_root` on the restoring
+`Container` are not valid here; msb rejects a root-disk setting on a
+`from_checkpoint` restore before boot.
+
 ## Ref formats
 
 A checkpoint's `checkpoint_ref` is backend-native, and its shape differs by backend:
 
 - **docker**: an image tag, `rightsize/checkpoint:<12 hex chars>`.
-- **microsandbox**: a disk snapshot name, `rz-ckpt-<12 hex chars>`.
+- **microsandbox**: an absolute path to the snapshot artifact,
+  `<cache dir>/checkpoints/rz-ckpt-<12 hex chars>` (or
+  `<cache dir>/checkpoints/rz-ckpt-<name>` for a named checkpoint — see
+  "Reusing checkpoints across runs" below), created via msb's `--dest-dir` so
+  every process on the host agrees on where the artifact lives rather than
+  wherever msb's own default snapshot store happens to be. The ref stays opaque
+  either way — nothing in the public API changes, and a bare `rz-ckpt-<12hex>`
+  ref minted by an earlier release keeps restoring. msb still lists the
+  snapshot in its own global index (`msb snapshot list`) regardless of the
+  `--dest-dir` it was created under; removing it via `Checkpoint::remove` or the
+  manual CLI cleanup below cleans up both that index entry and the dest-dir
+  artifact.
 
 Both are random per checkpoint (never reused across calls).
 
@@ -257,7 +279,9 @@ below), then rewrites the registry entry. Latest wins; there is no versioning.
 
 **The registry**: one JSON file per name, `<cacheDir>/checkpoints/<name>.json`
 (the same rightsize cache directory every backend and the
-[reaping ledger](./reaping.md) share), written atomically only after the backend
+[reaping ledger](./reaping.md) share, and — for microsandbox — the same
+`checkpoints/` directory its own snapshot artifacts now live under, see "Ref
+formats" above), written atomically only after the backend
 checkpoint has already succeeded. `find(name)` probes a same-backend entry's
 artifact before returning it — a stale entry (the artifact deleted out from under
 the registry) resolves to absent and is cleaned up automatically; a
