@@ -76,7 +76,7 @@ async fn schema_post_get_round_trips_and_both_health_endpoints_are_up() {
     // linux/arm64 manifest, which no amd64 lane can pull; 1.3.0 carries both
     // architectures. The module default keeps floating per its own docs — this pin is
     // the IT's determinism, not a product change.
-    let guard = PinotContainer::with_image("apachepinot/pinot:1.3.0")
+    let guard = PinotContainer::with_image("apachepinot/pinot:1.5.0")
         .start()
         .await
         .expect("pinot must start — a four-JVM QuickStart cluster, budget the 180s wait");
