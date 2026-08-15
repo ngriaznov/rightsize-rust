@@ -1,4 +1,7 @@
 //! `sandbox-it` integration test for the Cassandra module: a `cqlsh` round-trip
+//! (every invocation passes `--request-timeout=60`: cqlsh's ~10s per-request
+//! default is too tight for the FIRST statement on a cold Cassandra JVM on a
+//! loaded CI runner)
 //! (`CREATE KEYSPACE` → `CREATE TABLE` → `INSERT` → `SELECT`) via the image's bundled
 //! `cqlsh` binary — no Cassandra driver dependency needed for a smoke check, matching
 //! the module's exec-based house convention for a bundled-client protocol proof.
@@ -39,7 +42,7 @@ async fn create_keyspace_table_insert_select_round_trips_via_cqlsh() {
                CREATE TABLE IF NOT EXISTS smoke.t (id int PRIMARY KEY, val text); \
                INSERT INTO smoke.t (id, val) VALUES (1, 'rightsize');";
     let setup = guard
-        .exec(&["cqlsh", "-e", cql])
+        .exec(&["cqlsh", "--request-timeout=60", "-e", cql])
         .await
         .expect("exec must run");
     assert_eq!(
@@ -49,7 +52,12 @@ async fn create_keyspace_table_insert_select_round_trips_via_cqlsh() {
     );
 
     let select = guard
-        .exec(&["cqlsh", "-e", "SELECT val FROM smoke.t WHERE id = 1;"])
+        .exec(&[
+            "cqlsh",
+            "--request-timeout=60",
+            "-e",
+            "SELECT val FROM smoke.t WHERE id = 1;",
+        ])
         .await
         .expect("exec must run");
     assert_eq!(
