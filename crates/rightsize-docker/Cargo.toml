@@ -1,6 +1,6 @@
 [package]
 name = "rightsize-docker"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ keywords = ["testing", "containers", "docker"]
 categories = ["development-tools::testing", "asynchronous"]
 
 [dependencies]
-rightsize = { path = "../rightsize", version = "0.7.0" }
+rightsize = { path = "../rightsize", version = "0.7.1" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
