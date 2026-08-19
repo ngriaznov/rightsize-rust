@@ -32,23 +32,71 @@ use sha2::{Digest, Sha256};
 use crate::platform::Platform;
 use rightsize::error::{Result, RightsizeError};
 
-/// The pinned microsandbox release, as a literal so [`DEFAULT_BASE`] can build the
-/// release URL from it at compile time — `concat!` takes literals, not consts, and a
-/// second hand-written copy of the version is exactly the drift this avoids.
-macro_rules! msb_version {
+/// The pinned microsandbox release for macOS/Linux hosts, as a literal so
+/// [`DEFAULT_BASE`] can build the release URL from it at compile time — `concat!` takes
+/// literals, not consts, and a second hand-written copy of the version is exactly the
+/// drift this avoids.
+///
+/// Only referenced from the `#[cfg(not(windows))]` arm of
+/// [`MSB_VERSION`]/[`DEFAULT_BASE`] — `#[allow(unused_macros)]` because a Windows build
+/// never takes that arm, which would otherwise make this look unused there even though a
+/// unix build very much uses it.
+#[allow(unused_macros)]
+macro_rules! msb_version_unix {
     () => {
         "0.6.10"
     };
 }
 
-/// The pinned microsandbox release this crate provisions. Bumping [`msb_version`] is the
-/// only change needed to move the whole workspace to a newer msb — the release URL, asset
-/// names, checksums, and the install-dir path are all derived from it.
-pub const MSB_VERSION: &str = msb_version!();
+/// The pinned microsandbox release for Windows hosts.
+///
+/// This is deliberately one release behind [`msb_version_unix`]: msb 0.6.10 has a
+/// Windows-only regression where the runtime's pre-boot guest bootstrap frame never
+/// reaches `agentd` on Windows hosts, so every sandbox dies agentless about 70 seconds
+/// after spawn ("sandbox process exited (exit code: 0) before agent relay became
+/// available"). macOS and Linux are unaffected — the guest kernel DLL is byte-identical
+/// between 0.6.9 and 0.6.10, so the break is in `msb.exe` itself, not anything this
+/// crate installs into `lib/`. Windows stays pinned to 0.6.9, the last release without
+/// this regression, until upstream fixes it. This is safe to do per-platform rather than
+/// reverting everyone: 0.6.9 and 0.6.10 are identical across every CLI surface this
+/// library drives (verified by a full command-tree diff), so unix and Windows hosts
+/// exercise the same behavior despite running different pinned binaries — bump this back
+/// in step with [`msb_version_unix`] once the fix lands upstream.
+///
+/// Only referenced from the `#[cfg(windows)]` arm of [`MSB_VERSION`]/[`DEFAULT_BASE`] —
+/// `#[allow(unused_macros)]` because a unix build never takes that arm, which would
+/// otherwise make this look unused there even though a Windows build very much uses it.
+#[allow(unused_macros)]
+macro_rules! msb_version_windows {
+    () => {
+        "0.6.9"
+    };
+}
 
+/// The pinned microsandbox release this crate provisions on this host: unix hosts get
+/// [`msb_version_unix`], Windows hosts get [`msb_version_windows`] (see that macro's
+/// doc comment for why they currently differ). Bumping the relevant macro is the only
+/// change needed to move that platform to a newer msb — the release URL, asset names,
+/// checksums, and the install-dir path are all derived from it.
+#[cfg(windows)]
+pub const MSB_VERSION: &str = msb_version_windows!();
+/// The pinned microsandbox release this crate provisions on this host: unix hosts get
+/// [`msb_version_unix`], Windows hosts get [`msb_version_windows`] (see that macro's
+/// doc comment for why they currently differ). Bumping the relevant macro is the only
+/// change needed to move that platform to a newer msb — the release URL, asset names,
+/// checksums, and the install-dir path are all derived from it.
+#[cfg(not(windows))]
+pub const MSB_VERSION: &str = msb_version_unix!();
+
+#[cfg(windows)]
 const DEFAULT_BASE: &str = concat!(
     "https://github.com/superradcompany/microsandbox/releases/download/v",
-    msb_version!()
+    msb_version_windows!()
+);
+#[cfg(not(windows))]
+const DEFAULT_BASE: &str = concat!(
+    "https://github.com/superradcompany/microsandbox/releases/download/v",
+    msb_version_unix!()
 );
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
@@ -978,5 +1026,62 @@ mod tests {
         assert!(!is_executable(Path::new(
             "/definitely/not/a/real/path/rightsize-provisioner-test"
         )));
+    }
+
+    #[test]
+    fn windows_msb_pin_differs_from_unix_and_each_drives_its_own_url_and_install_dir() {
+        // The two per-platform pins must actually differ — a Windows regression fix
+        // that silently picked the same version for both platforms would defeat the
+        // whole point of this seam.
+        assert_ne!(
+            msb_version_windows!(),
+            msb_version_unix!(),
+            "Windows must stay pinned to the last-good release while unix moves on"
+        );
+        assert_eq!(msb_version_windows!(), "0.6.9");
+        assert_eq!(msb_version_unix!(), "0.6.10");
+
+        // Whichever pin this host actually selected must be the one that ends up in
+        // both the release URL and the install dir — not just a literal sitting next
+        // to unused code.
+        #[cfg(windows)]
+        {
+            assert_eq!(MSB_VERSION, msb_version_windows!());
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(MSB_VERSION, msb_version_unix!());
+        }
+        assert!(
+            DEFAULT_BASE.ends_with(MSB_VERSION),
+            "DEFAULT_BASE {DEFAULT_BASE} must be built from the selected MSB_VERSION {MSB_VERSION}"
+        );
+
+        // Build both platforms' expected release URLs directly from their own literals
+        // (never from MSB_VERSION, which is already host-selected) and confirm they
+        // disagree — the download URL genuinely forks per platform.
+        let windows_url = concat!(
+            "https://github.com/superradcompany/microsandbox/releases/download/v",
+            msb_version_windows!()
+        );
+        let unix_url = concat!(
+            "https://github.com/superradcompany/microsandbox/releases/download/v",
+            msb_version_unix!()
+        );
+        assert_ne!(windows_url, unix_url);
+        assert_eq!(
+            DEFAULT_BASE,
+            if cfg!(windows) { windows_url } else { unix_url }
+        );
+
+        // The install dir is keyed by the selected version too, so a host on the older
+        // Windows pin never collides with a host on the newer unix pin in a shared
+        // cache root.
+        let cache = temp_cache_dir("per-platform-version");
+        let expected_install_dir = cache.join("msb").join(MSB_VERSION);
+        assert_eq!(
+            expected_install_dir.file_name().unwrap().to_str().unwrap(),
+            MSB_VERSION
+        );
     }
 }
