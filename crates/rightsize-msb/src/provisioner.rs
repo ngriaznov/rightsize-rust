@@ -37,7 +37,7 @@ use rightsize::error::{Result, RightsizeError};
 /// second hand-written copy of the version is exactly the drift this avoids.
 macro_rules! msb_version {
     () => {
-        "0.6.9"
+        "0.6.10"
     };
 }
 
