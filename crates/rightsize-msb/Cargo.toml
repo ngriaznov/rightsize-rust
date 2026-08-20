@@ -1,6 +1,6 @@
 [package]
 name = "rightsize-msb"
-version = "0.7.1"
+version = "0.7.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ keywords = ["testing", "containers", "microvm", "microsandbox"]
 categories = ["development-tools::testing", "asynchronous"]
 
 [dependencies]
-rightsize = { path = "../rightsize", version = "0.7.1" }
+rightsize = { path = "../rightsize", version = "0.7.2" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
