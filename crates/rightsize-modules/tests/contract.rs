@@ -67,7 +67,7 @@
 //! the host file behind the mount: see
 //! [`a_mount_is_read_write_by_default_and_the_guest_write_reaches_the_host_file`].
 //!
-//! Plus five behaviors for the msb-0.6.8 spec options (`with_disk_limit`,
+//! Plus five behaviors for the root-disk and network spec options (`with_disk_limit`,
 //! `with_tmpfs_root`, `with_network_disabled`) — docker ignores all three and runs
 //! with its normal disk-backed rootfs and normal networking, proven by these same
 //! tests running unmodified on both backends:
@@ -1639,8 +1639,8 @@ async fn helper_reuse_stop_semantics() {
     // a panic above.
 }
 
-// ==================== msb-0.6.8 spec options: disk limit, tmpfs root, ============
-// ==================== network disabled ============================================
+// ==================== root-disk and network spec options: disk limit, ============
+// ==================== tmpfs root, network disabled ================================
 
 /// `with_network_disabled` contract: on BOTH backends the container still starts and
 /// serves its published port (the http.server/`for_http` pattern used at the top of
