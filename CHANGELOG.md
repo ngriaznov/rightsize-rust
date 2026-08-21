@@ -7,7 +7,21 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.12 on macOS and Linux; Windows stays
+  on 0.6.9.** msb 0.6.10, 0.6.11, and 0.6.12 are all broken on Windows: since 0.6.10,
+  guest bootstrap moved off the kernel command line onto a one-shot pre-boot console
+  frame, and on Windows that frame never reaches the guest agent, so the agent times
+  out after 60 seconds and the guest dies. The sandbox can briefly report as running,
+  but the agent relay endpoint is never created, so exec, logs, and ping can never
+  connect. There is no client-side workaround, and upstream has no fix merged or
+  staged. The three affected releases changed no CLI surface this library drives, so
+  the per-platform pin does not change behavior on either platform.
+
+  **If you point `MSB_PATH` at your own msb binary on Windows, keep it at 0.6.9** —
+  a 0.6.10, 0.6.11, or 0.6.12 binary there will hit the regression on every container
+  start.
 
 ## [0.7.2] - 2026-08-19
 
