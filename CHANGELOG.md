@@ -7,7 +7,17 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.14 on all platforms.** Upstream fixed
+  the Windows bootstrap regression in 0.6.14: the `msb_krun`/`msb_krun_devices` 0.1.32
+  bump starts console-port delivery at `PORT_OPEN` instead of `PORT_READY`, matching
+  unix (upstream issue #1426, closed against 0.6.14). The per-platform split pin
+  introduced in 0.7.2 — unix on 0.6.12, Windows held back on 0.6.9 — is retired; both
+  platforms provision the same release again.
+
+  **If you point `MSB_PATH` at your own msb binary on Windows, never use 0.6.10
+  through 0.6.13** — those releases carry the bootstrap regression this fix resolves.
 
 ## [0.7.3] - 2026-08-21
 
