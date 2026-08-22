@@ -50,8 +50,8 @@ transport-routing risk.
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = "0.7.3"
-rightsize-modules = "0.7.3"
+rightsize = "0.7.4"
+rightsize-modules = "0.7.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

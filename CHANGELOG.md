@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.4] - 2026-08-22
+
 ### Changed
 
 - **The pinned microsandbox release is now 0.6.14 on all platforms.** Upstream fixed
@@ -705,7 +709,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.0...v0.7.1
