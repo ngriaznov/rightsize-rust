@@ -18,6 +18,13 @@ Nothing yet.
   copies on NTFS only copy allocated ranges, and read-only mounts no longer get
   write-probed. No CLI surface this library drives changed.
 
+### Fixed
+
+- **Host ports that hit a bind conflict are no longer eligible for the immediate retry.**
+  The port-retry loop used to return a conflicted port to the allocator before the next
+  attempt, so the OS could hand the same proven-contended port straight back. Conflicted
+  ports now stay quarantined until the retry loop exits.
+
 ## [0.7.4] - 2026-08-22
 
 ### Changed

@@ -631,6 +631,7 @@ async fn create_started_container(
     checkpoint_ref: Option<&str>,
 ) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
+    let mut quarantine = ConflictQuarantine(Vec::new());
 
     for _ in 0..PORT_BIND_ATTEMPTS {
         let mapped_ports = allocate_ports(exposed_ports)?;
@@ -725,7 +726,6 @@ async fn create_started_container(
             Err(e) => {
                 let _ = backend.stop(handle.as_ref()).await;
                 let _ = backend.remove(handle.as_ref()).await;
-                release_ports(&mapped_ports);
                 // Same rationale as the `create` failure branch above: this attempt's
                 // container was just torn down, so its ledger line must go too.
                 crate::reaper::after_stop(
@@ -734,9 +734,12 @@ async fn create_started_container(
                     reaper_cache_dir_override,
                 );
                 if is_port_bind_conflict(&e) {
+                    // Quarantined, not released: see `ConflictQuarantine`.
+                    quarantine.0.extend(mapped_ports.iter().copied());
                     last_conflict = Some(e);
                     continue;
                 }
+                release_ports(&mapped_ports);
                 return Err(e);
             }
         }
@@ -846,6 +849,20 @@ fn allocate_ports(exposed_ports: &[u16]) -> Result<Vec<(u16, u16)>> {
 fn release_ports(mapped_ports: &[(u16, u16)]) {
     for &(_, host_port) in mapped_ports {
         free_ports().release(host_port);
+    }
+}
+
+/// Holds host ports that hit a bind conflict during a create/start retry loop and
+/// releases them back to the allocator only when the loop exits — any exit, success or
+/// error, via `Drop`. Releasing a conflicted port immediately would let the next
+/// attempt legally re-pick the very port that just conflicted (the OS frequently
+/// reissues a just-freed ephemeral port), wasting an attempt on a proven-contended
+/// port.
+struct ConflictQuarantine(Vec<(u16, u16)>);
+
+impl Drop for ConflictQuarantine {
+    fn drop(&mut self) {
+        release_ports(&self.0);
     }
 }
 
@@ -1191,6 +1208,7 @@ async fn create_and_start_reuse_sandbox(
     env: &[(String, String)],
 ) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
+    let mut quarantine = ConflictQuarantine(Vec::new());
 
     for _ in 0..PORT_BIND_ATTEMPTS {
         let mapped_ports = allocate_ports(&container.exposed_ports)?;
@@ -1256,11 +1274,13 @@ async fn create_and_start_reuse_sandbox(
             Err(e) => {
                 let _ = backend.stop(handle.as_ref()).await;
                 let _ = backend.remove(handle.as_ref()).await;
-                release_ports(&mapped_ports);
                 if is_port_bind_conflict(&e) {
+                    // Quarantined, not released: see `ConflictQuarantine`.
+                    quarantine.0.extend(mapped_ports.iter().copied());
                     last_conflict = Some(e);
                     continue;
                 }
+                release_ports(&mapped_ports);
                 return Err(e);
             }
         }
@@ -5420,6 +5440,8 @@ mod tests {
         );
         let started_ports = backend.started_ports.lock().unwrap().clone();
         assert_eq!(started_ports.len(), 3, "start attempted three times");
+        // Guaranteed distinct, not an accident of ephemeral-port allocation: conflicted
+        // ports stay quarantined (`ConflictQuarantine`) until the retry loop exits.
         let distinct: std::collections::HashSet<u16> = started_ports.iter().copied().collect();
         assert_eq!(
             distinct.len(),
@@ -5458,6 +5480,8 @@ mod tests {
         );
         let started_ports = backend.started_ports.lock().unwrap().clone();
         assert_eq!(started_ports.len(), 3, "start attempted three times");
+        // Guaranteed distinct, not an accident of ephemeral-port allocation: conflicted
+        // ports stay quarantined (`ConflictQuarantine`) until the retry loop exits.
         let distinct: std::collections::HashSet<u16> = started_ports.iter().copied().collect();
         assert_eq!(
             distinct.len(),
