@@ -315,6 +315,47 @@ fn is_name_conflict(output: &str) -> bool {
     output.to_lowercase().contains("already exists")
 }
 
+/// The marker line msb's guest agent writes to the SYSTEM log once it has actually
+/// come up — present only once a sandbox's boot genuinely reached a working guest
+/// agent, as opposed to dying before one ever existed.
+const SANDBOX_STARTED_MARKER: &str = "--- sandbox started ---";
+
+/// Post-mortem check for [`try_spawn_and_await_running`]'s fast-exit case: an
+/// attached `msb run` child for sandbox `name` exited 0 before this backend's own
+/// polling ever observed `Running`. On msb 0.6.16+ this is not necessarily a failed
+/// boot — msb's convergent-lifecycle rework no longer surfaces `Running` at all for a
+/// workload that finishes before the next poll (a short build/test script, e.g.
+/// `alpine -- true`), whereas earlier msb releases usually won that race on a fast
+/// host and observed `Running` briefly before the same exit; 0.6.16 itself never
+/// wins it.
+///
+/// Confirming the sandbox genuinely finished — rather than dying mid-boot the way
+/// msb 0.6.10-0.6.13's Windows agentless-death failures did (also exit 0, but the
+/// guest agent never came up) — requires BOTH of:
+/// - `msb ls --format json` reports this sandbox's own `status` as `"Stopped"`
+///   ([`ls_json::status_is`]);
+/// - `msb logs <name> --source system --tail 1000` contains
+///   [`SANDBOX_STARTED_MARKER`], the boot-completion line msb's guest agent writes
+///   only once it has actually come up.
+///
+/// Either query itself failing to run, or either signal being absent, returns
+/// `false` — this never claims success on incomplete information, so a broken `ls`/
+/// `logs` invocation just falls back to today's ordinary failure message rather than
+/// masking a real problem.
+fn fast_exit_ran_to_completion(msb: &Path, name: &str) -> bool {
+    let Ok(ls_result) = invoke_standalone(msb, &commands::ls(), LOGS_TIMEOUT) else {
+        return false;
+    };
+    if !ls_json::status_is(&ls_result.stdout, name, "Stopped") {
+        return false;
+    }
+    let Ok(log_result) = invoke_standalone(msb, &commands::logs_system(name), LOGS_TIMEOUT) else {
+        return false;
+    };
+    log_result.stdout.contains(SANDBOX_STARTED_MARKER)
+        || log_result.stderr.contains(SANDBOX_STARTED_MARKER)
+}
+
 /// True if `output` (a `msb exec` invocation's stderr) says msb could not reach the
 /// guest agent's endpoint at all, as distinct from the guest command itself failing.
 ///
@@ -1170,7 +1211,10 @@ enum PreRunningFailure {
 
 /// Runs on a blocking thread: spawns `msb run <spec's argv>` attached (no `-d`),
 /// polls `msb ls --format json` until the sandbox reaches `Running`, and returns the
-/// live child for `start()` to keep around.
+/// live child for `start()` to keep around. [`try_spawn_and_await_running`]'s
+/// fast-exit post-mortem (see its doc) also returns `Ok` here, unmodified — that
+/// already-exited child passes straight through this match with no retry, same as
+/// any other successful attempt.
 ///
 /// Two classified transient failures are retried once each. A first attempt that
 /// hit msb's state-database error — usually the startup-migration race (see
@@ -1299,6 +1343,17 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
 /// The tail drained here carries msb's own boot output only — registry/pull errors,
 /// a crash before the sandbox exists — never the workload's. `logs()` never reads
 /// from it; workload output always comes from a `msb logs` invocation.
+///
+/// **Fast-exit post-mortem (msb 0.6.16+):** msb's convergent-lifecycle rework stopped
+/// surfacing `Running` at all for a workload that finishes before this loop's next
+/// poll — a short build/test script, e.g. `alpine -- true` — so the exit-0 case below
+/// is no longer necessarily a failed boot. When the child exits 0 and none of the
+/// classified failures above match, [`fast_exit_ran_to_completion`] is given one
+/// chance to confirm the sandbox genuinely finished (its own state is `Stopped` in
+/// `msb ls`, and the system log carries the boot-completion marker only the guest
+/// agent writes) before this falls back to today's generic "before reaching Running"
+/// error. A non-zero exit never takes this path — see that function's doc for why
+/// both signals, not just the exit code, are required.
 fn try_spawn_and_await_running(
     msb: &Path,
     spec: &ContainerSpec,
@@ -1340,37 +1395,49 @@ fn try_spawn_and_await_running(
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(if is_image_cache_corruption(&output) {
-                PreRunningFailure::CacheCorruption { output }
-            } else if is_msb_state_db_error(&output) {
-                PreRunningFailure::StateDbError { output }
-            } else if is_msb_install_lock_active(&output) {
-                PreRunningFailure::InstallLockActive { output }
-            } else if is_port_bind_conflict(&output) {
-                PreRunningFailure::Other(RightsizeError::PortBindConflict {
+            if is_image_cache_corruption(&output) {
+                return Err(PreRunningFailure::CacheCorruption { output });
+            }
+            if is_msb_state_db_error(&output) {
+                return Err(PreRunningFailure::StateDbError { output });
+            }
+            if is_msb_install_lock_active(&output) {
+                return Err(PreRunningFailure::InstallLockActive { output });
+            }
+            if is_port_bind_conflict(&output) {
+                return Err(PreRunningFailure::Other(RightsizeError::PortBindConflict {
                     message: format!(
                         "msb run for sandbox {} could not bind a host port: {output}",
                         spec.name
                     ),
                     source: None,
-                })
-            } else if is_name_conflict(&output) {
-                PreRunningFailure::Other(RightsizeError::NameConflict {
+                }));
+            }
+            if is_name_conflict(&output) {
+                return Err(PreRunningFailure::Other(RightsizeError::NameConflict {
                     message: format!(
                         "msb run for sandbox {} could not start — a sandbox with this name \
                          already exists: {output}",
                         spec.name
                     ),
                     source: None,
-                })
-            } else {
-                PreRunningFailure::Other(RightsizeError::Backend(format!(
-                    "msb run for sandbox {} exited (code {}) before reaching Running — check the \
-                     image entrypoint and `msb run` output below:\n{output}",
-                    spec.name,
-                    status.code().unwrap_or(-1)
-                )))
-            });
+                }));
+            }
+            // None of the known bad signatures matched. On msb 0.6.16+ a clean exit
+            // here is not necessarily a failed boot — see this function's doc for why
+            // — so a zero exit gets one post-mortem check before falling back to
+            // today's generic error below. A non-zero exit skips straight to it: only
+            // a clean exit can mean the workload ran to completion, so nothing about
+            // the failure path changes for any other exit code.
+            if status.success() && fast_exit_ran_to_completion(msb, &spec.name) {
+                return Ok(child);
+            }
+            return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+                "msb run for sandbox {} exited (code {}) before reaching Running — check the \
+                 image entrypoint and `msb run` output below:\n{output}",
+                spec.name,
+                status.code().unwrap_or(-1)
+            ))));
         }
         match running_names_via(msb) {
             Ok(names) if names.contains(&spec.name) => return Ok(child),
@@ -3301,6 +3368,129 @@ mod tests {
                  as an error",
             );
         assert_eq!(effective_ref, "sha256-fakedigest1234");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- fast-exit post-mortem classification (msb 0.6.16+) ----
+
+    /// Writes a stub `msb` replacement for the fast-exit classification's tests.
+    /// Dispatches on `$1`:
+    /// - `run`  -> exits immediately with `run_exit_code`, before this backend's
+    ///   polling loop ever gets a chance to observe `Running` — the scenario itself.
+    /// - `ls`   -> answers `msb ls --format json` with this one sandbox reporting
+    ///   `status: ls_status`.
+    /// - `logs` -> answers `msb logs <name> --source system --tail 1000` with the
+    ///   boot-completion marker line iff `marker_present`, otherwise an unrelated
+    ///   line.
+    #[cfg(unix)]
+    fn write_fake_msb_for_fast_exit(
+        dir: &Path,
+        name: &str,
+        run_exit_code: u8,
+        ls_status: &str,
+        marker_present: bool,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-fast-exit.sh");
+        let marker_line = if marker_present {
+            SANDBOX_STARTED_MARKER
+        } else {
+            "--- some unrelated system log line ---"
+        };
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             run)\n\
+             exit {run_exit_code}\n\
+             ;;\n\
+             ls)\n\
+             echo '[{{\"name\":\"{name}\",\"status\":\"{ls_status}\"}}]'\n\
+             exit 0\n\
+             ;;\n\
+             logs)\n\
+             echo '{marker_line}'\n\
+             exit 0\n\
+             ;;\n\
+             esac\n\
+             exit 1\n"
+        );
+        std::fs::write(&script, body).expect("write fake msb fast-exit script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake msb fast-exit script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_exit_with_stopped_state_and_started_marker_classifies_as_success() {
+        let dir = unique_test_dir("fast-exit-success");
+        let name = "rz-fast-exit-ok";
+        let script = write_fake_msb_for_fast_exit(&dir, name, 0, "Stopped", true);
+        let spec = ContainerSpec::new(name, "alpine:3.19", "run-1");
+
+        let result = spawn_and_await_running(&script, &spec);
+        assert!(
+            result.is_ok(),
+            "exit 0 + ls Stopped + started marker present must classify as a \
+             completed workload, not a failed boot: {:?}",
+            result.err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_exit_without_the_started_marker_still_fails_with_the_existing_error() {
+        let dir = unique_test_dir("fast-exit-no-marker");
+        let name = "rz-fast-exit-no-marker";
+        let script = write_fake_msb_for_fast_exit(&dir, name, 0, "Stopped", false);
+        let spec = ContainerSpec::new(name, "alpine:3.19", "run-1");
+
+        let err = spawn_and_await_running(&script, &spec).unwrap_err();
+        assert!(
+            err.to_string().contains("before reaching Running"),
+            "an absent started marker must keep today's failure message unchanged, \
+             even with ls reporting Stopped: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_exit_with_a_non_stopped_state_still_fails_with_the_existing_error() {
+        let dir = unique_test_dir("fast-exit-not-stopped");
+        let name = "rz-fast-exit-not-stopped";
+        let script = write_fake_msb_for_fast_exit(&dir, name, 0, "Exited", true);
+        let spec = ContainerSpec::new(name, "alpine:3.19", "run-1");
+
+        let err = spawn_and_await_running(&script, &spec).unwrap_err();
+        assert!(
+            err.to_string().contains("before reaching Running"),
+            "a state other than Stopped must keep today's failure message unchanged, \
+             even with the started marker present: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_exit_classification_never_applies_to_a_non_zero_exit() {
+        let dir = unique_test_dir("fast-exit-nonzero");
+        let name = "rz-fast-exit-nonzero";
+        let script = write_fake_msb_for_fast_exit(&dir, name, 1, "Stopped", true);
+        let spec = ContainerSpec::new(name, "alpine:3.19", "run-1");
+
+        let err = spawn_and_await_running(&script, &spec).unwrap_err();
+        assert!(
+            err.to_string().contains("before reaching Running"),
+            "a non-zero exit must never be classified as a completed workload, \
+             whatever ls/logs report: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -50,6 +50,23 @@ pub(crate) fn running_names(json: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Returns whether `json`'s entry named `name` has `status` exactly equal to
+/// `wanted` (msb's own casing, e.g. `"Stopped"`) — the msb backend's fast-exit
+/// post-mortem classification uses this to confirm a sandbox that exited before
+/// `Running` was observed actually finished cleanly rather than dying mid-boot.
+///
+/// The same tolerant-failure posture as [`running_names`]: no entry named `name`, an
+/// entry missing `name` or `status`, or a `json` that fails to parse as an array at
+/// all, all yield `false` rather than an error — a malformed/absent `msb ls` result
+/// must read as "not confirmed Stopped", never crash the classification.
+pub(crate) fn status_is(json: &str, name: &str, wanted: &str) -> bool {
+    let entries: Vec<LsEntry> = serde_json::from_str(json).unwrap_or_default();
+    entries.into_iter().any(|e| match (e.name, e.status) {
+        (Some(n), Some(s)) => n == name && s == wanted,
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +150,33 @@ mod tests {
     fn no_running_sandboxes_at_all_yields_empty_set() {
         let json = r#"[{"name":"a","status":"Stopped"}]"#;
         assert!(names(json).is_empty());
+    }
+
+    #[test]
+    fn status_is_matches_the_named_entrys_exact_status() {
+        let json = r#"[
+              {"name":"rz-a","status":"Stopped"},
+              {"name":"rz-b","status":"Running"}
+            ]"#;
+        assert!(status_is(json, "rz-a", "Stopped"));
+        assert!(!status_is(json, "rz-a", "Running"));
+        assert!(status_is(json, "rz-b", "Running"));
+    }
+
+    #[test]
+    fn status_is_false_when_the_name_is_not_present_at_all() {
+        let json = r#"[{"name":"rz-a","status":"Stopped"}]"#;
+        assert!(!status_is(json, "rz-does-not-exist", "Stopped"));
+    }
+
+    #[test]
+    fn status_is_false_when_the_entry_is_missing_name_or_status() {
+        let json = r#"[{"name":"rz-a"},{"status":"Stopped"}]"#;
+        assert!(!status_is(json, "rz-a", "Stopped"));
+    }
+
+    #[test]
+    fn status_is_false_on_malformed_json_rather_than_panicking() {
+        assert!(!status_is("not json at all", "rz-a", "Stopped"));
     }
 }

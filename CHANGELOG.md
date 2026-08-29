@@ -12,8 +12,30 @@ reaches its first tagged release.
 - **The pinned microsandbox release is now 0.6.16** (from 0.6.15). Upstream changes
   relevant here: network address slots are recycled instead of exhausting after many
   sandbox creations, single-file mounts are properly isolated, and a failed boot now
-  renders a structured boot error in `msb logs`. No CLI surface this library drives
-  changed.
+  renders a structured boot error in `msb logs`. One behavior-relevant change did
+  land, covered under Fixed below: 0.6.16's convergent-lifecycle rework stops
+  surfacing `Running` at all for a workload that finishes before this library's own
+  readiness poll can observe it.
+
+- **Downgrading `MSB_PATH` off 0.6.16 is unsafe once its `MSB_HOME` has been used.**
+  0.6.16 migrates the shared state database on first run; an older msb binary
+  pointed at that same, now-migrated `MSB_HOME` refuses outright with "database
+  schema is newer than this msb binary". Back up or recreate `MSB_HOME` before
+  downgrading.
+
+### Fixed
+
+- **A workload that finishes quickly no longer fails `start()` on msb 0.6.16.** msb
+  0.6.16's convergent-lifecycle rework never surfaces `Running` for a sandbox whose
+  command (e.g. a short build or test script) completes before the readiness poll's
+  next check — earlier releases usually won that race on a fast host and observed
+  `Running` briefly before the same exit. The boot supervision now recognizes this
+  case: an attached `msb run` child that exits 0 before `Running` was observed is
+  checked post-mortem, and classified as a completed (not failed) start when `msb ls`
+  reports the sandbox `Stopped` and the system log carries the boot-completion marker
+  msb's guest agent writes only once it has actually come up. Any other combination
+  (a non-zero exit, a state other than `Stopped`, or the marker missing) still fails
+  exactly as before.
 
 ## [0.7.5] - 2026-08-26
 

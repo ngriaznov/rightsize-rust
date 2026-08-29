@@ -261,9 +261,14 @@ async fn sweep_end_to_end_reaps_a_fabricated_dead_run() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .expect("spawn fresh-init child process");
-    assert!(status.success(), "fresh-init child must exit cleanly");
+    assert!(
+        status.status.success(),
+        "fresh-init child must exit cleanly\n--- child stdout ---\n{}\n--- child stderr ---\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
 
     let deadline = Instant::now() + REAP_CEILING;
     let mut reaped = false;

@@ -250,6 +250,24 @@ pub fn follow_logs(name: &str) -> Vec<String> {
     vec!["logs".to_string(), name.to_string(), "-f".to_string()]
 }
 
+/// Builds the argv for a one-shot SYSTEM-log fetch (`--source system`, the last 1000
+/// lines) — [`logs`]'s sibling, pointed at msb's own boot/lifecycle log instead of the
+/// workload's. Used only by the backend's post-mortem fast-exit classification: when
+/// an attached `msb run` child exits 0 before this backend ever observes `Running`,
+/// the system log's boot-completion marker line (written only once the guest agent
+/// has actually come up) is what distinguishes a workload that ran to completion from
+/// a genuinely dead boot.
+pub fn logs_system(name: &str) -> Vec<String> {
+    vec![
+        "logs".to_string(),
+        name.to_string(),
+        "--source".to_string(),
+        "system".to_string(),
+        "--tail".to_string(),
+        "1000".to_string(),
+    ]
+}
+
 /// Builds the argv for `msb stop`.
 pub fn stop(name: &str) -> Vec<String> {
     vec!["stop".to_string(), name.to_string()]
@@ -498,6 +516,10 @@ mod tests {
         );
         assert_eq!(logs("rz-abc-1"), vec!["logs", "rz-abc-1", "--tail", "1000"]);
         assert_eq!(follow_logs("rz-abc-1"), vec!["logs", "rz-abc-1", "-f"]);
+        assert_eq!(
+            logs_system("rz-abc-1"),
+            vec!["logs", "rz-abc-1", "--source", "system", "--tail", "1000"]
+        );
         assert_eq!(stop("rz-abc-1"), vec!["stop", "rz-abc-1"]);
         assert_eq!(rm("rz-abc-1"), vec!["rm", "rz-abc-1"]);
         // Confirmed empirically against the real msb binary: no `--json` flag on `ls`.
