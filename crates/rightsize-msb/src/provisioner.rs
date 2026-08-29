@@ -44,7 +44,7 @@ use rightsize::error::{Result, RightsizeError};
 /// avoid 0.6.10 through 0.6.13.
 macro_rules! msb_version {
     () => {
-        "0.6.15"
+        "0.6.16"
     };
 }
 
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn msb_version_is_unified_and_drives_the_url_and_install_dir() {
-        assert_eq!(MSB_VERSION, "0.6.15");
+        assert_eq!(MSB_VERSION, "0.6.16");
         assert!(
             DEFAULT_BASE.ends_with(MSB_VERSION),
             "DEFAULT_BASE {DEFAULT_BASE} must be built from MSB_VERSION {MSB_VERSION}"
