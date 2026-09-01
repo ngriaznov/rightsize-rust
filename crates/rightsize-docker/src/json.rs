@@ -126,6 +126,17 @@ pub(crate) struct ExecInspect {
     pub exit_code: Option<i64>,
 }
 
+/// `GET /version` response — only the `Os` field this backend reads, to confirm the
+/// daemon on the other end of the socket serves Linux containers (see
+/// `crate::provider`'s `is_supported` for why: this backend only knows how to run
+/// Linux containers, so a Windows-containers `dockerd` — reachable, but the wrong
+/// kind of daemon — must not report itself as supported).
+#[derive(Deserialize)]
+pub(crate) struct VersionResponse {
+    #[serde(rename = "Os")]
+    pub os: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +223,13 @@ mod tests {
         let body = r#"{"ExitCode":null}"#;
         let parsed: ExecInspect = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.exit_code, None);
+    }
+
+    #[test]
+    fn version_response_extracts_os_regardless_of_other_fields() {
+        let body = r#"{"Platform":{"Name":""},"Version":"27.3.1","Os":"linux","Arch":"amd64"}"#;
+        let parsed: VersionResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.os, "linux");
     }
 
     #[test]

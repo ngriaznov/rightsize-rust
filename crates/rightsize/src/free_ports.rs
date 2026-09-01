@@ -73,6 +73,21 @@ impl FreePorts {
             .expect("FreePorts mutex poisoned")
             .clone()
     }
+
+    /// Test-only book-keeping seam: marks `port` issued directly, via the same
+    /// `HashSet::insert` [`Self::allocate`] relies on to reject an already-issued
+    /// port — without needing a fresh OS-assigned port to land on that exact number.
+    /// Returns whether `port` was newly inserted (`false` means it was already
+    /// considered issued). This lets a test prove a released port is reissuable
+    /// against the pool's own accounting, rather than against the OS actually
+    /// handing that same port number back, which it has no obligation to do.
+    #[cfg(test)]
+    pub(crate) fn reserve(&self, port: u16) -> bool {
+        self.issued
+            .lock()
+            .expect("FreePorts mutex poisoned")
+            .insert(port)
+    }
 }
 
 impl Default for FreePorts {
@@ -139,14 +154,21 @@ mod tests {
             "release must drop the port from issued_view()"
         );
 
-        // Re-allocating enough ports must be able to hit the just-released port again —
-        // demonstrated by directly re-inserting it via allocate() retrying past
-        // in-process duplicates. We prove reissuability by binding it again ourselves,
-        // which only works if release() actually gave it back to the OS-visible pool
-        // (i.e. this process no longer thinks it's taken).
-        let listener =
-            TcpListener::bind(("127.0.0.1", port)).expect("released port must be bindable again");
-        assert_eq!(listener.local_addr().unwrap().port(), port);
+        // Reissuability used to be proven by rebinding this exact port with a raw
+        // `TcpListener::bind`, but that asserted something the OS never promised: it
+        // has no obligation to hand this exact port number back on the next bind, and
+        // on a shared CI host any other process can grab it in the gap between
+        // release and this bind (observed exactly as an AddrInUse under coverage
+        // instrumentation on a loaded runner) — environmental noise, not a defect in
+        // `release`. The property this test actually owns is in-process: `release`
+        // must give the pool's own book-keeping the port back. `reserve` performs the
+        // same `issued.insert(port)` `allocate()` relies on to reject an
+        // already-issued port, so a `true` result here means the slot is genuinely
+        // free in the pool's accounting, with no OS bind involved.
+        assert!(
+            pool.reserve(port),
+            "a released port must be freshly issuable again in the pool's own book-keeping"
+        );
     }
 
     /// Mutation-proof: this test is written so that if `release` were a no-op (i.e. it

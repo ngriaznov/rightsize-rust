@@ -14,7 +14,7 @@ reaches its first tagged release.
   `DOCKER_HOST=npipe:////./pipe/name`, the same convention real Docker clients use
   there), the same way it dials `/var/run/docker.sock` on unix — unix behavior and
   defaults are unchanged. `DockerBackendProvider::is_supported` runs the same
-  `GET /_ping` probe on both platforms, just over whichever transport the platform
+  `GET /version` probe on both platforms, just over whichever transport the platform
   actually has, so a Windows host without Docker Desktop running still gets a clean
   `is_supported() == false` and a typed error, not a compile or connect crash. A
   Windows named-pipe handle has no per-read/write timeout knob the way a unix socket
@@ -22,6 +22,10 @@ reaches its first tagged release.
   thread's wait a different way there (`rightsize_docker::stream::run_with_deadline`
   runs the round trip on a detached thread and times out the wait on it) — a wedged
   Docker Desktop daemon can no longer hang either path indefinitely on Windows.
+  `is_supported()` also now requires that daemon's `GET /version` response to report
+  `"Os":"linux"`, so a reachable-but-Windows-containers `dockerd` (a real possibility
+  once a Windows daemon is in the picture at all) is correctly treated as unsupported
+  rather than a false positive, on every platform.
 
 ### Fixed
 
