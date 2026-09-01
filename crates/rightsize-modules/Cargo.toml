@@ -1,6 +1,6 @@
 [package]
 name = "rightsize-modules"
-version = "0.7.6"
+version = "0.7.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,9 +23,9 @@ backend-docker = ["dep:rightsize-docker"]
 sandbox-it = []
 
 [dependencies]
-rightsize = { path = "../rightsize", version = "0.7.6" }
-rightsize-msb = { path = "../rightsize-msb", version = "0.7.6", optional = true }
-rightsize-docker = { path = "../rightsize-docker", version = "0.7.6", optional = true }
+rightsize = { path = "../rightsize", version = "0.7.7" }
+rightsize-msb = { path = "../rightsize-msb", version = "0.7.7", optional = true }
+rightsize-docker = { path = "../rightsize-docker", version = "0.7.7", optional = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

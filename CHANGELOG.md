@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.7] - 2026-09-01
+
 ### Added
 
 - **The docker backend now works on Windows, over Docker Desktop's named pipe.**
@@ -790,7 +794,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.3...v0.7.4
