@@ -100,21 +100,28 @@ with each other on this msb build.
 
 ## Docker deep-dive
 
-### Unix-socket-only, and why
+### Hand-rolled transport, and why
 
-`rightsize-docker` is a from-scratch client over `tokio::net::UnixStream` — no
-`bollard`, no `hyper`. This is a binding decision, not an oversight: a shared HTTP
-stack that some *other* dependency in a consumer's tree can independently upgrade is a
-real, previously-observed failure mode (a `httpclient5` bump misrouting a JVM Docker
-client onto plaintext TCP port 2375 in the wild). Hand-rolling the client means this
-crate's dependency tree structurally cannot be the reason a Docker client gets
-misrouted onto TCP by an unrelated bump elsewhere in your tree — the whole surface is
-exactly the daemon endpoints this backend uses, talking to the daemon over a plain
-unix-socket HTTP connection, always.
+`rightsize-docker` is a from-scratch client over a unix domain socket (unix) or
+Docker Desktop's named pipe (Windows, `\\.\pipe\docker_engine`) — no `bollard`, no
+`hyper`. This is a binding decision, not an oversight: a shared HTTP stack that some
+*other* dependency in a consumer's tree can independently upgrade is a real,
+previously-observed failure mode (a `httpclient5` bump misrouting a JVM Docker client
+onto plaintext TCP port 2375 in the wild). Hand-rolling the client means this crate's
+dependency tree structurally cannot be the reason a Docker client gets misrouted onto
+TCP by an unrelated bump elsewhere in your tree — the whole surface is exactly the
+daemon endpoints this backend uses, talking to the daemon over a plain local
+connection, always, on whichever transport the host platform actually offers.
 
-On Windows this means the Docker fallback needs a daemon reachable over a real unix
-socket — Docker Desktop's WSL2-backed daemon exposes one — not Windows' native named
-pipe (`\\.\pipe\docker_engine`), which this client does not speak.
+`DOCKER_HOST` is honored per platform, the same way real `docker` CLIs/SDKs read it:
+`unix:///path/to.sock` (or a bare path) on unix, `npipe:////./pipe/name` on Windows.
+Anything else (a TCP endpoint, or the other platform's own scheme) falls back to the
+platform default rather than attempting a connection this client has no transport for
+at all — see `crate::client::DockerClient::from_docker_host`'s doc for the exact
+mapping on each platform. Both platform arms — and the async/blocking stream types
+each dials — live behind one crate-internal seam (`crate::stream`), so `client.rs`'s
+HTTP parsing and `frames.rs`'s log-frame demuxer are written once, against that seam,
+not once per platform.
 
 Chunked transfer decoding and the daemon's log-stream multiplexing frame format
 (`[stream_type: u8, 0, 0, 0, len: u32_be, payload]`) are still hand-parsed — that's

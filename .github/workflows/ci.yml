@@ -1,7 +1,9 @@
 name: ci
 on:
   push:
-    branches: [main]
+    # win-docker is a temporary CI trigger branch for the docker-backend Windows
+    # named-pipe transport work — remove once that work merges to main.
+    branches: [main, win-docker]
   pull_request:
   workflow_dispatch:
   # Weekly run: integration tests pin real upstream artifacts (the msb release,
@@ -81,12 +83,13 @@ jobs:
   # findings" appendix): WHP is already Enabled with RestartNeeded=False on both images,
   # so no enablement step is needed here (unlike the spike, which probed for that).
   #
-  # Scoped to `-p rightsize-msb` plus the contract suite below, not `--workspace`:
-  # - `rightsize-docker` is unix-socket-only by design (`tokio::net::UnixStream`/
-  #   `std::os::unix::net::UnixStream`, no Windows arm — see docs/backends.md's
-  #   "Unix-socket-only, and why"), so it does not compile on windows-msvc; any
-  #   invocation that links it fails to build here, which is why the contract-suite
-  #   step selects `--no-default-features --features backend-msb`.
+  # This is also the only lane that compiles the FULL workspace on Windows (the
+  # `cargo check --workspace --all-targets` step below, run before anything else) —
+  # no other job builds anything on `windows-msvc` at all, so this is what would have
+  # caught `rightsize-docker` failing to compile there before it grew a named-pipe
+  # transport (see docs/backends.md's "Hand-rolled transport, and why"). The actual
+  # test invocations below stay scoped to `-p rightsize-msb` plus the contract suite,
+  # not `--workspace`, for reasons unrelated to compilation:
   # - `rightsize` (core)'s own unit suite has two pre-existing, Windows-path-portability
   #   gaps unrelated to msb: `mountable_file::for_host_path_leaves_an_absolute_path_
   #   untouched` asserts a hardcoded POSIX path (`/etc/hosts`) round-trips unmodified
@@ -107,6 +110,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
+      # The whole-workspace compile gate: catches a Windows compile break in ANY
+      # crate (not just the ones the test steps below happen to touch) before any of
+      # them run. `--all-targets` includes test/bench targets, so a `#[cfg(windows)]`
+      # test that only exists on this platform is checked too, not just library code.
+      - run: cargo check --workspace --all-targets
       # Same incremental image-cache warming as msb-linux, Windows-suffixed keys and
       # msb's Windows-native cache path (see install.ps1's own default install root;
       # this crate's Windows cache root is %LOCALAPPDATA%\rightsize, but msb's own
@@ -133,9 +141,12 @@ jobs:
       # of rightsize-modules boots the whole module catalog serially, which this lane
       # cannot afford, while the contract suite is alpine and python only.
       # `--no-default-features --features backend-msb,sandbox-it` because the default
-      # features include backend-docker, and rightsize-docker is a unix-socket client
-      # that does not compile on Windows — the suite's docker references are gated on
-      # that same feature. Appends to the same log the cache-corruption guard greps.
+      # features include backend-docker, and this runner has no Docker daemon (Desktop
+      # or otherwise) — `rightsize-docker` itself compiles fine on Windows now (see
+      # the whole-workspace `cargo check` step above), this is purely about not
+      # depending on a daemon this lane doesn't run; the suite's docker references are
+      # gated on that same feature. Appends to the same log the cache-corruption guard
+      # greps.
       - run: RIGHTSIZE_BACKEND=microsandbox cargo test -p rightsize-modules --no-default-features --features backend-msb,sandbox-it --test contract -- --test-threads=1 2>&1 | tee -a /tmp/it-output.log
         shell: bash
       # Same guard as msb-linux: never bank a cache a run observed corrupted, so the

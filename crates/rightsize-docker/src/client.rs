@@ -1,30 +1,40 @@
-//! A from-scratch HTTP/1.1 client over `tokio::net::UnixStream` — the entire reason
-//! this backend hand-rolls its own transport: sharing an HTTP stack with
-//! whatever the consuming project also depends on can, in practice, misroute a Docker
-//! client onto TCP 2375 instead of the daemon's unix socket (a real class of
-//! regression seen when a shared HTTP stack changes its defaults on a version bump).
-//! This client only ever opens `tokio::net::UnixStream`s — see
+//! A from-scratch HTTP/1.1 client over a unix domain socket (unix) or Docker
+//! Desktop's named pipe (Windows) — the entire reason this backend hand-rolls its own
+//! transport: sharing an HTTP stack with whatever the consuming project also depends
+//! on can, in practice, misroute a Docker client onto TCP 2375 instead of the
+//! daemon's real endpoint (a real class of regression seen when a shared HTTP stack
+//! changes its defaults on a version bump). This client only ever opens a
+//! [`crate::stream::DockerStream`] — see
 //! `docker_backend_dials_a_unix_socket_never_a_tcp_host` in `crate::backend`'s tests
-//! for the standing regression guard.
+//! for the standing regression guard (its assertions hold for the Windows pipe path
+//! too: no `host:port` shape, ever).
 //!
-//! One request/response cycle = one connection: dial the socket, write the request,
-//! read the status line + headers, then read the body honoring `Transfer-Encoding:
-//! chunked` (dechunked here) or `Content-Length`. There is no keep-alive/pooling — the
-//! daemon calls this client makes are infrequent enough (container lifecycle, not a
-//! request-per-millisecond workload) that a fresh connection per call is the simplest
-//! correct thing, and it sidesteps an entire class of connection-reuse bugs a hand-
-//! rolled client would otherwise have to get right.
+//! One request/response cycle = one connection: dial the socket/pipe, write the
+//! request, read the status line + headers, then read the body honoring
+//! `Transfer-Encoding: chunked` (dechunked here) or `Content-Length`. There is no
+//! keep-alive/pooling — the daemon calls this client makes are infrequent enough
+//! (container lifecycle, not a request-per-millisecond workload) that a fresh
+//! connection per call is the simplest correct thing, and it sidesteps an entire class
+//! of connection-reuse bugs a hand-rolled client would otherwise have to get right.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 use rightsize::error::{Result, RightsizeError};
 
+use crate::stream::{DockerStream, connect_async};
+
 /// The daemon's default unix socket path on a host with no `DOCKER_HOST` override.
+#[cfg(unix)]
 const DEFAULT_SOCKET_PATH: &str = "/var/run/docker.sock";
+
+/// Docker Desktop's default named-pipe endpoint on a Windows host with no
+/// `DOCKER_HOST` override — the same pipe the `docker` CLI and every other Docker
+/// client on Windows dials by default.
+#[cfg(windows)]
+const DEFAULT_PIPE_PATH: &str = r"\\.\pipe\docker_engine";
 
 /// The ceiling on a single unary request/response cycle — connect, write, read
 /// headers, read the whole body. Long enough for a slow daemon under load, short
@@ -63,19 +73,23 @@ pub(crate) struct DockerClient {
 }
 
 impl DockerClient {
-    /// Builds a client at the default socket path (`/var/run/docker.sock`), or the
-    /// path from `DOCKER_HOST` if it names a `unix://` (or bare-path) socket — the
-    /// same override real `docker` CLI/SDKs honor. A `DOCKER_HOST` naming a TCP
-    /// endpoint (`tcp://…`, `http://…`) is deliberately NOT honored: this client only
-    /// ever dials a unix socket — see [`Self::from_env`]'s doc for the exact
-    /// fallback behavior in that case.
+    /// Builds a client at the platform default endpoint (the unix socket
+    /// `/var/run/docker.sock`, or on Windows the named pipe `\\.\pipe\docker_engine`),
+    /// or the endpoint `DOCKER_HOST` names if it uses the scheme this platform's
+    /// transport actually speaks (`unix://`/bare-path on unix, `npipe://` on Windows)
+    /// — the same override real `docker` CLI/SDKs honor. Any other `DOCKER_HOST`
+    /// (a TCP endpoint, or the other platform's own scheme) is deliberately NOT
+    /// honored — see [`Self::from_env`]'s doc for the exact fallback behavior in that
+    /// case.
     pub(crate) fn from_env() -> Self {
         Self::from_docker_host(std::env::var("DOCKER_HOST").ok().as_deref())
     }
 
     /// The pure seam [`Self::from_env`] delegates to, parameterized over the
     /// `DOCKER_HOST` value so this is unit-testable without touching real process
-    /// environment. `host`:
+    /// environment.
+    ///
+    /// On unix, `host`:
     /// - `None` or unset → the default socket path.
     /// - `Some("unix:///path/to.sock")` → `/path/to.sock`.
     /// - `Some("/path/to.sock")` (a bare path, no scheme) → used as-is.
@@ -85,6 +99,16 @@ impl DockerClient {
     ///   `DOCKER_HOST` is treated the same as if it named a socket at the default
     ///   location — this client only ever speaks to a real unix socket, never
     ///   attempting HTTP over a socket path that doesn't exist.
+    ///
+    /// On Windows, `host`:
+    /// - `None` or unset → the default pipe path, `\\.\pipe\docker_engine`.
+    /// - `Some("npipe:////./pipe/docker_engine")` (the convention real Docker clients
+    ///   use on Windows) → `\\.\pipe\docker_engine`.
+    /// - Anything else (a `unix://`/`tcp://`/`http://` `DOCKER_HOST`, meaningless on
+    ///   this platform's transport) → falls back to the default pipe path, the same
+    ///   "never attempt a connection this client doesn't actually speak" contract the
+    ///   unix arm applies to a non-unix `DOCKER_HOST`.
+    #[cfg(unix)]
     pub(crate) fn from_docker_host(host: Option<&str>) -> Self {
         let socket_path = match host {
             Some(h) if h.starts_with("unix://") => PathBuf::from(h.trim_start_matches("unix://")),
@@ -97,10 +121,35 @@ impl DockerClient {
         }
     }
 
+    /// Windows arm of [`Self::from_docker_host`] — see that doc comment for the exact
+    /// `host` → endpoint mapping. `npipe://` is stripped by length rather than
+    /// `trim_start_matches` (contrast the unix arm) because the remainder must keep
+    /// its own leading slashes verbatim before they're flipped to backslashes:
+    /// `"npipe://" + "//./pipe/docker_engine"` → stripping the 8-char prefix leaves
+    /// `"//./pipe/docker_engine"`, which becomes the exact device path
+    /// `\\.\pipe\docker_engine` once every `/` is replaced with `\`.
+    #[cfg(windows)]
+    pub(crate) fn from_docker_host(host: Option<&str>) -> Self {
+        const NPIPE_PREFIX: &str = "npipe://";
+        let socket_path = match host {
+            Some(h) if h.starts_with(NPIPE_PREFIX) => {
+                PathBuf::from(h[NPIPE_PREFIX.len()..].replace('/', "\\"))
+            }
+            _ => PathBuf::from(DEFAULT_PIPE_PATH),
+        };
+        DockerClient {
+            socket_path,
+            response_timeout: RESPONSE_TIMEOUT,
+        }
+    }
+
     /// Builds a client dialing an arbitrary socket path directly — the seam unit tests
     /// use to point this client at a local fixture listener instead of the real
-    /// daemon.
-    #[cfg(test)]
+    /// daemon. Unix-only: every current call site is one of this crate's unix-socket
+    /// test fixtures (see this module's own test module, and `crate::backend`'s) —
+    /// there is no Windows named-pipe *server* fixture to point this at (see those
+    /// fixtures' doc comments for why).
+    #[cfg(all(test, unix))]
     pub(crate) fn at_socket(path: impl Into<PathBuf>) -> Self {
         DockerClient {
             socket_path: path.into(),
@@ -110,8 +159,8 @@ impl DockerClient {
 
     /// Test-only: shrinks the unary-request timeout so a fixture that deliberately
     /// never completes a response fails promptly instead of after the real
-    /// [`RESPONSE_TIMEOUT`] ceiling.
-    #[cfg(test)]
+    /// [`RESPONSE_TIMEOUT`] ceiling. Unix-only, same reason as [`Self::at_socket`].
+    #[cfg(all(test, unix))]
     pub(crate) fn with_response_timeout(mut self, timeout: Duration) -> Self {
         self.response_timeout = timeout;
         self
@@ -177,15 +226,15 @@ impl DockerClient {
         method: &str,
         path: &str,
         body: Option<&str>,
-    ) -> Result<(ParsedHeaders, UnixStream)> {
+    ) -> Result<(ParsedHeaders, DockerStream)> {
         let mut stream = self.connect().await?;
         write_request(&mut stream, method, path, body).await?;
         let headers = read_headers(&mut stream).await?;
         Ok((headers, stream))
     }
 
-    async fn connect(&self) -> Result<UnixStream> {
-        UnixStream::connect(&self.socket_path).await.map_err(|e| {
+    async fn connect(&self) -> Result<DockerStream> {
+        connect_async(&self.socket_path).await.map_err(|e| {
             RightsizeError::Backend(format!(
                 "could not connect to the Docker daemon at {} — is Docker/Podman/Colima \
                  running? ({e})",
@@ -198,7 +247,7 @@ impl DockerClient {
 /// Writes `METHOD path HTTP/1.1\r\nHost: docker\r\n...\r\n\r\n[body]` to `stream`.
 /// `Content-Length`/`Content-Type` headers are included only when `body` is `Some`.
 async fn write_request(
-    stream: &mut UnixStream,
+    stream: &mut DockerStream,
     method: &str,
     path: &str,
     body: Option<&str>,
@@ -237,7 +286,7 @@ pub(crate) struct ParsedHeaders {
 /// (a wedged daemon, or a test fixture that stalls mid-header) would otherwise make
 /// this loop accumulate `raw` without limit while it waits for bytes that never
 /// complete the block — this turns that into a named error instead of unbounded growth.
-async fn read_headers(stream: &mut UnixStream) -> Result<ParsedHeaders> {
+async fn read_headers(stream: &mut DockerStream) -> Result<ParsedHeaders> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -314,7 +363,7 @@ fn parse_headers(text: &str) -> Result<ParsedHeaders> {
 /// present means "read until the peer closes the connection" (this client always
 /// sends `Connection: close`, so the daemon closing at body-end is the expected
 /// signal in that case).
-async fn read_body_to_end(stream: &mut UnixStream, headers: &ParsedHeaders) -> Result<Vec<u8>> {
+async fn read_body_to_end(stream: &mut DockerStream, headers: &ParsedHeaders) -> Result<Vec<u8>> {
     if headers.chunked {
         return read_chunked_body(stream).await;
     }
@@ -340,7 +389,7 @@ async fn read_body_to_end(stream: &mut UnixStream, headers: &ParsedHeaders) -> R
 /// a hex chunk-size line, then that many bytes plus the trailing `\r\n`, until a
 /// zero-size chunk (optionally followed by trailer headers, which this daemon never
 /// sends anything interesting in, so they're drained and discarded) ends the stream.
-pub(crate) async fn read_chunked_body(stream: &mut UnixStream) -> Result<Vec<u8>> {
+pub(crate) async fn read_chunked_body(stream: &mut DockerStream) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let size_line = read_line(stream).await?;
@@ -382,7 +431,7 @@ pub(crate) async fn read_chunked_body(stream: &mut UnixStream) -> Result<Vec<u8>
 /// Bounded at [`MAX_HEADER_BYTES`], same reasoning as `read_headers` — a chunk-size
 /// line (or trailer line) that never terminates would otherwise accumulate `raw`
 /// without limit.
-async fn read_line(stream: &mut UnixStream) -> Result<String> {
+async fn read_line(stream: &mut DockerStream) -> Result<String> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -415,12 +464,20 @@ async fn read_line(stream: &mut UnixStream) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     /// Spawns a fixture unix-socket "server" in a temp dir that accepts exactly one
     /// connection, reads whatever the client sends (discarded — these tests only
     /// care about what the client parses back out of a canned response), and writes
     /// `response` verbatim before closing. Returns the client already pointed at it.
+    /// Unix-only, like every fixture in this module that binds a real unix listener
+    /// (see `crate::frames`'s own test module for the same convention) — there is no
+    /// equivalent named-pipe *server* fixture here, since faking the Windows pipe
+    /// transport's actual I/O is exactly what this crate's Windows work deliberately
+    /// does NOT unit-test (see the crate's Windows platform-selection tests instead,
+    /// further down in this module).
+    #[cfg(unix)]
     async fn fixture_client(response: &'static [u8]) -> (DockerClient, tempdir_shim::TempDir) {
         let dir = tempdir_shim::TempDir::new();
         let sock_path = dir.path().join("docker.sock");
@@ -447,7 +504,10 @@ mod tests {
     /// A minimal, dependency-free temp-directory helper (this crate takes on no extra
     /// deps beyond its runtime dependency budget, so tests build their own
     /// throwaway-directory scaffolding from `std` rather than pulling in a `tempfile`
-    /// crate for this alone).
+    /// crate for this alone). Unix-only: rooted at a unix socket path budget (see
+    /// `TempDir::new`'s own doc), meaningless on Windows, where nothing in this test
+    /// module uses it.
+    #[cfg(unix)]
     mod tempdir_shim {
         use std::path::{Path, PathBuf};
 
@@ -480,6 +540,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parses_a_content_length_response() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"Id\":\"abc\"}";
@@ -489,6 +550,7 @@ mod tests {
         assert_eq!(resp.body, b"{\"Id\":\"abc\"}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parses_a_chunked_response() {
         let response: &[u8] =
@@ -502,6 +564,7 @@ mod tests {
         assert_eq!(resp.body, b"hello world");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parses_a_non_200_status() {
         let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
@@ -514,6 +577,7 @@ mod tests {
         assert!(resp.body.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parses_a_500_with_a_body() {
         let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 28\r\n\r\n{\"message\":\"already in use\"}";
@@ -526,6 +590,7 @@ mod tests {
         assert_eq!(resp.body, b"{\"message\":\"already in use\"}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn writes_a_json_body_with_matching_content_length() {
         let dir = tempdir_shim::TempDir::new();
@@ -566,12 +631,14 @@ mod tests {
         assert!(sent.ends_with(body));
     }
 
+    #[cfg(unix)]
     #[test]
     fn from_docker_host_none_uses_the_default_socket_path() {
         let client = DockerClient::from_docker_host(None);
         assert_eq!(client.socket_path(), Path::new(DEFAULT_SOCKET_PATH));
     }
 
+    #[cfg(unix)]
     #[test]
     fn from_docker_host_parses_a_unix_scheme_path() {
         let client = DockerClient::from_docker_host(Some("unix:///run/user/1000/docker.sock"));
@@ -581,12 +648,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn from_docker_host_accepts_a_bare_path() {
         let client = DockerClient::from_docker_host(Some("/custom/docker.sock"));
         assert_eq!(client.socket_path(), Path::new("/custom/docker.sock"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn from_docker_host_falls_back_to_default_for_a_tcp_host() {
         // This client has no TCP transport at all — a tcp:// DOCKER_HOST
@@ -594,6 +663,50 @@ mod tests {
         // HTTP over a nonexistent socket path derived from a TCP URL.
         let client = DockerClient::from_docker_host(Some("tcp://127.0.0.1:2375"));
         assert_eq!(client.socket_path(), Path::new(DEFAULT_SOCKET_PATH));
+    }
+
+    // --- Windows endpoint selection (DockerClient::from_docker_host's windows arm) --
+
+    #[cfg(windows)]
+    #[test]
+    fn from_docker_host_none_uses_the_default_pipe_path() {
+        let client = DockerClient::from_docker_host(None);
+        assert_eq!(client.socket_path(), Path::new(DEFAULT_PIPE_PATH));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn from_docker_host_parses_an_npipe_scheme_path() {
+        // The real convention Docker clients use on Windows: four slashes after the
+        // scheme, then a `.`, then the pipe's own name — see `from_docker_host`'s doc
+        // for exactly how this maps to the device path asserted below.
+        let client = DockerClient::from_docker_host(Some("npipe:////./pipe/docker_engine"));
+        assert_eq!(client.socket_path(), Path::new(r"\\.\pipe\docker_engine"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn from_docker_host_parses_an_npipe_scheme_path_with_a_custom_pipe_name() {
+        let client = DockerClient::from_docker_host(Some("npipe:////./pipe/custom_engine"));
+        assert_eq!(client.socket_path(), Path::new(r"\\.\pipe\custom_engine"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn from_docker_host_falls_back_to_default_for_a_tcp_host_on_windows() {
+        // Same "never attempt a connection this transport doesn't speak" contract as
+        // the unix arm's own tcp:// fallback test above.
+        let client = DockerClient::from_docker_host(Some("tcp://127.0.0.1:2375"));
+        assert_eq!(client.socket_path(), Path::new(DEFAULT_PIPE_PATH));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn from_docker_host_falls_back_to_default_for_a_unix_host_on_windows() {
+        // A unix:// DOCKER_HOST is the other platform's own scheme — meaningless to
+        // the named-pipe transport, so it falls back the same way a tcp:// one does.
+        let client = DockerClient::from_docker_host(Some("unix:///var/run/docker.sock"));
+        assert_eq!(client.socket_path(), Path::new(DEFAULT_PIPE_PATH));
     }
 
     #[test]
@@ -623,6 +736,7 @@ mod tests {
     /// then sends bytes forever without ever completing a header block (no `\r\n\r\n`)
     /// — the "wedged daemon" case the response-timeout ceiling exists for. Bytes are
     /// paced slowly so the connection stays open (not EOF) for the whole test.
+    #[cfg(unix)]
     async fn spawn_never_completing_headers_fixture() -> (DockerClient, tempdir_shim::TempDir) {
         let dir = tempdir_shim::TempDir::new();
         let sock_path = dir.path().join("docker.sock");
@@ -641,6 +755,7 @@ mod tests {
         (DockerClient::at_socket(sock_path), dir)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn request_times_out_instead_of_hanging_on_a_response_that_never_completes_headers() {
         let (client, _dir) = spawn_never_completing_headers_fixture().await;
@@ -663,6 +778,7 @@ mod tests {
     /// never terminate the block — proves the [`MAX_HEADER_BYTES`] cap fires (a named
     /// error) well before the response-timeout ceiling would, and without unbounded
     /// memory growth.
+    #[cfg(unix)]
     async fn spawn_oversized_header_fixture() -> (DockerClient, tempdir_shim::TempDir) {
         let dir = tempdir_shim::TempDir::new();
         let sock_path = dir.path().join("docker.sock");
@@ -684,6 +800,7 @@ mod tests {
         (DockerClient::at_socket(sock_path), dir)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_headers_caps_accumulation_instead_of_growing_without_bound() {
         let (client, _dir) = spawn_oversized_header_fixture().await;

@@ -33,10 +33,11 @@ async-trait = { workspace = true }
 # No rightsize-msb/rightsize-docker dev-dependencies: integration tests already see
 # both through the OPTIONAL regular dependencies whenever the matching backend-*
 # feature is on, and a dev-dependency cannot be optional — an unconditional one here
-# forced rightsize-docker (a unix-socket client that does not compile on Windows)
-# into every test build, defeating `--no-default-features --features
-# backend-msb,sandbox-it`, which is exactly how the Windows CI lane builds the
-# contract suite.
+# would force rightsize-docker into every test build regardless of feature selection,
+# defeating `--no-default-features --features backend-msb,sandbox-it`, which is
+# exactly how the Windows CI lane builds the contract suite scoped to msb only (that
+# lane has no Docker daemon to test against — `rightsize-docker` itself compiles fine
+# on Windows, see docs/backends.md's "Hand-rolled transport, and why").
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Parses the reaping ledger's run record in the contract suite instead of

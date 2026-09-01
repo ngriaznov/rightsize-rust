@@ -30,10 +30,15 @@ impl BackendProvider for DockerBackendProvider {
         // *inside* one already (a `#[tokio::test]` resolving a backend), and
         // `Runtime::block_on` panics in the latter case ("cannot start a runtime from
         // within a runtime"). Rather than juggle "is there already a runtime" logic,
-        // this probe is a plain blocking `std::os::unix::net::UnixStream` GET
-        // /_ping — the same blocking-transport shape `DockerBackend::cleanup_sync`
-        // already uses for its own no-Tokio-in-context constraint, and the honest fit
-        // for a synchronous trait method that must work in either context.
+        // this probe is a plain blocking GET /_ping over
+        // [`crate::stream::BlockingDockerStream`] (a unix socket on unix, Docker
+        // Desktop's named pipe on Windows) — the same blocking-transport shape
+        // `DockerBackend::cleanup_sync` already uses for its own no-Tokio-in-context
+        // constraint, and the honest fit for a synchronous trait method that must work
+        // in either context. Windows mirrors the unix probe exactly (a real connect +
+        // `GET /_ping`, not merely checking the pipe path exists): a stale or
+        // orphaned pipe file existing without a daemon actually answering behind it
+        // would otherwise report "supported" for a daemon that isn't really there.
         blocking_ping(DockerClient::from_env().socket_path())
     }
 
@@ -48,16 +53,15 @@ impl BackendProvider for DockerBackendProvider {
 
 /// A minimal blocking `GET /_ping`, true only on a 2xx response — see
 /// [`DockerBackendProvider::is_supported`]'s doc for why this is blocking std I/O
-/// rather than a reused async request.
-fn blocking_ping(socket_path: &std::path::Path) -> bool {
+/// rather than a reused async request. `target` is a unix socket path on unix, a
+/// named pipe path on Windows — [`crate::stream::connect_blocking`] is what actually
+/// dispatches on that.
+fn blocking_ping(target: &std::path::Path) -> bool {
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
     let probe = || -> std::io::Result<bool> {
-        let mut stream = UnixStream::connect(socket_path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let mut stream = crate::stream::connect_blocking(target, Duration::from_secs(2))?;
         stream.write_all(b"GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n")?;
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);

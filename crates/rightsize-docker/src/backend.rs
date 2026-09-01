@@ -980,7 +980,7 @@ async fn run_docker_cli(args: &[String]) -> Result<ExecResult> {
 
 /// The `cleanup_sync` path's blocking counterpart to `stop`+`remove`: issues a plain
 /// `POST /containers/{id}/stop?t=` then `DELETE /containers/{id}?force=true` over a
-/// blocking `std::os::unix::net::UnixStream` — no Tokio, since this runs on the
+/// blocking [`crate::stream::BlockingDockerStream`] — no Tokio, since this runs on the
 /// dedicated `Drop`-path cleanup thread with no async runtime in context. Best-effort:
 /// errors are swallowed by the caller, matching this backend's own async `stop`/
 /// `remove`.
@@ -1020,7 +1020,7 @@ fn blocking_find_container_id_by_name(socket_path: &std::path::Path, name: &str)
     entries.into_iter().next().map(|e| e.id)
 }
 
-/// A minimal blocking HTTP GET over a blocking unix socket, returning the response
+/// A minimal blocking HTTP GET over a blocking transport, returning the response
 /// body — the read-the-body counterpart to [`blocking_request`] (which discards it),
 /// needed by [`blocking_find_container_id_by_name`]. Honors `Content-Length` when
 /// present, dechunks a `Transfer-Encoding: chunked` response (`GET
@@ -1033,10 +1033,9 @@ fn blocking_find_container_id_by_name(socket_path: &std::path::Path, name: &str)
 /// assumption).
 fn blocking_get_body(socket_path: &std::path::Path, path: &str) -> std::io::Result<Vec<u8>> {
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(stop_timeout_budget())))?;
+    let mut stream =
+        crate::stream::connect_blocking(socket_path, Duration::from_secs(stop_timeout_budget()))?;
     let request = format!("GET {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
 
@@ -1087,7 +1086,7 @@ fn blocking_get_body(socket_path: &std::path::Path, path: &str) -> std::io::Resu
 /// chunk (optionally followed by trailer headers, drained and discarded) ends the
 /// body.
 fn blocking_read_chunked_body(
-    reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    reader: &mut std::io::BufReader<crate::stream::BlockingDockerStream>,
 ) -> std::io::Result<Vec<u8>> {
     use std::io::{BufRead, Read};
 
@@ -1126,11 +1125,11 @@ fn blocking_read_chunked_body(
     Ok(out)
 }
 
-/// A minimal blocking HTTP/1.1 request over a blocking unix socket — the Drop-path
+/// A minimal blocking HTTP/1.1 request over a blocking transport — the Drop-path
 /// analogue of [`DockerClient::request`], deliberately NOT reusing any of that async
-/// client's code (which is all `tokio::net::UnixStream`-shaped): this runs on a plain
-/// OS thread with no Tokio runtime available, so it needs its own blocking transport.
-/// Doesn't need to handle chunked responses — the
+/// client's code (which is all [`crate::stream::DockerStream`]-shaped, tokio-based):
+/// this runs on a plain OS thread with no Tokio runtime available, so it needs its own
+/// blocking transport. Doesn't need to handle chunked responses — the
 /// only calls made here (`stop`, `force=true remove`) return small `Content-Length`
 /// (or empty) bodies in practice — so this reads until the peer closes and returns
 /// whatever arrived, without trying to interpret framing at all.
@@ -1140,10 +1139,9 @@ fn blocking_request(
     path: &str,
 ) -> std::io::Result<()> {
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(stop_timeout_budget())))?;
+    let mut stream =
+        crate::stream::connect_blocking(socket_path, Duration::from_secs(stop_timeout_budget()))?;
     let request = format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
     let mut discard = Vec::new();
@@ -1177,7 +1175,11 @@ mod tests {
 
     /// A minimal, dependency-free temp-directory helper for the blocking-socket
     /// tests below — see the async test module's own `tempdir_shim` for why this
-    /// crate hand-rolls one per test module rather than sharing it.
+    /// crate hand-rolls one per test module rather than sharing it. Unix-only, like
+    /// the tests that use it (see `blocking_get_body_dechunks_a_transfer_encoding_
+    /// chunked_response`'s doc for why there is no Windows named-pipe counterpart
+    /// here).
+    #[cfg(unix)]
     mod blocking_tempdir_shim {
         use std::path::{Path, PathBuf};
 
@@ -1210,7 +1212,13 @@ mod tests {
     /// dockerd/Docker Desktop build observed, not the `Content-Length` shape an
     /// earlier version of this function assumed, which made
     /// `blocking_find_container_id_by_name` (and therefore `remove_by_name`) find
-    /// nothing on every real daemon.
+    /// nothing on every real daemon. Unix-only: this drives `blocking_get_body`
+    /// (and so `crate::stream::connect_blocking`) through a real unix-socket fixture
+    /// server; there is no equivalent named-pipe *server* fixture, since faking the
+    /// Windows pipe transport's actual I/O is exactly what this crate's Windows work
+    /// deliberately does NOT unit-test (see `crate::client`'s test module for the same
+    /// convention).
+    #[cfg(unix)]
     #[test]
     fn blocking_get_body_dechunks_a_transfer_encoding_chunked_response() {
         use std::io::{Read, Write};
@@ -1245,7 +1253,8 @@ mod tests {
 
     /// The `Content-Length`-framed shape must keep working too — the dechunking
     /// addition must be additive, not a regression on the framing that already
-    /// worked.
+    /// worked. Unix-only, same reason as the test above.
+    #[cfg(unix)]
     #[test]
     fn blocking_get_body_honors_content_length_when_present() {
         use std::io::{Read, Write};
@@ -1503,7 +1512,14 @@ mod tests {
     // `SandboxBackend`, since the bug lives in the daemon-call sequence itself, not
     // in anything a fake could stand in for.
 
+    // The rest of this module's fixtures bind a real unix listener (`multi_request_
+    // fixture` below), so they — and the tests that drive `DockerBackend` through
+    // them — are unix-only for the same reason `crate::client`'s and `crate::frames`'s
+    // own socket fixtures are: faking the Windows pipe transport's actual I/O is
+    // exactly what this crate's Windows work deliberately does NOT unit-test.
+    #[cfg(unix)]
     use std::sync::Arc;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     /// A minimal, dependency-free temp-directory helper — duplicated from
@@ -1511,6 +1527,7 @@ mod tests {
     /// one is nested inside a private `#[cfg(test)] mod tests` in a different file
     /// and this crate's own convention is small hand-rolled scaffolding per test
     /// module over an extra dependency or cross-module test plumbing.
+    #[cfg(unix)]
     mod tempdir_shim {
         use std::path::{Path, PathBuf};
 
@@ -1548,6 +1565,7 @@ mod tests {
     /// `remove_network`'s cache-miss fallback issues a `GET` lookup THEN a `DELETE`
     /// — two separate connections, since this client never keeps one alive across
     /// calls (see `crate::client`'s module doc).
+    #[cfg(unix)]
     async fn multi_request_fixture(
         responses: Vec<Vec<u8>>,
     ) -> (DockerClient, tempdir_shim::TempDir, Arc<Mutex<Vec<String>>>) {
@@ -1585,6 +1603,7 @@ mod tests {
 
     /// A canned `200 OK` response listing exactly one network whose daemon id is
     /// `id` — the shape `GET /networks?filters=...` returns.
+    #[cfg(unix)]
     fn network_list_response(id: &str) -> Vec<u8> {
         let payload = format!(r#"[{{"Id":"{id}"}}]"#);
         format!(
@@ -1600,11 +1619,13 @@ mod tests {
     /// "..."}]` shape as [`network_list_response`], reused as-is by
     /// [`ListedEntry`], but named separately since it stands for a different
     /// daemon resource at each call site).
+    #[cfg(unix)]
     fn container_list_response(id: &str) -> Vec<u8> {
         network_list_response(id)
     }
 
     /// A canned `200 OK` empty-array response — "nothing matched this filter."
+    #[cfg(unix)]
     fn empty_list_response() -> Vec<u8> {
         let payload = "[]";
         format!(
@@ -1616,6 +1637,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_running_returns_a_handle_when_the_daemon_lists_a_running_match() {
         let (client, _dir, received) =
             multi_request_fixture(vec![container_list_response("daemon-c-1")]).await;
@@ -1638,6 +1660,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_running_returns_none_when_nothing_matches() {
         let (client, _dir, _received) = multi_request_fixture(vec![empty_list_response()]).await;
         let backend = DockerBackend::new(client);
@@ -1647,6 +1670,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn create_maps_a_409_conflict_to_the_typed_name_conflict_error() {
         // Two canned responses: `create()` first checks the image is present
         // (`pull_if_missing`'s `GET /images/{name}/json`, answered `200 OK` so it
@@ -1671,6 +1695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn remove_network_falls_back_to_a_live_lookup_when_the_in_memory_cache_never_saw_it() {
         let (client, _dir, received) = multi_request_fixture(vec![
             network_list_response("daemon-net-9"),
@@ -1703,6 +1728,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn remove_network_uses_the_cached_id_without_a_lookup_when_this_instance_created_it() {
         // Only ONE canned response: if this test needed a second connection (a GET
         // lookup it shouldn't be making), the fixture would have nothing left to
@@ -1730,6 +1756,7 @@ mod tests {
     // --- create_checkpoint (checkpoint) ---------------------------------------
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn create_checkpoint_posts_commit_with_the_split_repo_and_tag_and_returns_the_ref() {
         let (client, _dir, received) = multi_request_fixture(vec![
             b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
@@ -1761,6 +1788,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn create_checkpoint_surfaces_a_daemon_error_as_a_backend_error() {
         let (client, _dir, _received) = multi_request_fixture(vec![
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 23\r\n\r\n{\"message\":\"no such\"}"
@@ -1784,6 +1812,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn remove_checkpoint_deletes_the_image_and_treats_not_found_as_success() {
         let (client, _dir, received) = multi_request_fixture(vec![
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
@@ -1807,6 +1836,7 @@ mod tests {
     // --- has_checkpoint (named checkpoints' existence probe) --------------------
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn has_checkpoint_returns_true_on_a_200() {
         let (client, _dir, received) = multi_request_fixture(vec![
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
@@ -1829,6 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn has_checkpoint_returns_false_on_a_404() {
         let (client, _dir, _received) = multi_request_fixture(vec![
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
@@ -1844,6 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn has_checkpoint_surfaces_any_other_status_as_an_error() {
         let (client, _dir, _received) = multi_request_fixture(vec![
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 15\r\n\r\n{\"message\":\"x\"}"

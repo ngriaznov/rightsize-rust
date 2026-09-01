@@ -24,11 +24,11 @@
 //! callback in some callers can legitimately fire more than once for the same close).
 
 use tokio::io::AsyncReadExt;
-use tokio::net::UnixStream;
 
 use rightsize::error::{Result, RightsizeError};
 
 use crate::client::ParsedHeaders;
+use crate::stream::DockerStream;
 
 /// Which of the container's own streams a frame's payload came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,13 +55,13 @@ pub(crate) struct Frame {
     pub(crate) payload: Vec<u8>,
 }
 
-/// Wraps a still-open `UnixStream` positioned right after the response headers (as
+/// Wraps a still-open [`DockerStream`] positioned right after the response headers (as
 /// returned by [`crate::client::DockerClient::request_stream`]) and reads raw bytes
 /// off it regardless of whether the body is `Transfer-Encoding: chunked` or a fixed
 /// `Content-Length` — the frame demuxer below only ever wants "give me N more raw body
 /// bytes," not two different framings to worry about.
 pub(crate) struct BodyReader<'a> {
-    stream: &'a mut UnixStream,
+    stream: &'a mut DockerStream,
     chunked: bool,
     /// Bytes remaining in the current unit: the whole body for `Content-Length` (or
     /// the read-until-close fallback, seeded to `usize::MAX`), or the current chunk
@@ -74,7 +74,7 @@ pub(crate) struct BodyReader<'a> {
 }
 
 impl<'a> BodyReader<'a> {
-    pub(crate) fn new(stream: &'a mut UnixStream, headers: &ParsedHeaders) -> Self {
+    pub(crate) fn new(stream: &'a mut DockerStream, headers: &ParsedHeaders) -> Self {
         BodyReader {
             stream,
             chunked: headers.chunked,
@@ -373,7 +373,9 @@ mod tests {
 
     // --- frame demux (StreamType routing via demux_into over a fixed body) --
 
-    /// Builds a raw frame: 8-byte header + payload.
+    /// Builds a raw frame: 8-byte header + payload. Unix-only: every caller is one of
+    /// the unix-socket `FrameFixture`-based tests below.
+    #[cfg(unix)]
     fn frame_bytes(stream_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = vec![stream_type, 0, 0, 0];
         out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -385,20 +387,26 @@ mod tests {
     /// `client.rs`'s own fixture helper for why not `std::env::temp_dir()` — `SUN_LEN`),
     /// spawns a server task that writes `bytes` out in `chunk_size`-sized pieces with a
     /// tiny delay between each (simulating bytes arriving in separate reads), and
-    /// hands back a connected client `UnixStream`. `read_frame`/`demux_into` are
-    /// generic over `BodyReader`, which is itself hard-wired to `UnixStream` — this
+    /// hands back a connected client [`DockerStream`]. `read_frame`/`demux_into` take
+    /// a [`BodyReader`], which is itself hard-wired to [`DockerStream`] — this
     /// exercises them through a real socket rather than faking the reader type, so
-    /// these tests take the exact code path production traffic does.
+    /// these tests take the exact code path production traffic does. Unix-only: there
+    /// is no equivalent named-pipe *server* fixture, since faking the Windows pipe
+    /// transport's actual I/O is exactly what this crate's Windows work deliberately
+    /// does NOT unit-test (see `crate::client`'s own test module for the same
+    /// convention, and its Windows platform-selection tests for what IS tested there).
+    #[cfg(unix)]
     struct FrameFixture {
-        stream: UnixStream,
+        stream: DockerStream,
         server: tokio::task::JoinHandle<()>,
         dir: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl FrameFixture {
         async fn serving(bytes: Vec<u8>, chunk_size: usize) -> Self {
             use tokio::io::AsyncWriteExt as _;
-            use tokio::net::UnixListener;
+            use tokio::net::{UnixListener, UnixStream};
 
             static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -424,7 +432,7 @@ mod tests {
 
             let stream = UnixStream::connect(&sock_path).await.expect("connect");
             FrameFixture {
-                stream,
+                stream: DockerStream::Unix(stream),
                 server,
                 dir,
             }
@@ -449,6 +457,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stdout_and_stderr_frames_are_routed_by_stream_type() {
         let mut bytes = Vec::new();
@@ -472,6 +481,7 @@ mod tests {
         fixture.finish().await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn empty_payload_frames_are_handled() {
         let mut bytes = Vec::new();
@@ -495,6 +505,7 @@ mod tests {
         fixture.finish().await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_partial_frame_split_across_reads_still_reassembles() {
         // Bytes dribbled out 3 at a time (well inside a single 8-byte header, let
@@ -511,6 +522,7 @@ mod tests {
         fixture.finish().await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn demux_into_separates_stdout_and_stderr_for_exec_style_accumulation() {
         let mut bytes = Vec::new();

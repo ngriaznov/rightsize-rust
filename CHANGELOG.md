@@ -7,7 +7,31 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **The docker backend now works on Windows, over Docker Desktop's named pipe.**
+  `rightsize-docker` dials `\\.\pipe\docker_engine` by default on Windows (honoring
+  `DOCKER_HOST=npipe:////./pipe/name`, the same convention real Docker clients use
+  there), the same way it dials `/var/run/docker.sock` on unix — unix behavior and
+  defaults are unchanged. `DockerBackendProvider::is_supported` runs the same
+  `GET /_ping` probe on both platforms, just over whichever transport the platform
+  actually has, so a Windows host without Docker Desktop running still gets a clean
+  `is_supported() == false` and a typed error, not a compile or connect crash.
+
+### Fixed
+
+- **The whole workspace now compiles on Windows, and CI enforces it.**
+  `rightsize-docker`'s HTTP/1.1 client, log-frame demuxer, and Drop-path blocking
+  cleanup transport were hard-wired to `tokio::net::UnixStream`/
+  `std::os::unix::net::UnixStream`, which don't exist as types on a non-unix target —
+  any Windows consumer that so much as depended on the `rightsize` crates, regardless
+  of which backend it actually used, failed to build. No CI lane compiled the full
+  workspace on Windows before now (the docker lanes are Linux-only, and the
+  `msb-windows` lane built only what its own tests touched), so this shipped
+  unnoticed. Both transports now live behind one crate-internal seam
+  (`rightsize_docker::stream`, not part of the public API), and the `msb-windows` CI
+  job runs `cargo check --workspace --all-targets` before its test steps so a Windows
+  compile break in any crate fails the build immediately, not silently.
 
 ## [0.7.6] - 2026-08-29
 
