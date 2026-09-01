@@ -21,6 +21,14 @@
 //! `#[cfg(windows)]` on each), so there is nothing to match on the "wrong" platform —
 //! the enum is really "the one stream type this platform has," named the same way on
 //! both.
+//!
+//! **Blocking-path timeouts:** unix arms a per-handle deadline directly on the socket
+//! (`SO_RCVTIMEO`/`SO_SNDTIMEO`, in [`connect_blocking`]); a Windows named-pipe handle
+//! opened without `FILE_FLAG_OVERLAPPED` has no equivalent knob, so the Windows callers
+//! of `connect_blocking` (`DockerBackendProvider::is_supported`, the `Drop`-path
+//! cleanup helpers) instead bound the *calling* thread's wait with
+//! [`run_with_deadline`], which runs the whole connect-plus-request round trip on a
+//! detached thread and times out the wait on it rather than the I/O itself.
 
 use std::io;
 use std::path::Path;
@@ -180,10 +188,9 @@ impl io::Write for BlockingDockerStream {
 /// before this module existed. Windows has no equivalent per-handle timeout knob for a
 /// synchronously-opened named pipe (that needs overlapped I/O, which a `Drop`-path
 /// thread with no async runtime has no use for), so `timeout` is accepted but unused
-/// there; every caller of this function already treats the whole operation as
-/// best-effort (errors swallowed, no caller left waiting on a specific deadline), so an
-/// unbounded blocking read on a genuinely wedged Windows daemon is a corner case, not a
-/// regression from a guarantee this path ever made on unix's own best-effort callers.
+/// here; every caller of this function instead gets its deadline enforced one layer up,
+/// by wrapping the whole connect-plus-request round trip in [`run_with_deadline`] — see
+/// that function's doc for why a per-handle knob isn't what actually matters here.
 #[cfg(unix)]
 pub(crate) fn connect_blocking(
     target: &Path,
@@ -214,4 +221,70 @@ pub(crate) fn connect_blocking(
         .write(true)
         .open(target)?;
     Ok(BlockingDockerStream::Pipe(file))
+}
+
+/// Bounds how long the *calling* thread waits for `f` (a blocking connect-plus-request
+/// round trip over [`BlockingDockerStream`]) on Windows, where [`connect_blocking`]'s
+/// plain synchronous pipe handle has no per-read/write deadline of its own (that needs
+/// `FILE_FLAG_OVERLAPPED` plus `GetOverlappedResult`, raw WinAPI FFI this crate doesn't
+/// otherwise carry — see [`connect_blocking`]'s Windows doc). Runs `f` on a fresh,
+/// detached OS thread and waits on a channel for at most `timeout`: if `f` finishes in
+/// time its result is returned as-is; if it doesn't, this returns a `TimedOut` error
+/// immediately and abandons the spawned thread to finish (or stay wedged against the
+/// daemon) on its own. Every caller of this function already treats the whole
+/// operation as best-effort — errors swallowed, no state the rest of the program
+/// depends on the abandoned thread ever releasing — so a leaked thread here costs
+/// nothing a caller relies on; what it buys is the actual property unix gets for free
+/// from `SO_RCVTIMEO`/`SO_SNDTIMEO`: `DockerBackendProvider::is_supported()` and the
+/// `Drop`-path cleanup calls can no longer hang the calling thread forever against a
+/// named pipe that accepts connections but sits behind a wedged daemon.
+#[cfg(windows)]
+pub(crate) fn run_with_deadline<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver may already be gone (we timed out and returned) — a failed
+        // send just means nobody's listening any more, which is fine to ignore.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Docker named-pipe request did not complete before the deadline",
+        ))
+    })
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_with_deadline_returns_the_inner_result_when_it_finishes_in_time() {
+        let result = run_with_deadline(Duration::from_secs(5), || Ok::<_, io::Error>(42));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn run_with_deadline_propagates_an_inner_error_when_it_finishes_in_time() {
+        let result = run_with_deadline(Duration::from_secs(5), || {
+            Err::<(), _>(io::Error::new(io::ErrorKind::NotFound, "nope"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn run_with_deadline_times_out_a_closure_that_never_finishes_in_the_budget() {
+        let start = std::time::Instant::now();
+        let result = run_with_deadline(Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_secs(60));
+            Ok::<_, io::Error>(())
+        });
+        // The calling thread must come back well before the closure's own sleep does —
+        // that's the entire property this function exists to provide.
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
 }

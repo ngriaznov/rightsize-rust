@@ -16,8 +16,8 @@ container, and there's no daemon to install first.
   binary downloads itself (SHA-256-verified) into `~/.cache/rightsize/` on first use.
   One Cargo dependency, zero install steps, no root.
 - A hand-rolled Docker fallback for platforms microVMs can't reach — Intel Macs,
-  Windows, Linux without `/dev/kvm` — talking to the daemon over a plain
-  `tokio::net::UnixStream`, never `bollard`/`hyper`.
+  Windows, Linux without `/dev/kvm` — talking to the daemon over a plain unix domain
+  socket (unix) or Docker Desktop's named pipe (Windows), never `bollard`/`hyper`.
 - Twenty-three preconfigured containers (`rightsize-modules`) for common test
   dependencies — see the [Modules index](./modules/index.md) for the full list.
 
@@ -48,7 +48,7 @@ cleanup thread reclaims it even if the test panics. See
 | Runtime install | Docker Desktop / daemon required | **none — self-provisions on first use** |
 | Licensing | Docker Desktop licensing in orgs | Apache-2.0 all the way down |
 | Async model | blocking client calls | **`async fn` throughout — no thread-per-container blocking** |
-| Docker client (fallback path) | `bollard`/`shiplift` over `hyper` | **hand-rolled, unix-socket-only — can't be misrouted onto TCP** |
+| Docker client (fallback path) | `bollard`/`shiplift` over `hyper` | **hand-rolled, no shared HTTP stack — can't be misrouted onto TCP** |
 
 Testcontainers-style libraries run each dependency as a Docker container: same
 kernel, same namespace machinery, one daemon coordinating everything. That's

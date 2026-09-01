@@ -1031,7 +1031,29 @@ fn blocking_find_container_id_by_name(socket_path: &std::path::Path, name: &str)
 /// daemon), and otherwise falls back to reading until the peer closes (this client
 /// always sends `Connection: close`, matching [`blocking_request`]'s own
 /// assumption).
+///
+/// On Windows this runs [`blocking_get_body_once`] under
+/// [`crate::stream::run_with_deadline`] instead of calling it directly, for the same
+/// reason [`blocking_request`] does — see that function's doc.
 fn blocking_get_body(socket_path: &std::path::Path, path: &str) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        blocking_get_body_once(socket_path, path)
+    }
+    #[cfg(windows)]
+    {
+        let socket_path = socket_path.to_path_buf();
+        let path = path.to_string();
+        crate::stream::run_with_deadline(Duration::from_secs(stop_timeout_budget()), move || {
+            blocking_get_body_once(&socket_path, &path)
+        })
+    }
+}
+
+/// The actual connect-plus-request-plus-parse round trip behind [`blocking_get_body`],
+/// factored out so both the direct (unix) and deadline-bounded (Windows) call sites
+/// run identical logic.
+fn blocking_get_body_once(socket_path: &std::path::Path, path: &str) -> std::io::Result<Vec<u8>> {
     use std::io::{BufRead, BufReader, Read, Write};
 
     let mut stream =
@@ -1133,7 +1155,39 @@ fn blocking_read_chunked_body(
 /// only calls made here (`stop`, `force=true remove`) return small `Content-Length`
 /// (or empty) bodies in practice — so this reads until the peer closes and returns
 /// whatever arrived, without trying to interpret framing at all.
+///
+/// On Windows this runs [`blocking_request_once`] under
+/// [`crate::stream::run_with_deadline`] instead of calling it directly: a Windows
+/// named-pipe handle from [`crate::stream::connect_blocking`] has no per-read/write
+/// deadline of its own (see that function's Windows doc), so without this wrapper a
+/// pipe that accepts the connection but sits behind a wedged daemon would hang the
+/// `Drop`-path cleanup thread indefinitely on this call. Unix already gets an
+/// equivalent bound for free from the socket's own `SO_RCVTIMEO`/`SO_SNDTIMEO`, so it
+/// calls `blocking_request_once` straight, unchanged from before this module existed.
 fn blocking_request(
+    socket_path: &std::path::Path,
+    method: &str,
+    path: &str,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        blocking_request_once(socket_path, method, path)
+    }
+    #[cfg(windows)]
+    {
+        let socket_path = socket_path.to_path_buf();
+        let method = method.to_string();
+        let path = path.to_string();
+        crate::stream::run_with_deadline(Duration::from_secs(stop_timeout_budget()), move || {
+            blocking_request_once(&socket_path, &method, &path)
+        })
+    }
+}
+
+/// The actual connect-plus-request round trip behind [`blocking_request`], factored
+/// out so both the direct (unix) and deadline-bounded (Windows) call sites run
+/// identical logic.
+fn blocking_request_once(
     socket_path: &std::path::Path,
     method: &str,
     path: &str,

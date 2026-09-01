@@ -88,8 +88,9 @@ jobs:
   # no other job builds anything on `windows-msvc` at all, so this is what would have
   # caught `rightsize-docker` failing to compile there before it grew a named-pipe
   # transport (see docs/backends.md's "Hand-rolled transport, and why"). The actual
-  # test invocations below stay scoped to `-p rightsize-msb` plus the contract suite,
-  # not `--workspace`, for reasons unrelated to compilation:
+  # test invocations below stay scoped to `-p rightsize-msb`, `-p rightsize-docker`'s
+  # own unit suite, and the shared contract suite, not `--workspace`, for reasons
+  # unrelated to compilation:
   # - `rightsize` (core)'s own unit suite has two pre-existing, Windows-path-portability
   #   gaps unrelated to msb: `mountable_file::for_host_path_leaves_an_absolute_path_
   #   untouched` asserts a hardcoded POSIX path (`/etc/hosts`) round-trips unmodified
@@ -101,8 +102,11 @@ jobs:
   #   scope for the msb Windows work, so this lane doesn't compile/run core's unit
   #   suite at all rather than fighting either gap here.
   # This lane verifies `rightsize-msb` (whose own `backend_it.rs`/
-  # `network_links_it.rs` already exercise `rightsize` at the integration level)
-  # and the shared backend contract suite on real WHP.
+  # `network_links_it.rs` already exercise `rightsize` at the integration level),
+  # `rightsize-docker`'s own unit suite (its named-pipe/`DOCKER_HOST` endpoint
+  # selection and blocking-transport deadline-bounding, none of which needs a live
+  # daemon this runner doesn't have), and the shared backend contract suite on real
+  # WHP.
   msb-windows:
     runs-on: windows-2025
     steps:
@@ -115,6 +119,14 @@ jobs:
       # them run. `--all-targets` includes test/bench targets, so a `#[cfg(windows)]`
       # test that only exists on this platform is checked too, not just library code.
       - run: cargo check --workspace --all-targets
+      # `rightsize-docker`'s own unit suite, no `sandbox-it` (that needs a live daemon
+      # this runner doesn't have — see the `rightsize-modules` step's own note below).
+      # This is what actually *runs* the `#[cfg(windows)]` unit tests the check step
+      # above only compiles: `DockerClient::from_docker_host`'s named-pipe/`npipe://`
+      # endpoint-selection cases, and `crate::stream::run_with_deadline`'s
+      # bounded-wait behavior (the thing standing in for a real per-handle timeout on
+      # a Windows named-pipe handle, which has no such knob of its own).
+      - run: cargo test -p rightsize-docker --lib
       # Same incremental image-cache warming as msb-linux, Windows-suffixed keys and
       # msb's Windows-native cache path (see install.ps1's own default install root;
       # this crate's Windows cache root is %LOCALAPPDATA%\rightsize, but msb's own

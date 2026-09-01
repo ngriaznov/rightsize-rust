@@ -18,10 +18,10 @@ containers). Read on for how to build, test, and submit changes.
     `windows-2022`/`windows-2025` hosted runners. rightsize-rust
     self-provisions the `msb` binary on first use — no manual install
     required.
-  - **Docker**: any Docker-compatible daemon reachable at the default socket
-    (a unix socket — the client is unix-socket-only, so on Windows this
-    means WSL2/Docker Desktop's Linux-daemon-backed socket, not a native
-    Windows named pipe), or via `DOCKER_HOST`.
+  - **Docker**: any Docker-compatible daemon reachable at the platform default —
+    the unix socket `/var/run/docker.sock` on unix, or Docker Desktop's native named
+    pipe `\\.\pipe\docker_engine` on Windows — or via `DOCKER_HOST`
+    (`unix:///path/to.sock` on unix, `npipe:////./pipe/name` on Windows).
 
 ## Building
 

@@ -9,8 +9,8 @@
 //! least amount of synchronous work that's still correct: send a small, `'static`
 //! teardown descriptor to a dedicated background OS thread and return immediately. That
 //! thread — started once per process — drains the descriptors and tears each one down
-//! with **blocking std I/O only**: `std::process::Command` for msb, a blocking
-//! `std::os::unix::net::UnixStream` for docker. Never Tokio, never `block_on`, because
+//! with **blocking std I/O only**: `std::process::Command` for msb, a blocking unix
+//! domain socket (unix) or named pipe (Windows) for docker. Never Tokio, never `block_on`, because
 //! this thread has no async runtime and must not assume one exists anywhere in the
 //! process either.
 //!

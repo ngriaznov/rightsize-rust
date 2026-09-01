@@ -6,9 +6,9 @@
 `BackendProvider` registry, and the error enum — and depends on no backend.
 `rightsize-msb` drives the pinned `msb` CLI as attached child processes, provisions
 the toolchain from GitHub releases, and emulates networking with TCP-over-`exec
---stream` tunnels. `rightsize-docker` is a from-scratch Docker HTTP client over
-`tokio::net::UnixStream` and the correctness oracle the microVM backend is checked
-against. `rightsize-modules` ships the preconfigured containers covered in
+--stream` tunnels. `rightsize-docker` is a from-scratch Docker HTTP client over a
+unix domain socket (unix) or Docker Desktop's named pipe (Windows), and the
+correctness oracle the microVM backend is checked against. `rightsize-modules` ships the preconfigured containers covered in
 [Modules](./modules/index.md). Host ports are pre-allocated core-side — **backends
 bind, never allocate** — because `msb` only supports static `host:guest` maps; this
 one invariant is what lets advertised-listener modules like
@@ -116,10 +116,11 @@ persistent daemon, hardware-isolated microVMs." See
   [Getting Started](./getting-started.md#the-shared-container-recipe).
 - **Idiomatic Rust naming**, not a mechanical port of a Testcontainers-style API —
   `snake_case`, builder-style `with_*` methods, `Container::new("image")`.
-- **Hand-rolled Docker client** over `tokio::net::UnixStream` — no `bollard`, no
-  `hyper` — so this crate's dependency tree can't be the reason a Docker client gets
-  misrouted onto TCP by an unrelated dependency bump elsewhere in a consumer's tree.
-  See [Backends](./backends.md#unix-socket-only-and-why).
+- **Hand-rolled Docker client** over a unix domain socket (unix) or Docker Desktop's
+  named pipe (Windows) — no `bollard`, no `hyper` — so this crate's dependency tree
+  can't be the reason a Docker client gets misrouted onto TCP by an unrelated
+  dependency bump elsewhere in a consumer's tree.
+  See [Backends](./backends.md#hand-rolled-transport-and-why).
 
 ## Where to look in the source
 

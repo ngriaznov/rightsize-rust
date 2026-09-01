@@ -100,7 +100,8 @@ correct:
 
 That cleanup thread drains a channel of these descriptors and tears each one down
 using **blocking std I/O only** — `std::process::Command` for msb `stop`/`rm`, a
-blocking `std::os::unix::net::UnixStream` for docker's DELETE calls. Never Tokio,
+blocking unix domain socket (unix) or named pipe (Windows) for docker's DELETE
+calls. Never Tokio,
 never `block_on`, because this thread has no async runtime and must not assume one
 exists anywhere else in the process either. A panic tearing down one job is caught
 (`std::panic::catch_unwind`) so it can't take the whole cleanup thread down for the

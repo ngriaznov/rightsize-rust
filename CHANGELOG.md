@@ -16,7 +16,12 @@ reaches its first tagged release.
   defaults are unchanged. `DockerBackendProvider::is_supported` runs the same
   `GET /_ping` probe on both platforms, just over whichever transport the platform
   actually has, so a Windows host without Docker Desktop running still gets a clean
-  `is_supported() == false` and a typed error, not a compile or connect crash.
+  `is_supported() == false` and a typed error, not a compile or connect crash. A
+  Windows named-pipe handle has no per-read/write timeout knob the way a unix socket
+  does, so `is_supported()` and the `Drop`-path cleanup calls bound the calling
+  thread's wait a different way there (`rightsize_docker::stream::run_with_deadline`
+  runs the round trip on a detached thread and times out the wait on it) — a wedged
+  Docker Desktop daemon can no longer hang either path indefinitely on Windows.
 
 ### Fixed
 
@@ -744,8 +749,8 @@ Initial public release.
   brace-scanning parser in `rightsize-msb` are both replaced by `serde`/
   `serde_json` — derived structs for the Docker Engine API request/response
   shapes and `msb ls --format json`'s output. Public behavior is unchanged; the
-  Docker backend's unix-socket-only HTTP transport (see
-  [Backends](docs/backends.md#unix-socket-only-and-why)) is untouched — only
+  Docker backend's hand-rolled HTTP transport (see
+  [Backends](docs/backends.md#hand-rolled-transport-and-why)) is untouched — only
   its JSON layer moved off hand-rolled parsing.
 
 ### Fixed

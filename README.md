@@ -37,13 +37,13 @@ the container even if the test panics ([how it works](#how-it-works)).
 | Runtime install | Docker Desktop / daemon required | **none — self-provisions on first use** |
 | Licensing | Docker Desktop licensing in orgs | Apache-2.0 all the way down |
 | Async model | blocking client calls | **`async fn` throughout — no thread-per-container blocking** |
-| Docker client | `bollard`/`shiplift` over `hyper` | **hand-rolled, unix-socket-only — can't be misrouted onto TCP** |
+| Docker client | `bollard`/`shiplift` over `hyper` | **hand-rolled, no shared HTTP stack — can't be misrouted onto TCP** |
 
-The Docker client's transport is hand-rolled by design: a small layer over
-`tokio::net::UnixStream`, so a dependency bump elsewhere in your tree can never be
-the reason a Docker call gets misrouted onto TCP - no `bollard`, no `hyper`, ever. The
-JSON layer on top of it is ordinary `serde`/`serde_json`, which carries none of that
-transport-routing risk.
+The Docker client's transport is hand-rolled by design: a small layer over a unix
+domain socket (unix) or Docker Desktop's named pipe (Windows), so a dependency bump
+elsewhere in your tree can never be the reason a Docker call gets misrouted onto TCP -
+no `bollard`, no `hyper`, ever. The JSON layer on top of it is ordinary
+`serde`/`serde_json`, which carries none of that transport-routing risk.
 
 ## Quickstart
 
