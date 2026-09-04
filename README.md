@@ -50,8 +50,8 @@ no `bollard`, no `hyper`, ever. The JSON layer on top of it is ordinary
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = "0.7.7"
-rightsize-modules = "0.7.7"
+rightsize = "0.7.8"
+rightsize-modules = "0.7.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
