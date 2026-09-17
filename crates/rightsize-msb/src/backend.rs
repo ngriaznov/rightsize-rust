@@ -1,15 +1,28 @@
-//! `MsbCliBackend`: drives `msb` as an ATTACHED child process per container (detached
-//! mode never starts the image `ENTRYPOINT` on 0.6.2, only attached mode does),
-//! classifies port-bind failures from the child's combined output, and works around
-//! `msb logs -f` never exiting on its own once a sandbox stops with a watchdog that
-//! does one authoritative, at-most-once tail replay.
+//! `MsbCliBackend`: drives `msb run` as an ATTACHED child process per container
+//! (detached mode never starts the image `ENTRYPOINT` on 0.6.2, only attached mode
+//! does), classifies port-bind failures from the child's combined output, and works
+//! around `msb logs -f` never exiting on its own once a sandbox stops with a watchdog
+//! that does one authoritative, at-most-once tail replay.
+//!
+//! **Checkpoint restore is supervised differently, on purpose.** `msb restore
+//! <path> --name <name>` (msb 0.7.1+, both the checkpoint feature's own re-boot and
+//! an ordinary `Container::from_checkpoint(...)` restore — see `commands::restore`'s
+//! doc) creates a DETACHED sandbox: the `restore` process itself activates it and
+//! exits — typically within seconds, exit 0 on success — while the sandbox keeps
+//! booting in the background and reaches `Running` on its own (verified live). So
+//! `try_restore_and_await_running` waits for that process to exit (classifying a
+//! nonzero exit's output through the same [`PreRunningFailure`] cascade `run` uses),
+//! then polls `msb ls` for `Running` the same way the attached path does — and
+//! never has a live child to hand back: a restored sandbox's [`HandleState::attached`]
+//! is `None`, not a [`Child`] this backend has to reap, kill, or death-detect on.
 //!
 //! **Handle-side mutable state:** `Handle` itself is immutable — `spec` plus
 //! the backend-assigned `id`. Everything that changes over a container's lifetime (the
-//! attached child, its log tail, the exec-tunnels installed for network links) lives in
-//! `MsbCliBackend`'s own `handles: Mutex<HashMap<String, HandleState>>`, keyed by
-//! `handle.id()`. No method here downcasts `&dyn SandboxHandle` — every one that needs
-//! mutable state looks it up by id under that mutex instead.
+//! attached child, when there is one, its log tail, the exec-tunnels installed for
+//! network links) lives in `MsbCliBackend`'s own `handles: Mutex<HashMap<String,
+//! HandleState>>`, keyed by `handle.id()`. No method here downcasts `&dyn
+//! SandboxHandle` — every one that needs mutable state looks it up by id under that
+//! mutex instead.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
@@ -80,7 +93,12 @@ impl SandboxHandle for Handle {
 /// handle itself.
 #[derive(Default)]
 struct HandleState {
-    /// The attached `msb run` child, once `start()` has spawned it.
+    /// The attached `msb run` child, once `start()` has spawned it — `None` for a
+    /// sandbox that was booted (or checkpoint-rebooted) via `msb restore` instead:
+    /// that command is detached (see the module docs), so there is no child process
+    /// for this backend to hold, reap on stop, or death-detect on. Every reader of
+    /// this field already treats an absent child as "nothing to do here" rather than
+    /// an error — see `stop()` and `reap_attached_child`'s own callers.
     attached: Option<Child>,
     /// Exec-tunnels installed by `install_network_links`, torn down on `stop`.
     resources: Vec<ExecTunnel>,
@@ -619,7 +637,10 @@ impl SandboxBackend for MsbCliBackend {
 
         let mut handles = self.handles.lock().expect("handles mutex poisoned");
         if let Some(state) = handles.get_mut(&id) {
-            state.attached = Some(attached);
+            // `attached` is already `Option<Child>` — `Some` for an ordinary `msb
+            // run` boot, `None` for a `msb restore` (checkpoint) boot, which has no
+            // live child to hold (see the module docs).
+            state.attached = attached;
         }
         drop(handles);
         // A `keep_alive` (reuse) sandbox is never added to `started_names` — that set
@@ -911,9 +932,13 @@ impl SandboxBackend for MsbCliBackend {
     /// multi-step msb invocation in this backend. The re-boot reuses
     /// [`spawn_and_await_running`], this backend's own normal boot path (already
     /// the shape `Container::from_checkpoint`'s restores use) — see the module
-    /// docs for why an msb `start` resume is not used here. The handle's held
-    /// attached child is swapped to the new one on success; the ledger and this
-    /// handle's identity (name, spec) are untouched either way.
+    /// docs for why an msb `start` resume is not used here, and for why that
+    /// re-boot (an `msb restore`, same as any other checkpoint restore) never
+    /// yields a live child: the handle's held attached child is swapped to
+    /// whatever the re-boot returns on success — `None` in practice, since this
+    /// path always restores — clearing out the pre-checkpoint `msb run` child it
+    /// held before, if any; the ledger and this handle's identity (name, spec) are
+    /// untouched either way.
     ///
     /// **The returned ref is NOT `<dest_dir>/<name>`.** msb 0.7.1's dest-dir disk
     /// snapshot store nests the artifact one level deeper than the name it was
@@ -1024,7 +1049,8 @@ impl SandboxBackend for MsbCliBackend {
 
         let mut handles = self.handles.lock().expect("handles mutex poisoned");
         if let Some(state) = handles.get_mut(&id) {
-            state.attached = Some(new_child);
+            // Already `Option<Child>` — see `start()`'s own assignment for why.
+            state.attached = new_child;
         }
         Ok(snapshot_ref)
     }
@@ -1241,6 +1267,7 @@ fn shell_single_quote(s: &str) -> String {
 /// `Running`: either a classified error ready to surface, or a cache-corruption
 /// signature (see [`is_image_cache_corruption`]) that [`spawn_and_await_running`]
 /// gets one chance to heal and retry before giving up.
+#[derive(Debug)]
 enum PreRunningFailure {
     CacheCorruption { output: String },
     StateDbError { output: String },
@@ -1268,7 +1295,7 @@ enum PreRunningFailure {
 /// registered cleanup state left over to double-register on the retry. A second
 /// failure (whether cache corruption again or anything else) surfaces an actionable
 /// error naming what was attempted instead of retrying further.
-fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
+fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Option<Child>> {
     match try_spawn_and_await_running(msb, spec) {
         Ok(child) => Ok(child),
         Err(PreRunningFailure::Other(e)) => Err(e),
@@ -1374,19 +1401,34 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
     }
 }
 
-/// One `msb run`/`msb restore` attempt: spawns the child, polls until `Running`,
-/// and returns either the live child or a classified [`PreRunningFailure`]. Never
-/// retries by itself — [`spawn_and_await_running`] is the only caller and owns the
-/// one-shot heal+retry policy.
-///
-/// `spec.checkpoint_ref` decides which command this builds: `Some` means a
-/// checkpoint restore (`commands::restore`, on msb 0.7.1+ — never `--disk-only`,
-/// which that command rejects against the disk-scope snapshots this backend
-/// creates; see `commands::restore`'s own doc), `None` means an ordinary boot
-/// (`commands::run`). Both this backend's normal `start()`
-/// path (a [`rightsize::Container::from_checkpoint`]-built spec, spec.checkpoint_ref
-/// already set) and [`MsbCliBackend::create_checkpoint`]'s own re-boot reach this
-/// same branch.
+/// One `msb run`/`msb restore` attempt: dispatches on `spec.checkpoint_ref` — `Some`
+/// means a checkpoint restore (`commands::restore`, on msb 0.7.1+ — never
+/// `--disk-only`, which that command rejects against the disk-scope snapshots this
+/// backend creates; see `commands::restore`'s own doc), `None` means an ordinary
+/// boot (`commands::run`) — and returns either a classified [`PreRunningFailure`] or
+/// the successful attempt's live child, when it has one: `Some` for an attached
+/// `run`, `None` for a detached `restore` (see [`try_restore_and_await_running`]'s
+/// own doc for why). Both this backend's normal `start()` path (a
+/// [`rightsize::Container::from_checkpoint`]-built spec, spec.checkpoint_ref already
+/// set) and [`MsbCliBackend::create_checkpoint`]'s own re-boot reach the restore
+/// branch. Never retries by itself — [`spawn_and_await_running`] is the only caller
+/// and owns the one-shot heal+retry policy, for either branch alike.
+fn try_spawn_and_await_running(
+    msb: &Path,
+    spec: &ContainerSpec,
+) -> std::result::Result<Option<Child>, PreRunningFailure> {
+    match &spec.checkpoint_ref {
+        Some(snapshot_path) => try_restore_and_await_running(msb, spec, snapshot_path),
+        None => try_run_and_await_running(msb, spec).map(Some),
+    }
+}
+
+/// The `spec.checkpoint_ref.is_none()` branch of [`try_spawn_and_await_running`]:
+/// spawns an attached `msb run` child, polls until `Running`, and returns either the
+/// live child or a classified [`PreRunningFailure`]. Byte-for-byte the same
+/// supervision this backend has always given an ordinary boot — see
+/// [`try_restore_and_await_running`] for the detached-restore counterpart, which
+/// this never falls back to or is called by.
 ///
 /// The tail drained here carries msb's own boot output only — registry/pull errors,
 /// a crash before the sandbox exists — never the workload's. `logs()` never reads
@@ -1402,14 +1444,11 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
 /// agent writes) before this falls back to today's generic "before reaching Running"
 /// error. A non-zero exit never takes this path — see that function's doc for why
 /// both signals, not just the exit code, are required.
-fn try_spawn_and_await_running(
+fn try_run_and_await_running(
     msb: &Path,
     spec: &ContainerSpec,
 ) -> std::result::Result<Child, PreRunningFailure> {
-    let argv = match &spec.checkpoint_ref {
-        Some(snapshot_path) => commands::restore(spec, snapshot_path),
-        None => commands::run(spec),
-    };
+    let argv = commands::run(spec);
     let mut child = spawn_msb_command(|| {
         let mut cmd = Command::new(msb);
         cmd.args(&argv)
@@ -1514,6 +1553,219 @@ fn try_spawn_and_await_running(
             ))));
         }
         std::thread::sleep(READINESS_POLL);
+    }
+}
+
+/// The `spec.checkpoint_ref.is_some()` branch of [`try_spawn_and_await_running`]:
+/// runs `msb restore <snapshot_path> --name <spec.name> ...` (`snapshot_path` is
+/// `spec.checkpoint_ref`'s own value, unwrapped by the caller — see
+/// `commands::restore`'s own doc for the argv this builds) and supervises it as the
+/// DETACHED boot it actually is, unlike [`try_run_and_await_running`]'s attached one.
+///
+/// **Why this shape.** `msb restore` (msb 0.7.1+) creates a detached sandbox —
+/// restore.rs's own doc says "Restore a snapshot into a new detached sandbox" — so
+/// the `restore` invocation itself activates the sandbox and EXITS, typically within
+/// seconds and with little or no stdout, once activation succeeds; exit 0 means
+/// success, a nonzero exit means the restore failed with the reason on stderr/
+/// stdout. The sandbox then keeps booting in the background on its own and reaches
+/// `Running` some time after `restore` has already exited (live-verified: `msb ls`
+/// shows it `Running`, and exec works, after the `restore` process is long gone).
+/// Supervising that the way [`try_run_and_await_running`] supervises an attached
+/// `msb run` child — treating the child's exit before this backend has observed
+/// `Running` as a failed boot — misreads every successful restore as one: exactly
+/// the CI failure this function exists to fix.
+///
+/// **Two phases, one budget.** [`FIRST_RUN_TIMEOUT`] bounds the whole attempt, the
+/// same overall budget [`try_run_and_await_running`]'s single loop gives an attached
+/// boot — this just spends it in two sequential steps instead of one interleaved
+/// loop, since a detached restore genuinely has two different things to wait for in
+/// order:
+/// 1. **Wait for `restore` itself to exit**, polling [`READINESS_POLL`] apart like
+///    the attached path does. A nonzero exit is a failed restore — its combined
+///    stdout/stderr is classified through the exact same [`PreRunningFailure`]
+///    cascade [`try_run_and_await_running`] applies to `run`'s output (install-lock,
+///    state-db, image-cache-corruption, port-bind, name-conflict, then a generic
+///    fallback), since msb reports those conditions identically for `restore`. Exit
+///    0 proceeds to the next phase; there is no fast-exit post-mortem here (unlike
+///    `run`'s) — a clean, prompt exit is not a fast-exit special case for `restore`,
+///    it is the ordinary, expected outcome of a successful one.
+/// 2. **Poll `msb ls --format json`** (same [`READINESS_POLL`] interval) until this
+///    sandbox reports `Running`. Reaching `Stopped`, or dropping out of `ls`
+///    entirely, at any point during this poll is a definite boot failure — nothing
+///    is still in flight to wait out the rest of the budget for — surfaced with the
+///    sandbox's own system log (`msb logs <name> --source system`, the same command
+///    [`fast_exit_ran_to_completion`] already reads) attached as a best-effort
+///    diagnostic. Any other status (`Starting`, or the name not listed yet on an
+///    early poll) just keeps polling.
+///
+/// **No live child, ever, on success.** A detached `restore` has no attached process
+/// for this backend to hold once it has exited — this always returns `Ok(None)`,
+/// never a [`Child`], so [`HandleState::attached`] ends up `None` for a restored
+/// sandbox: nothing left to reap on `stop()`, nothing to kill on teardown, no
+/// exit-based death detection to run — see the module docs. `stop`/`rm`/`exec`/
+/// `logs` are unaffected either way; they always drive the sandbox by name through
+/// the `msb` CLI, never through this (or any) attached child.
+fn try_restore_and_await_running(
+    msb: &Path,
+    spec: &ContainerSpec,
+    snapshot_path: &str,
+) -> std::result::Result<Option<Child>, PreRunningFailure> {
+    let argv = commands::restore(spec, snapshot_path);
+    let mut child = spawn_msb_command(|| {
+        let mut cmd = Command::new(msb);
+        cmd.args(&argv)
+            .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    })
+    .map_err(|e| {
+        PreRunningFailure::Other(RightsizeError::Backend(format!(
+            "failed to spawn msb {}: {e}",
+            argv.join(" ")
+        )))
+    })?;
+
+    let stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stderr_pipe = child.stderr.take().expect("piped stderr");
+    let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let t_out = spawn_tail_drain(stdout_pipe, tail.clone());
+    let t_err = spawn_tail_drain(stderr_pipe, tail.clone());
+
+    // Phase 1: wait (bounded) for the detached `restore` invocation itself to exit —
+    // see this function's own doc for why that, not `Running`, is the event this
+    // phase waits on.
+    let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| PreRunningFailure::Other(RightsizeError::from(e)))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = t_out.join();
+            let _ = t_err.join();
+            let output = collect_tail(&tail);
+            return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+                "msb restore for sandbox {} did not exit within {}s — a successful detached \
+                 restore activates and exits within seconds, so msb itself may be overloaded \
+                 or unresponsive; last output:\n{output}",
+                spec.name,
+                FIRST_RUN_TIMEOUT.as_secs()
+            ))));
+        }
+        std::thread::sleep(READINESS_POLL);
+    };
+    let _ = t_out.join();
+    let _ = t_err.join();
+    let output = collect_tail(&tail);
+
+    if !status.success() {
+        if is_image_cache_corruption(&output) {
+            return Err(PreRunningFailure::CacheCorruption { output });
+        }
+        if is_msb_state_db_error(&output) {
+            return Err(PreRunningFailure::StateDbError { output });
+        }
+        if is_msb_install_lock_active(&output) {
+            return Err(PreRunningFailure::InstallLockActive { output });
+        }
+        if is_port_bind_conflict(&output) {
+            return Err(PreRunningFailure::Other(RightsizeError::PortBindConflict {
+                message: format!(
+                    "msb restore for sandbox {} could not bind a host port: {output}",
+                    spec.name
+                ),
+                source: None,
+            }));
+        }
+        if is_name_conflict(&output) {
+            return Err(PreRunningFailure::Other(RightsizeError::NameConflict {
+                message: format!(
+                    "msb restore for sandbox {} could not start — a sandbox with this name \
+                     already exists: {output}",
+                    spec.name
+                ),
+                source: None,
+            }));
+        }
+        return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+            "msb restore for sandbox {} exited (code {}) — the restore itself failed, so the \
+             sandbox never activated; check the snapshot and `msb restore` output below:\n{output}",
+            spec.name,
+            status.code().unwrap_or(-1)
+        ))));
+    }
+
+    // Phase 2: `restore` exited 0 — activation succeeded and this detached sandbox
+    // is now booting on its own in the background. Poll `msb ls` the same interval
+    // the attached path uses, under the same overall deadline, until it reports
+    // Running.
+    loop {
+        if let Ok(ls_result) = invoke_standalone(msb, &commands::ls(), LOGS_TIMEOUT) {
+            let sandbox_status = ls_json::status_of(&ls_result.stdout, &spec.name);
+            match sandbox_status.as_deref() {
+                Some("Running") => return Ok(None),
+                Some("Stopped") | None => {
+                    let reason = if sandbox_status.is_none() {
+                        "dropped out of `msb ls` entirely"
+                    } else {
+                        "reached Stopped"
+                    };
+                    return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+                        "sandbox {} never reached Running after a successful `msb restore` — \
+                         it {reason} while this backend polled `msb ls`. {}",
+                        spec.name,
+                        restore_boot_failure_diagnostics(msb, &spec.name),
+                    ))));
+                }
+                Some(_still_booting) => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+                "sandbox {} did not reach Running within {}s after a successful `msb restore` \
+                 — this can mean a slow disk restore or msb itself being unresponsive. {}",
+                spec.name,
+                FIRST_RUN_TIMEOUT.as_secs(),
+                restore_boot_failure_diagnostics(msb, &spec.name),
+            ))));
+        }
+        std::thread::sleep(READINESS_POLL);
+    }
+}
+
+/// Joins `tail`'s currently buffered lines the same way every boot-output error
+/// message in this module does — factored out once [`try_restore_and_await_running`]
+/// needed the exact same snapshot-and-join [`try_run_and_await_running`] already
+/// does inline at each of its own call sites.
+fn collect_tail(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
+    tail.lock()
+        .expect("tail mutex poisoned")
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Best-effort system-log diagnostics for a restore's background boot failing —
+/// `msb logs <name> --source system --tail 1000`, the same command
+/// [`fast_exit_ran_to_completion`] already reads to confirm a completed attached
+/// boot. Never itself turns into an error: an unreadable or empty log is reported as
+/// such in the returned string rather than surfacing a nested failure.
+fn restore_boot_failure_diagnostics(msb: &Path, name: &str) -> String {
+    match invoke_standalone(msb, &commands::logs_system(name), LOGS_TIMEOUT) {
+        Ok(result) if !result.stdout.trim().is_empty() || !result.stderr.trim().is_empty() => {
+            format!(
+                "`msb logs {name} --source system` output:\n{}{}",
+                result.stdout, result.stderr
+            )
+        }
+        Ok(_) => format!("`msb logs {name} --source system` returned no output"),
+        Err(e) => format!("`msb logs {name} --source system` could not be read: {e}"),
     }
 }
 
@@ -1642,12 +1894,13 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
 /// against `name` (a running sandbox), taking a snapshot msb is given the name
 /// `basename` for and `--dest-dir dest_dir`, via `invoke` (the plain one-shot
 /// `stop`/`snapshot create`/`rm` commands) and `reboot` (the actual re-boot of a
-/// fresh attached sandbox from the just-created snapshot's REAL ref, under the
+/// fresh sandbox from the just-created snapshot's REAL ref, under the
 /// same name — see below for where that ref comes from). Both are injected
 /// rather than hardcoded — `invoke` as a pure argv-in/`ExecResult`-out closure,
 /// `reboot` generic over its success type `T` (production instantiates it with
-/// [`spawn_and_await_running`], returning the live [`Child`] this backend needs
-/// to hold; tests instantiate it with a bare `Result<()>`) — so this
+/// [`spawn_and_await_running`], returning `Option<Child>` — a restore re-boot
+/// never holds a live child, see the module docs — for this backend to hold;
+/// tests instantiate it with a bare `Result<()>`) — so this
 /// orchestration logic (the ordering, and which steps short-circuit which) is
 /// unit-testable without a real `msb` binary or child process. `dest_dir`
 /// already exists by the time this runs — [`MsbCliBackend::create_checkpoint`]
@@ -2642,15 +2895,16 @@ mod tests {
 
     // ---- run vs restore: `try_spawn_and_await_running`'s own branch ----
     //
-    // The argv-logging stub exits 0 unconditionally for every subcommand,
-    // including the `ls`/`logs` fast-exit post-mortem calls this makes after a
-    // clean exit — none of those fabricate JSON `ls`/`logs` output, so the
-    // fast-exit check never confirms the sandbox and this always ends in the
-    // generic "before reaching Running" error either way. That failure is
-    // expected and irrelevant here. What these tests assert on is which
-    // subcommand `try_spawn_and_await_running` chose to spawn in the first
-    // place — found by its distinctive leading word rather than by log
-    // position, since the readiness-poll loop can race an `ls` check (a
+    // The argv-logging stub exits 0 unconditionally for every subcommand, but
+    // never fabricates JSON `ls`/`logs` output, so both branches still end in
+    // failure against it — `run` (`try_run_and_await_running`) falls through its
+    // fast-exit post-mortem to the generic "before reaching Running" error, and
+    // `restore` (`try_restore_and_await_running`) reads the empty/unparsable `ls`
+    // output as the sandbox having dropped out of `ls` entirely and fails its
+    // Phase 2 poll on the first iteration. Either failure is expected and
+    // irrelevant here. What these tests assert on is which subcommand was
+    // actually spawned first — found by its distinctive leading word rather than
+    // by log position, since the readiness-poll loop can race an `ls` check (a
     // SEPARATE `msb` invocation, logged independently) against the primary
     // child's own exit before either write lands.
 
@@ -3854,6 +4108,295 @@ mod tests {
             "a non-zero exit must never be classified as a completed workload, \
              whatever ls/logs report: {err}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- restore supervision: `try_restore_and_await_running`'s detached-boot
+    // shape (msb 0.7.1's `msb restore` creates a DETACHED sandbox — see that
+    // function's own doc) ----
+    //
+    // Writes a stub `msb` replacement dedicated to these tests. Dispatches on
+    // `$1`:
+    // - `restore` -> prints `restore_stderr` to stderr and exits immediately with
+    //   `restore_exit_code` — the detached restore invocation itself, which on
+    //   msb 0.7.1 activates the sandbox and exits, typically within seconds, well
+    //   before the sandbox it started necessarily reaches `Running`.
+    // - `ls`      -> answers `msb ls --format json` from `ls_statuses`, ADVANCING
+    //   one entry per call (a minimal state machine: call 0 answers
+    //   `ls_statuses[0]`, call 1 answers `ls_statuses[1]`, and so on, holding at
+    //   the last entry once exhausted) — proving the boot poll actually polls
+    //   more than once rather than trusting a single snapshot. `"ABSENT"` answers
+    //   `[]` (the sandbox not listed at all, e.g. after `msb rm`), anything else
+    //   answers a one-entry array reporting that literal status for `name`.
+    // - `logs`    -> a fixed one-line system-log tail, for the boot-failure
+    //   diagnostic's best-effort fetch.
+    // - `stop`/`rm` -> exit 0, so a full `start()`-then-`stop()` round trip
+    //   through the real backend never hangs on cleanup.
+    #[cfg(unix)]
+    fn write_fake_msb_for_restore(
+        dir: &Path,
+        name: &str,
+        restore_exit_code: u8,
+        restore_stderr: &str,
+        ls_statuses: &[&str],
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-restore.sh");
+
+        let render_status = |status: &str| -> String {
+            if status == "ABSENT" {
+                "echo '[]'".to_string()
+            } else {
+                format!("echo '[{{\"name\":\"{name}\",\"status\":\"{status}\"}}]'")
+            }
+        };
+        let mut case_arms = String::new();
+        for (i, status) in ls_statuses.iter().enumerate() {
+            case_arms.push_str(&format!("{i}) {} ;;\n", render_status(status)));
+        }
+        let last_arm = render_status(ls_statuses.last().copied().unwrap_or("ABSENT"));
+
+        let body = format!(
+            "#!/bin/sh\n\
+             dir=\"$(dirname \"$0\")\"\n\
+             case \"$1\" in\n\
+             restore)\n\
+             echo '{restore_stderr}' 1>&2\n\
+             exit {restore_exit_code}\n\
+             ;;\n\
+             ls)\n\
+             n=$(cat \"$dir/ls-calls\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$dir/ls-calls\"\n\
+             case \"$n\" in\n\
+             {case_arms}\
+             *) {last_arm} ;;\n\
+             esac\n\
+             exit 0\n\
+             ;;\n\
+             logs)\n\
+             echo 'fake system log tail'\n\
+             exit 0\n\
+             ;;\n\
+             stop|rm)\n\
+             exit 0\n\
+             ;;\n\
+             esac\n\
+             exit 0\n"
+        );
+        std::fs::write(&script, body).expect("write fake msb restore script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake msb restore script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_succeeds_when_the_sandbox_reaches_running_only_after_a_few_polls() {
+        // (a) Red-proof: a successful detached restore — `restore` exits 0 fast,
+        // `ls` only reports `Running` on its THIRD call — must still succeed, and
+        // must actually have polled more than once to get there (never claim
+        // success off the first, possibly-stale, `ls` snapshot).
+        let dir = unique_test_dir("restore-eventually-running");
+        let name = "rz-restore-eventually-running";
+        let script =
+            write_fake_msb_for_restore(&dir, name, 0, "", &["Starting", "Starting", "Running"]);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let result =
+            try_restore_and_await_running(&script, &spec, spec.checkpoint_ref.as_ref().unwrap());
+        let child = result.unwrap_or_else(|e| {
+            panic!("a detached restore reaching Running must succeed, got {e:?}")
+        });
+        assert!(
+            child.is_none(),
+            "a restore boot must never hold a live child — msb restore is detached \
+             and has already exited by the time this returns"
+        );
+
+        let ls_calls: u32 = std::fs::read_to_string(dir.join("ls-calls"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            ls_calls >= 3,
+            "must have actually polled `ls` past the first two non-Running answers, not \
+             short-circuited: {ls_calls} calls"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_start_via_the_real_backend_leaves_no_attached_child_and_stop_does_not_hang() {
+        // (a) continued, end to end through `MsbCliBackend`: `start()` on a
+        // checkpoint-ref spec must succeed via the restore path, and the handle it
+        // produces must behave like the module docs promise — no attached child to
+        // reap, so `stop()` (which would otherwise wait on one) returns promptly.
+        let dir = unique_test_dir("restore-start-stop-no-hang");
+        let name = "rz-restore-start-stop";
+        let script = write_fake_msb_for_restore(&dir, name, 0, "", &["Running"]);
+        let backend = MsbCliBackend::new(script);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = backend.create(spec).await.expect("create must succeed");
+            backend
+                .start(handle.as_ref())
+                .await
+                .expect("start() over a detached restore must succeed once ls reports Running");
+
+            let started = std::time::Instant::now();
+            backend
+                .stop(handle.as_ref())
+                .await
+                .expect("stop() on a childless (restored) handle must still succeed");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "stop() must not block waiting to reap a child that was never there \
+                 (ATTACHED_STOP_TIMEOUT would show up here as a multi-second stall)"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_exiting_nonzero_with_a_state_db_signature_is_classified_not_treated_as_a_generic_failure()
+     {
+        // (b) Red-proof: a failed restore's OUTPUT is still routed through the same
+        // classification the attached run path uses — proving this isn't a bare
+        // "restore failed" catch-all that swallows the state-db/install-lock/
+        // cache-corruption signatures `spawn_and_await_running`'s retry logic
+        // depends on.
+        let dir = unique_test_dir("restore-state-db-classified");
+        let name = "rz-restore-state-db";
+        let script = write_fake_msb_for_restore(
+            &dir,
+            name,
+            1,
+            "error: database error: Execution Error: index idx already exists",
+            &["Running"],
+        );
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let err =
+            try_restore_and_await_running(&script, &spec, spec.checkpoint_ref.as_ref().unwrap())
+                .expect_err("a nonzero restore exit must never be classified as success");
+        assert!(
+            matches!(err, PreRunningFailure::StateDbError { .. }),
+            "a restore exit whose output carries msb's state-database error signature must \
+             classify as `StateDbError`, the same as it would for `run`, not fall through to \
+             a generic failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_exiting_nonzero_with_no_known_signature_surfaces_a_plain_classified_failure() {
+        // (b) continued, through the public `spawn_and_await_running` entry point:
+        // an ordinary (unrecognized) restore failure must surface as an actionable
+        // `Err` naming the sandbox and quoting msb's own output, not hang or panic.
+        let dir = unique_test_dir("restore-plain-failure");
+        let name = "rz-restore-plain-failure";
+        let script = write_fake_msb_for_restore(
+            &dir,
+            name,
+            1,
+            "error: snapshot corrupt: bad magic bytes",
+            &["Running"],
+        );
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let err = spawn_and_await_running(&script, &spec)
+            .expect_err("a restore that fails to activate at all must surface as an Err");
+        let msg = err.to_string();
+        assert!(msg.contains(name), "{msg}");
+        assert!(msg.contains("bad magic bytes"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_whose_sandbox_reaches_stopped_fails_fast_instead_of_hanging_out_the_budget() {
+        // (c) Red-proof: `restore` exits 0 (a successful activation), but the
+        // sandbox it started reaches `Stopped` on the very first poll instead of
+        // `Running` — a genuine background-boot failure. This must be classified
+        // as a boot failure IMMEDIATELY, not by waiting out
+        // `FIRST_RUN_TIMEOUT` (600s, far too long for this test to actually wait
+        // on) — asserting a tight wall-clock bound is what proves this is a fast
+        // failure, not a disguised hang.
+        let dir = unique_test_dir("restore-stopped-fast-fail");
+        let name = "rz-restore-stopped";
+        let script = write_fake_msb_for_restore(&dir, name, 0, "", &["Stopped"]);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let started = std::time::Instant::now();
+        let err =
+            try_restore_and_await_running(&script, &spec, spec.checkpoint_ref.as_ref().unwrap())
+                .expect_err("a sandbox that reaches Stopped instead of Running has failed to boot");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a Stopped sandbox must fail the poll immediately, not run out the boot budget: \
+             took {:?}",
+            started.elapsed()
+        );
+        let msg = match err {
+            PreRunningFailure::Other(e) => e.to_string(),
+            other => panic!("expected a plain boot-failure error, got {other:?}"),
+        };
+        assert!(msg.contains(name), "{msg}");
+        assert!(msg.contains("Stopped"), "{msg}");
+        assert!(
+            msg.contains("fake system log tail"),
+            "the Stopped-boot-failure message must carry the `msb logs --source system` \
+             diagnostic: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_whose_sandbox_disappears_from_ls_fails_fast_instead_of_hanging_out_the_budget() {
+        // (c) continued: the sandbox dropping out of `msb ls` entirely (rather
+        // than showing up `Stopped`) must be treated the same way — a definite
+        // failure, fast, not a hang.
+        let dir = unique_test_dir("restore-absent-fast-fail");
+        let name = "rz-restore-absent";
+        let script = write_fake_msb_for_restore(&dir, name, 0, "", &["ABSENT"]);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let started = std::time::Instant::now();
+        let err =
+            try_restore_and_await_running(&script, &spec, spec.checkpoint_ref.as_ref().unwrap())
+                .expect_err("a sandbox absent from `ls` entirely has failed to boot");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an absent sandbox must fail the poll immediately, not run out the boot budget: \
+             took {:?}",
+            started.elapsed()
+        );
+        let msg = match err {
+            PreRunningFailure::Other(e) => e.to_string(),
+            other => panic!("expected a plain boot-failure error, got {other:?}"),
+        };
+        assert!(msg.contains(name), "{msg}");
+        assert!(msg.contains("dropped out of"), "{msg}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

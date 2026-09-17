@@ -67,6 +67,26 @@ pub(crate) fn status_is(json: &str, name: &str, wanted: &str) -> bool {
     })
 }
 
+/// Returns `json`'s entry named `name`'s own `status` string, or `None` when that
+/// name is not listed at all (a genuinely absent/malformed entry, not merely "not
+/// `Running`" — see [`running_names`] for that narrower question). The msb
+/// restore-supervision boot poll uses this to tell "still booting toward
+/// `Running`" (some other in-progress status, or not listed yet on the very first
+/// poll) apart from "definitely not coming up" (`Stopped`, or dropped out of `ls`
+/// entirely after having been seen) — a distinction `status_is`'s plain yes/no
+/// can't make on its own.
+///
+/// Same tolerant-failure posture as [`running_names`]/[`status_is`]: an entry
+/// missing `name` or `status`, or a `json` that fails to parse as an array at all,
+/// is treated as "not listed" (`None`) rather than propagated as an error.
+pub(crate) fn status_of(json: &str, name: &str) -> Option<String> {
+    let entries: Vec<LsEntry> = serde_json::from_str(json).unwrap_or_default();
+    entries.into_iter().find_map(|e| match (e.name, e.status) {
+        (Some(n), Some(s)) if n == name => Some(s),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +198,34 @@ mod tests {
     #[test]
     fn status_is_false_on_malformed_json_rather_than_panicking() {
         assert!(!status_is("not json at all", "rz-a", "Stopped"));
+    }
+
+    #[test]
+    fn status_of_returns_the_named_entrys_own_status_string() {
+        let json = r#"[
+              {"name":"rz-a","status":"Stopped"},
+              {"name":"rz-b","status":"Running"},
+              {"name":"rz-c","status":"Starting"}
+            ]"#;
+        assert_eq!(status_of(json, "rz-a"), Some("Stopped".to_string()));
+        assert_eq!(status_of(json, "rz-b"), Some("Running".to_string()));
+        assert_eq!(status_of(json, "rz-c"), Some("Starting".to_string()));
+    }
+
+    #[test]
+    fn status_of_is_none_when_the_name_is_not_listed_at_all() {
+        let json = r#"[{"name":"rz-a","status":"Stopped"}]"#;
+        assert_eq!(status_of(json, "rz-does-not-exist"), None);
+    }
+
+    #[test]
+    fn status_of_is_none_when_the_matching_entry_is_missing_its_status() {
+        let json = r#"[{"name":"rz-a"}]"#;
+        assert_eq!(status_of(json, "rz-a"), None);
+    }
+
+    #[test]
+    fn status_of_is_none_on_malformed_json_rather_than_panicking() {
+        assert_eq!(status_of("not json at all", "rz-a"), None);
     }
 }
