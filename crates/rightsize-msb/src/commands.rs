@@ -128,7 +128,7 @@ pub fn copy_out(sandbox_name: &str, container_path: &str, host_path: &Path) -> V
     ]
 }
 
-/// Builds the argv for `msb snapshot create --from <sandbox> <snapshot>` — requires
+/// Builds the argv for `msb snapshot create --from-sandbox <sandbox> <snapshot>` — requires
 /// the sandbox to be STOPPED first (the checkpoint feature's own responsibility;
 /// this function only builds the argv). The plain 2-arg form msb's own default
 /// snapshot store uses; see [`snapshot_create_in`] for the dest-dir variant.
@@ -136,7 +136,7 @@ pub fn snapshot_create(sandbox_name: &str, snapshot_name: &str) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "create".to_string(),
-        "--from".to_string(),
+        "--from-sandbox".to_string(),
         sandbox_name.to_string(),
         snapshot_name.to_string(),
     ]
@@ -588,7 +588,7 @@ mod tests {
             vec![
                 "snapshot",
                 "create",
-                "--from",
+                "--from-sandbox",
                 "rz-abc-1",
                 "rz-ckpt-deadbeefcafe"
             ]
@@ -602,7 +602,7 @@ mod tests {
             vec![
                 "snapshot",
                 "create",
-                "--from",
+                "--from-sandbox",
                 "rz-abc-1",
                 "rz-ckpt-deadbeefcafe",
                 "--dest-dir",
