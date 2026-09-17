@@ -87,6 +87,16 @@ pub struct Container {
     /// `start()` refuses before any backend work if this doesn't match the active
     /// backend's name (see `RightsizeError::CheckpointBackendMismatch`).
     checkpoint_backend: Option<String>,
+    /// Set by [`Container::from_checkpoint`] to `cp.spec.env` — the exact env this
+    /// builder's own `env` field was seeded with. `start()` diffs the two, right
+    /// before any backend work, to tell a harmless replay of the checkpoint's own
+    /// captured env (this field unchanged) apart from a genuine caller override
+    /// (`.with_env`/`.remove_env` called after `from_checkpoint`, leaving `env`
+    /// different from this) — the distinction `RightsizeError::UnsupportedByBackend`
+    /// needs on microsandbox, whose `restore` has no `-e`/`--env` flag at all (see
+    /// `rightsize_msb::commands::restore`'s doc). `None` for every ordinarily-built
+    /// `Container`.
+    checkpoint_captured_env: Option<Vec<(String, String)>>,
     /// Test/module seam: overrides the named-checkpoint registry's cache dir —
     /// see [`Self::with_checkpoint_cache_dir_override`].
     checkpoint_cache_dir_override: Option<std::path::PathBuf>,
@@ -120,6 +130,7 @@ impl Container {
             reaper_cache_dir_override: None,
             checkpoint_ref: None,
             checkpoint_backend: None,
+            checkpoint_captured_env: None,
             checkpoint_cache_dir_override: None,
         }
     }
@@ -150,9 +161,14 @@ impl Container {
     /// `restore` has no `-e`/`--env` flag, so it never sees it: a disk-only
     /// restore replays whatever configuration the snapshot already captured).
     /// `start()` refuses before any backend work — [`RightsizeError::CheckpointBackendMismatch`]
-    /// — if the active backend's name doesn't match `cp.backend`, and
+    /// — if the active backend's name doesn't match `cp.backend`,
     /// [`RightsizeError::ReuseCheckpointConflict`] if `.reuse(true)` is also active,
-    /// since reuse identity has no concept of a checkpoint reference.
+    /// since reuse identity has no concept of a checkpoint reference, and
+    /// [`RightsizeError::UnsupportedByBackend`] on microsandbox if a `.with_env(...)`/
+    /// `.remove_env(...)` call after this one leaves `env` different from
+    /// `cp.spec.env` — an actual override attempt msb's `restore` has no flag to
+    /// carry (a caller replaying the checkpoint's own captured env unchanged, the
+    /// common case, is never refused: `restore` already replays it from disk).
     pub fn from_checkpoint(cp: &Checkpoint) -> Container {
         let mut c = Container::new(&cp.checkpoint_ref);
         c.env = cp.spec.env.clone();
@@ -161,6 +177,7 @@ impl Container {
         c.memory_limit_mb = cp.spec.memory_limit_mb;
         c.checkpoint_ref = Some(cp.checkpoint_ref.clone());
         c.checkpoint_backend = Some(cp.backend.clone());
+        c.checkpoint_captured_env = Some(cp.spec.env.clone());
         c
     }
 
@@ -170,6 +187,14 @@ impl Container {
     /// iteration order (see `dedup_env_last_wins`, applied once at `start()` time,
     /// right before the spec reaches a backend — this builder itself still just
     /// appends, so a spec-customizer pushing more env entries is resolved the same way).
+    ///
+    /// On a [`Container::from_checkpoint`] restore under the microsandbox backend,
+    /// a call here that actually changes the checkpoint's own captured env (a new
+    /// key, a different value, or a [`Self::remove_env`] of a captured one) makes
+    /// `start()` return [`RightsizeError::UnsupportedByBackend`] instead of
+    /// silently dropping it — msb's `restore` command has no `-e`/`--env` flag, so
+    /// there is nowhere for the override to go. Replaying the checkpoint's own env
+    /// unchanged is not affected: `restore` already replays it from disk.
     pub fn with_env(mut self, k: &str, v: &str) -> Self {
         self.env.push((k.to_string(), v.to_string()));
         self
@@ -449,6 +474,34 @@ impl Container {
                     active_backend: backend.name().to_string(),
                     checkpoint_backend: creator.clone(),
                 });
+            }
+
+            // msb 0.7.1's `restore` has no `-e`/`--env` flag at all (see
+            // `rightsize_msb::commands::restore`'s own doc), so a disk-only restore
+            // can only ever replay whatever env the checkpoint's own disk state
+            // already captured — never a caller-supplied override. Replaying that
+            // captured env unchanged (what `from_checkpoint` seeds `self.env` with,
+            // and what most restores do) is harmless to drop silently: msb never
+            // sees it, but the workload already has it, baked into the snapshot.
+            // Only refuse when the FINAL env this builder holds — after whatever
+            // `.with_env`/`.remove_env` calls ran since `from_checkpoint` — no
+            // longer matches that captured baseline: that is a genuine attempt to
+            // change something (e.g. rotate a secret at restore time) that this
+            // backend has no way to honor, so it must fail loudly rather than
+            // silently boot with the stale value.
+            if backend.name() == "microsandbox" {
+                let captured = self.checkpoint_captured_env.clone().unwrap_or_default();
+                if dedup_env_last_wins(self.env.clone()) != dedup_env_last_wins(captured) {
+                    return Err(RightsizeError::unsupported_with_remedy(
+                        "env override on a checkpoint restore",
+                        backend.name(),
+                        "msb's restore command has no -e/--env flag, so a disk-only \
+                         restore cannot apply an environment different from the one \
+                         the checkpoint already captured — set the desired env before \
+                         taking the checkpoint instead of after restoring it, or \
+                         restore this checkpoint under RIGHTSIZE_BACKEND=docker",
+                    ));
+                }
             }
         }
 
@@ -3485,6 +3538,139 @@ mod tests {
             ])
         );
         overridden_guard.stop().await.unwrap();
+    }
+
+    // Replaying the checkpoint's OWN captured env unchanged on the microsandbox
+    // backend must start cleanly — msb's `restore` never sees it (no `-e` flag),
+    // but the workload already has it baked into the captured disk, so there is
+    // nothing lossy about the drop. Mirrors `restore_command_never_carries_env_
+    // mounts_or_root_disk_flags` in `rightsize-msb`'s own `commands` tests, one
+    // layer up.
+    #[tokio::test]
+    async fn from_checkpoint_replaying_captured_env_unchanged_on_microsandbox_starts_cleanly() {
+        let source_backend = FakeBackend::named("microsandbox");
+        let source = container_on(&source_backend)
+            .with_env("A", "1")
+            .with_exposed_ports(&[6379]);
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        let restore_backend = FakeBackend::named("microsandbox");
+        let restored = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .waiting_for(ReadyImmediately);
+        let restored_guard = restored
+            .start()
+            .await
+            .expect("replaying the checkpoint's own captured env must not be refused");
+        restored_guard.stop().await.unwrap();
+    }
+
+    // The regression this backstops: before `commands::restore` existed, msb's own
+    // `run --from-snapshot` unconditionally re-passed `spec.env` as `-e K=V`, so
+    // `Container::from_checkpoint(&cp).with_env("KEY", "new").start()` genuinely
+    // threaded an override into the restored sandbox on the microsandbox backend —
+    // the same builder mechanics `from_checkpoint_applies_the_spec_defaults_and_
+    // allows_overrides` proves for `.with_command(...)`. msb 0.7.1's `restore` has
+    // no `-e`/`--env` flag at all, so that override can no longer reach the
+    // sandbox — `start()` must now refuse it with a typed error instead of
+    // silently booting with the checkpoint's stale env, on a key the caller
+    // explicitly tried to change.
+    #[tokio::test]
+    async fn from_checkpoint_env_override_on_microsandbox_is_refused_not_silently_dropped() {
+        let source_backend = FakeBackend::named("microsandbox");
+        let source = container_on(&source_backend)
+            .with_env("A", "1")
+            .with_exposed_ports(&[6379]);
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        // A changed value for an already-captured key.
+        let changed_value_backend = FakeBackend::named("microsandbox");
+        let changed_value = Container::from_checkpoint(&cp)
+            .with_backend(changed_value_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .with_env("A", "2");
+        let err = expect_start_err(
+            changed_value.start().await,
+            "changing a captured env value on an msb restore must be refused",
+        );
+        assert!(
+            matches!(err, RightsizeError::UnsupportedByBackend { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("env"), "{msg}");
+        assert!(msg.contains("microsandbox"), "{msg}");
+        assert!(
+            changed_value_backend
+                .state
+                .lock()
+                .unwrap()
+                .created
+                .is_empty(),
+            "no backend call may happen once the override is detected"
+        );
+
+        // A brand-new key the checkpoint never captured.
+        let new_key_backend = FakeBackend::named("microsandbox");
+        let new_key = Container::from_checkpoint(&cp)
+            .with_backend(new_key_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .with_env("B", "2");
+        let err = expect_start_err(
+            new_key.start().await,
+            "adding a new env key on an msb restore must be refused",
+        );
+        assert!(
+            matches!(err, RightsizeError::UnsupportedByBackend { .. }),
+            "{err}"
+        );
+
+        // Removing a captured key.
+        let removed_key_backend = FakeBackend::named("microsandbox");
+        let removed_key = Container::from_checkpoint(&cp)
+            .with_backend(removed_key_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .remove_env("A");
+        let err = expect_start_err(
+            removed_key.start().await,
+            "removing a captured env key on an msb restore must be refused",
+        );
+        assert!(
+            matches!(err, RightsizeError::UnsupportedByBackend { .. }),
+            "{err}"
+        );
+    }
+
+    // The same override that must be refused on microsandbox (above) still works
+    // on a backend whose restore path threads env through normally — docker's
+    // ordinary create path ignores `checkpoint_ref` entirely, so nothing about
+    // this migration touches it.
+    #[tokio::test]
+    async fn from_checkpoint_env_override_on_a_non_microsandbox_backend_is_unaffected() {
+        let source_backend = FakeBackend::named("docker");
+        let source = container_on(&source_backend)
+            .with_env("A", "1")
+            .with_exposed_ports(&[6379]);
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        let restore_backend = FakeBackend::named("docker");
+        let overridden = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .with_env("A", "2");
+        let restored_guard = overridden
+            .start()
+            .await
+            .expect("an env override on a non-microsandbox restore must still work");
+        let created = restore_backend.state.lock().unwrap().created[0].clone();
+        assert_eq!(created.env, vec![("A".to_string(), "2".to_string())]);
+        restored_guard.stop().await.unwrap();
     }
 
     // =========================== named checkpoints ==============================

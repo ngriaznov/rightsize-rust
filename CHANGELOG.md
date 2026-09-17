@@ -26,7 +26,14 @@ reaches its first tagged release.
   captured on disk, so the captured spec's env is no longer re-passed (it was
   redundant with what the snapshot itself already carries). Checkpoint create/restore
   semantics are unchanged from the caller's view; only the emitted `msb` command
-  changed.
+  changed — with one exception: on the microsandbox backend, calling `.with_env(...)`/
+  `.remove_env(...)` on a `Container::from_checkpoint(...)` restore to actually change
+  the checkpoint's captured env (rather than merely replay it unchanged) now returns a
+  typed `RightsizeError::UnsupportedByBackend` from `start()` instead of silently
+  booting with the old, unchanged env — `restore` has no flag to carry that override,
+  so this used-to-work combination on `msb run --from-snapshot` must now fail loudly.
+  Docker's checkpoint restore is unaffected; it ignores `checkpoint_ref` and threads
+  env through its ordinary create path either way.
 - **The MinIO module's default image moved to `quay.io/minio/minio:latest`.** The
   Docker Hub repository `minio/minio` was taken down (a `docker pull minio/minio` now
   fails "repository does not exist"); `quay.io/minio/minio` is upstream's maintained

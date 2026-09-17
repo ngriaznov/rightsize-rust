@@ -133,7 +133,14 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 /// - **env** — `restore` has no `-e`/`--env` flag at all. A disk-only restore
 ///   replays whatever configuration was captured on disk, so re-passing the
 ///   captured spec's env (what `run --from-snapshot` used to do, via the same `-e`
-///   flags an ordinary boot gets) is now both impossible and redundant.
+///   flags an ordinary boot gets) is now both impossible and redundant — `spec.env`
+///   simply never reaches this function's argv. `Container::start()`, one layer
+///   up, is what keeps that "redundant" from silently becoming "lossy": it
+///   refuses a `Container::from_checkpoint(...)` restore whose final `env` no
+///   longer matches the checkpoint's own captured one (a genuine `.with_env`/
+///   `.remove_env` override, not just a replay) with a typed
+///   `RightsizeError::UnsupportedByBackend`, rather than booting here with the
+///   override silently dropped.
 /// - **mounts** — `--mount-file` has no restore equivalent; restore's `-v`/
 ///   `--volume` is a different, unrelated concept (selecting a captured private
 ///   disk, or binding an external source), not this backend's host-file bind
