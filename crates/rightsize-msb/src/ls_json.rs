@@ -87,6 +87,26 @@ pub(crate) fn status_of(json: &str, name: &str) -> Option<String> {
     })
 }
 
+/// Returns whether `json` lists an entry named `name` at all, regardless of its
+/// status — or `None` when `json` doesn't parse as the documented array shape,
+/// i.e. the listing itself is inconclusive rather than a confirmed absence.
+///
+/// [`running_names`]/[`status_is`]/[`status_of`] all deliberately fold a parse
+/// failure into their own "not Running"/"not confirmed"/"not listed" default,
+/// which is the right call for their callers — a malformed or empty `msb ls`
+/// result should read as "nothing confirmed yet," not crash a readiness poll.
+/// This function exists because the msb checkpoint cycle's post-`rm` name-release
+/// wait is NOT one of those callers: it treats "the name is gone from `msb ls`"
+/// as a green light to reboot into a fresh restore, so a listing it can't confirm
+/// the presence OR absence of must never be read as "released." Unlike
+/// `status_of`'s `None` — which conflates "not listed" with "couldn't tell" —
+/// this keeps those two outcomes distinct (`Some(false)` vs. `None`) so the
+/// caller can require the former specifically.
+pub(crate) fn try_is_listed(json: &str, name: &str) -> Option<bool> {
+    let entries: Vec<LsEntry> = serde_json::from_str(json).ok()?;
+    Some(entries.iter().any(|e| e.name.as_deref() == Some(name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +247,26 @@ mod tests {
     #[test]
     fn status_of_is_none_on_malformed_json_rather_than_panicking() {
         assert_eq!(status_of("not json at all", "rz-a"), None);
+    }
+
+    #[test]
+    fn try_is_listed_is_some_true_when_the_name_appears_regardless_of_status() {
+        let json = r#"[{"name":"rz-a","status":"Stopped"}]"#;
+        assert_eq!(try_is_listed(json, "rz-a"), Some(true));
+    }
+
+    #[test]
+    fn try_is_listed_is_some_false_on_a_well_formed_listing_that_omits_the_name() {
+        assert_eq!(try_is_listed("[]", "rz-a"), Some(false));
+        let json = r#"[{"name":"rz-other","status":"Running"}]"#;
+        assert_eq!(try_is_listed(json, "rz-a"), Some(false));
+    }
+
+    #[test]
+    fn try_is_listed_is_none_on_malformed_json_never_folded_into_some_false() {
+        // The whole point of this function over `status_of`: a probe that failed to
+        // parse must be distinguishable from a probe that parsed and found nothing.
+        assert_eq!(try_is_listed("not json at all", "rz-a"), None);
+        assert_eq!(try_is_listed("", "rz-a"), None);
     }
 }

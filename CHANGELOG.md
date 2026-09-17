@@ -172,6 +172,11 @@ reaches its first tagged release.
   delay, mirroring this backend's existing one-shot transient-retry policy
   (the same shape already applied to msb's state-database migration race).
   The signature is checked unconditionally in code but never occurs on unix.
+- **The checkpoint cycle now waits out msb's asynchronous sandbox-name
+  release on Windows before rebooting from the snapshot**, polling `msb ls`
+  (bounded, briefly) after `rm` so the reboot no longer races a lingering
+  name into msb's own "already exists" refusal, with one short retry of the
+  reboot itself as defense in depth if that refusal still slips through.
 
 ## [0.7.9] - 2026-09-10
 

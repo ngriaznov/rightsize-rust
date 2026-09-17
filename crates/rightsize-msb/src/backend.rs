@@ -103,6 +103,28 @@ const WORKLOAD_EXEC_EARLY_EXIT_GRACE: Duration = Duration::from_millis(300);
 /// release this works around clears in well under a second in practice, and the
 /// retried `restore` itself dwarfs this delay either way.
 const RESTORE_ACCESS_DENIED_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// [`msb_checkpoint_cycle`]'s post-`rm` guard: how long — polled at
+/// [`READINESS_POLL`] intervals — to wait for a just-removed sandbox's name to
+/// actually drop out of `msb ls --format json` before rebooting under the same
+/// name. msb's own `rm` returning success is not the same as the name being
+/// free yet: on Windows, msb 0.7.1's sandbox record/name release lags the `rm`
+/// process's own exit (the same deferred-teardown-lag family
+/// [`is_restore_access_denied`] already works around one step later, for the
+/// snapshot artifact's file handle), so rebooting immediately can race that
+/// release and hit msb's own "sandbox already exists" refusal on the very next
+/// `restore`. Unix releases the name synchronously, so the very first poll —
+/// taken before any sleep — already sees it gone there. A few seconds covers
+/// every Windows lag observed in CI without turning a genuinely stuck teardown
+/// into an indefinite hang.
+const CHECKPOINT_NAME_RELEASE_BUDGET: Duration = Duration::from_secs(3);
+/// Before retrying [`msb_checkpoint_cycle`]'s own re-boot when it hits msb's
+/// "already exists" refusal despite [`CHECKPOINT_NAME_RELEASE_BUDGET`]'s own
+/// wait having already passed — short, one-shot, mirroring
+/// [`RESTORE_ACCESS_DENIED_RETRY_DELAY`]'s own policy. Defense in depth for
+/// msb's teardown finishing in the gap between that wait passing and the
+/// retried `restore` actually running; the wait above is the primary fix, this
+/// only catches what it might still miss.
+const CHECKPOINT_REBOOT_NAME_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// An immutable `msb` sandbox reference: its `ContainerSpec` and the name `msb` knows
 /// it by (always `spec.name` for this backend). All mutable per-container state lives
@@ -2223,6 +2245,64 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
 /// function's own doc), returning the caller's chosen success type `T`.
 type RebootFn<'a, T> = dyn FnMut(&str, Option<&[String]>) -> Result<T> + 'a;
 
+/// [`msb_checkpoint_cycle`]'s post-`rm` guard: polls `invoke(&commands::ls())`
+/// every [`READINESS_POLL`] until `name` no longer appears in `msb ls
+/// --format json` at all (see [`ls_json::try_is_listed`]), bounded by
+/// [`CHECKPOINT_NAME_RELEASE_BUDGET`] — see that constant's own doc for why
+/// `rm` exiting successfully is not the same as the name actually being free.
+/// The very first check runs before any sleep, so unix (which releases the
+/// name synchronously) always passes on one call.
+///
+/// A FAILED probe never counts as a confirmed release: `invoke` returning
+/// `Err` (spawn failure, timeout), an `Ok` result with a nonzero exit code, and
+/// stdout that doesn't parse as `msb ls`'s documented shape are all treated
+/// identically — none of them confirm the name is gone, so none of them may
+/// end the wait. `invoke_standalone` only ever errors on a spawn failure or a
+/// hard timeout, never on a nonzero `msb ls` exit code (it returns that as an
+/// ordinary `Ok(ExecResult)`), so the exit code is checked here explicitly
+/// rather than trusted to `invoke`'s own `Result` — a transient daemon hiccup
+/// on `msb ls` itself is plausible precisely because teardown is still in
+/// flight. [`ls_json::try_is_listed`] (unlike [`ls_json::status_of`], whose
+/// `None` is deliberately ambiguous between "not listed" and "couldn't parse"
+/// for callers that treat both the same way) keeps that ambiguity visible as
+/// its own `None` instead of folding it into "absent" — only `Some(false)` (an
+/// exit-0, successfully-parsed listing that omits `name`) counts as a
+/// confirmed release here; anything else — a nonzero exit, unparseable stdout
+/// even on exit 0, or the name still present — is treated as "still
+/// inconclusive" and simply polled again, the same as an entry that is still
+/// listed.
+///
+/// A budget-exceeded outcome returns a plain `Err` naming `name` — never a
+/// silent success and never an unbounded loop — so [`msb_checkpoint_cycle`]
+/// never lets `reboot` even attempt a restore already known to collide.
+fn wait_for_checkpoint_name_release(
+    invoke: &mut dyn FnMut(&[String]) -> Result<ExecResult>,
+    name: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + CHECKPOINT_NAME_RELEASE_BUDGET;
+    loop {
+        let confirmed_absent = invoke(&commands::ls())
+            .ok()
+            .filter(|ls| ls.exit_code == 0)
+            .and_then(|ls| ls_json::try_is_listed(&ls.stdout, name))
+            .map(|listed| !listed)
+            .unwrap_or(false);
+        if confirmed_absent {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(RightsizeError::Backend(format!(
+                "sandbox {name} still shows up in `msb ls` (or `msb ls` itself never confirmed \
+                 it absent) {}s after `msb rm {name}` — msb's own teardown normally frees a \
+                 removed sandbox's name well within that, so this looks stuck rather than \
+                 merely slow; check `msb ls` and `msb rm {name}` by hand",
+                CHECKPOINT_NAME_RELEASE_BUDGET.as_secs(),
+            )));
+        }
+        std::thread::sleep(READINESS_POLL);
+    }
+}
+
 /// Orchestrates the checkpoint feature's [capture →] stop → snapshot → rm →
 /// re-boot cycle against `name` (a running sandbox), taking a snapshot msb is
 /// given the name `basename` for and `--dest-dir dest_dir`, via `invoke` (the
@@ -2291,11 +2371,22 @@ type RebootFn<'a, T> = dyn FnMut(&str, Option<&[String]>) -> Result<T> + 'a;
 ///   <name>` as the by-hand remedy — no best-effort restart-for-the-caller here,
 ///   since that restart would be exactly the broken `msb start` call this cycle
 ///   no longer makes.
-/// - A failure to reboot after a successful snapshot (whether `rm` silently failed
-///   to free the name, or the reboot itself failed) surfaces an error naming the
-///   full checkpoint ref (parsed from `snapshot create`'s stdout, per above) and
-///   `Container::from_checkpoint(...)` as the recovery path — the sandbox is
-///   gone, but its state lives on in the snapshot.
+/// - After `rm`, [`wait_for_checkpoint_name_release`] polls `msb ls` until
+///   `name` is actually gone (bounded by
+///   [`CHECKPOINT_NAME_RELEASE_BUDGET`]) before `reboot` is ever called — msb's
+///   own `rm` can return before the name is released on Windows, and rebooting
+///   into that race would otherwise surface as msb's own "already exists"
+///   refusal instead of a clear error naming the stuck sandbox. As defense in
+///   depth, a `reboot` that still hits that refusal (msb's own teardown
+///   finishing in the gap between the wait passing and `reboot` actually
+///   running) is retried once, short backoff, mirroring
+///   [`is_restore_access_denied`]'s own one-shot retry.
+/// - A failure to reboot after a successful snapshot (whether the name-release
+///   wait itself timed out, or the reboot failed even after its own retry)
+///   surfaces an error naming the full checkpoint ref (parsed from `snapshot
+///   create`'s stdout, per above) and `Container::from_checkpoint(...)` as the
+///   recovery path — the sandbox is gone, but its state lives on in the
+///   snapshot.
 fn msb_checkpoint_cycle<T>(
     invoke: &mut dyn FnMut(&[String]) -> Result<ExecResult>,
     reboot: &mut RebootFn<'_, T>,
@@ -2353,17 +2444,48 @@ fn msb_checkpoint_cycle<T>(
 
     // Disk state now lives in the snapshot — remove the stopped sandbox so the
     // reboot below can recreate it under the same name. Best-effort: even if this
-    // itself fails, the reboot's own `msb run --name <name>` surfaces the
-    // consequence (a lingering sandbox collides on the name) as the error below.
+    // itself fails, the wait and reboot below surface the consequence (a
+    // lingering sandbox collides on the name) as their own errors.
     let _ = invoke(&commands::rm(name));
 
-    let rebooted = reboot(&checkpoint_ref, captured_cmdline.as_deref()).map_err(|e| {
+    // msb's own `rm` above can return before `name` is actually released on
+    // Windows — wait that out before ever attempting the reboot, rather than
+    // let it surface as the reboot's own "already exists" refusal. See
+    // `wait_for_checkpoint_name_release`'s own doc.
+    wait_for_checkpoint_name_release(invoke, name).map_err(|e| {
         RightsizeError::Backend(format!(
-            "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
-             sandbox was removed but its state is preserved in checkpoint {checkpoint_ref}, \
+            "{e} — the sandbox's disk state is preserved in checkpoint {checkpoint_ref}, \
              restorable via Container::from_checkpoint(...)"
         ))
     })?;
+
+    let rebooted = match reboot(&checkpoint_ref, captured_cmdline.as_deref()) {
+        Ok(rebooted) => rebooted,
+        // Defense in depth: the wait above already covers the ordinary case,
+        // but msb's own teardown can still finish in the gap between that wait
+        // passing and this retried `restore` actually running. One short,
+        // one-shot retry — same shape as `RESTORE_ACCESS_DENIED_RETRY_DELAY`'s
+        // own policy — before giving up.
+        Err(RightsizeError::NameConflict { message, .. }) => {
+            std::thread::sleep(CHECKPOINT_REBOOT_NAME_CONFLICT_RETRY_DELAY);
+            reboot(&checkpoint_ref, captured_cmdline.as_deref()).map_err(|e2| {
+                RightsizeError::Backend(format!(
+                    "re-booting sandbox {name} from checkpoint {checkpoint_ref} hit msb's \
+                     \"already exists\" refusal twice in a row ({message}), even after waiting \
+                     for the name to clear `msb ls` and retrying once more ({e2}) — the sandbox \
+                     was removed but its state is preserved in checkpoint {checkpoint_ref}, \
+                     restorable via Container::from_checkpoint(...)"
+                ))
+            })?
+        }
+        Err(e) => {
+            return Err(RightsizeError::Backend(format!(
+                "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
+                 sandbox was removed but its state is preserved in checkpoint {checkpoint_ref}, \
+                 restorable via Container::from_checkpoint(...)"
+            )));
+        }
+    };
 
     Ok((checkpoint_ref, rebooted, captured_cmdline))
 }
@@ -2764,6 +2886,18 @@ mod tests {
         let result = {
             let mut invoke = |args: &[String]| {
                 log.borrow_mut().push(args.join(" "));
+                // The post-rm name-release wait needs a genuinely parseable `msb
+                // ls` reply to confirm the name absent — see
+                // `wait_for_checkpoint_name_release`'s own doc for why an
+                // unparseable stdout (which this fake's blanket snapshot-create
+                // reply below is not) can no longer be read as a release.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
                 Ok(ExecResult {
                     exit_code: 0,
                     stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
@@ -2796,6 +2930,11 @@ mod tests {
                 commands::snapshot_create_in("rz-abc-1", "rz-ckpt-deadbeefcafe", dest_dir)
                     .join(" "),
                 commands::rm("rz-abc-1").join(" "),
+                // The post-rm name-release poll: this fake's `ls` reply is a
+                // genuinely parseable, empty listing, confirmed absent on the
+                // very first poll — one poll, no retry, matching unix's real
+                // behavior.
+                commands::ls().join(" "),
                 format!("reboot {expected_ref}"),
             ]
         );
@@ -2816,6 +2955,15 @@ mod tests {
                     return Ok(ExecResult {
                         exit_code: 0,
                         stdout: "redis-server\0--port\x006379\0\n".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                // See the happy-path test's identical branch for why the
+                // post-rm name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
                         stderr: String::new(),
                     });
                 }
@@ -2883,6 +3031,15 @@ mod tests {
         let result = {
             let mut invoke = |args: &[String]| {
                 calls.borrow_mut().push(args.to_vec());
+                // See the happy-path test's identical branch for why the post-rm
+                // name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
                 Ok(ExecResult {
                     exit_code: 0,
                     stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
@@ -2923,6 +3080,15 @@ mod tests {
                 if args == commands::capture_workload_cmdline("rz-abc-1") {
                     return Err(RightsizeError::Backend("exec unavailable".to_string()));
                 }
+                // See the happy-path test's identical branch for why the post-rm
+                // name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
                 Ok(ExecResult {
                     exit_code: 0,
                     stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
@@ -2954,6 +3120,15 @@ mod tests {
                         exit_code: 1,
                         stdout: String::new(),
                         stderr: "no such process".to_string(),
+                    });
+                }
+                // See the happy-path test's identical branch for why the post-rm
+                // name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
                     });
                 }
                 Ok(ExecResult {
@@ -3115,6 +3290,15 @@ mod tests {
         let result = {
             let mut invoke = |args: &[String]| {
                 calls.push(args.to_vec());
+                // See the happy-path test's identical branch for why the post-rm
+                // name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
                 Ok(ExecResult {
                     exit_code: 0,
                     stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
@@ -3149,10 +3333,379 @@ mod tests {
         assert!(msg.contains("Container::from_checkpoint"), "{msg}");
         assert_eq!(
             calls.len(),
-            3,
-            "rm must still be attempted before a reboot failure surfaces: {calls:?}"
+            4,
+            "rm and the post-rm name-release poll must still run before a reboot failure \
+             surfaces: {calls:?}"
         );
         assert_eq!(calls[2], commands::rm("rz-abc-1"));
+        assert_eq!(calls[3], commands::ls());
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_waits_out_a_transient_post_rm_listing_before_rebooting() {
+        // Red-proof (a): msb's own `rm` can return before the name is actually
+        // released on Windows — `msb ls` keeps listing it for a couple of polls
+        // before it clears. The cycle must wait that out and still reboot, not
+        // fail or reboot into a doomed "already exists" restore.
+        let ls_calls = RefCell::new(0u32);
+        let mut reboot_called = false;
+        let dest_dir_buf = std::env::temp_dir().join("rz-msb-checkpoint-cycle-name-release-wait");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                if args == commands::ls() {
+                    let mut n = ls_calls.borrow_mut();
+                    *n += 1;
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: if *n <= 2 {
+                            "[{\"name\":\"rz-abc-1\",\"status\":\"Stopped\"}]".to_string()
+                        } else {
+                            "[]".to_string()
+                        },
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                reboot_called = true;
+                Ok(())
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        result.expect("a transient post-rm listing must not fail the checkpoint once it clears");
+        assert!(
+            reboot_called,
+            "the reboot must still run once the name frees"
+        );
+        assert_eq!(
+            *ls_calls.borrow(),
+            3,
+            "must poll `msb ls` exactly until the name first reads absent, no more"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_a_failed_or_garbled_post_rm_ls_read_is_not_treated_as_released() {
+        // Red-proof for the critical review finding: a poll that comes back as a
+        // nonzero exit (a truncated/garbled `msb ls` read — the exact failure
+        // mode observed on Windows in the same asynchronous-teardown window this
+        // wait exists for) must NOT be read as "the name is free" just because
+        // its unparseable stdout would make `ls_json::status_of` return `None`
+        // (the ambiguous value `ls_json::try_is_listed` exists specifically to
+        // avoid folding into "absent" here). The wait must keep polling past
+        // that bad read and only succeed once a genuinely clean (`exit_code ==
+        // 0`, parseable) read confirms the name is gone.
+        let ls_calls = RefCell::new(0u32);
+        let mut reboot_called = false;
+        let dest_dir_buf =
+            std::env::temp_dir().join("rz-msb-checkpoint-cycle-garbled-ls-not-released");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                if args == commands::ls() {
+                    let mut n = ls_calls.borrow_mut();
+                    *n += 1;
+                    return Ok(match *n {
+                        // First poll: msb ls itself fails (nonzero exit) with
+                        // garbled/truncated stdout, while the sandbox is still
+                        // fully present. This must read as inconclusive, not as
+                        // proof of release.
+                        1 => ExecResult {
+                            exit_code: 1,
+                            stdout: "{\"name\":\"rz-a".to_string(),
+                            stderr: "unexpected EOF".to_string(),
+                        },
+                        // Second poll: ls succeeds again, but honestly reports
+                        // the sandbox still listed.
+                        2 => ExecResult {
+                            exit_code: 0,
+                            stdout: "[{\"name\":\"rz-abc-1\",\"status\":\"Stopped\"}]".to_string(),
+                            stderr: String::new(),
+                        },
+                        // Third poll: a genuinely clean, successful read
+                        // confirming the name is actually gone.
+                        _ => ExecResult {
+                            exit_code: 0,
+                            stdout: "[]".to_string(),
+                            stderr: String::new(),
+                        },
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                reboot_called = true;
+                Ok(())
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        result
+            .expect("a failed/garbled ls read must not short-circuit the wait to a false release");
+        assert!(
+            reboot_called,
+            "the reboot must still run once a clean read confirms release"
+        );
+        assert_eq!(
+            *ls_calls.borrow(),
+            3,
+            "the failed read must cost one more poll, not be read as release on poll one"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_an_exit_0_but_unparseable_ls_read_is_not_treated_as_released() {
+        // A narrower variant of the failed-read red-proof above: a `msb ls` that
+        // exits 0 but prints something that still isn't the documented JSON
+        // array shape (e.g. a stray log line interleaved with the real output
+        // during the same daemon-hiccup window) must ALSO stay inconclusive — a
+        // check that only gates on `exit_code != 0` (rather than on the parse
+        // itself) would wrongly treat this as a confirmed release.
+        let ls_calls = RefCell::new(0u32);
+        let mut reboot_called = false;
+        let dest_dir_buf =
+            std::env::temp_dir().join("rz-msb-checkpoint-cycle-exit-0-unparseable-ls-not-released");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                if args == commands::ls() {
+                    let mut n = ls_calls.borrow_mut();
+                    *n += 1;
+                    return Ok(match *n {
+                        // First poll: exit 0, but stdout is not the documented
+                        // array shape at all — must not read as "absent".
+                        1 => ExecResult {
+                            exit_code: 0,
+                            stdout: "msb: warming up cache...\n".to_string(),
+                            stderr: String::new(),
+                        },
+                        // Second poll: a genuinely clean, successful read
+                        // confirming the name is actually gone.
+                        _ => ExecResult {
+                            exit_code: 0,
+                            stdout: "[]".to_string(),
+                            stderr: String::new(),
+                        },
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                reboot_called = true;
+                Ok(())
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        result.expect(
+            "an exit-0-but-unparseable ls read must not short-circuit the wait to a false release",
+        );
+        assert!(
+            reboot_called,
+            "the reboot must still run once a clean read confirms release"
+        );
+        assert_eq!(
+            *ls_calls.borrow(),
+            2,
+            "the unparseable read must cost one more poll, not be read as release on poll one"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_a_name_that_never_frees_fails_clearly_without_rebooting() {
+        // Red-proof (b): if `msb ls` keeps listing the name past the whole
+        // release-wait budget, the cycle must fail with a clear, typed message
+        // naming the stuck sandbox — never loop forever, and never let the
+        // reboot even attempt a restore that is doomed to hit "already exists".
+        let mut reboot_called = false;
+        let dest_dir_buf = std::env::temp_dir().join("rz-msb-checkpoint-cycle-name-never-frees");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[{\"name\":\"rz-abc-1\",\"status\":\"Stopped\"}]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                reboot_called = true;
+                Ok(())
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        let err =
+            result.expect_err("a name that never frees must fail, not hang or silently reboot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rz-abc-1"),
+            "the stuck sandbox must be named: {msg}"
+        );
+        assert!(
+            msg.contains("Container::from_checkpoint"),
+            "the snapshot's own recovery path must still be named, since it already succeeded: \
+             {msg}"
+        );
+        assert!(
+            !reboot_called,
+            "the reboot must never be attempted once the release wait itself has failed"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_retries_the_reboot_once_on_an_already_exists_refusal_then_succeeds() {
+        // Red-proof (c): defense in depth — even after the release wait passes,
+        // msb's own teardown can still finish in the gap before the retried
+        // `restore` actually runs. One short, one-shot retry on msb's own
+        // "already exists" refusal must still let the checkpoint succeed.
+        let reboot_calls = RefCell::new(0u32);
+        let dest_dir_buf =
+            std::env::temp_dir().join("rz-msb-checkpoint-cycle-reboot-already-exists");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                // See the happy-path test's identical branch for why the post-rm
+                // name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                let mut n = reboot_calls.borrow_mut();
+                *n += 1;
+                if *n == 1 {
+                    return Err(RightsizeError::NameConflict {
+                        message: "sandbox 'rz-abc-1' already exists".to_string(),
+                        source: None,
+                    });
+                }
+                Ok(())
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        result.expect("an already-exists refusal must be retried once, not fail the checkpoint");
+        assert_eq!(
+            *reboot_calls.borrow(),
+            2,
+            "the reboot must be retried exactly once on an already-exists refusal"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_an_already_exists_refusal_twice_in_a_row_surfaces_a_real_error_not_an_infinite_retry()
+     {
+        // The retry in the previous test is one-shot, not a loop: a persistent
+        // "already exists" refusal (not just a transient race) must still
+        // surface as a real, actionable error rather than retry forever.
+        let reboot_calls = RefCell::new(0u32);
+        let dest_dir_buf =
+            std::env::temp_dir().join("rz-msb-checkpoint-cycle-reboot-already-exists-twice");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                // See the happy-path test's identical branch for why the post-rm
+                // name-release poll needs a genuinely parseable reply.
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                *reboot_calls.borrow_mut() += 1;
+                Err(RightsizeError::NameConflict {
+                    message: "sandbox 'rz-abc-1' already exists".to_string(),
+                    source: None,
+                })
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        let err = result.expect_err("a persistent already-exists refusal must not retry forever");
+        let msg = err.to_string();
+        assert!(msg.contains("twice in a row"), "{msg}");
+        assert!(msg.contains("Container::from_checkpoint"), "{msg}");
+        assert_eq!(
+            *reboot_calls.borrow(),
+            2,
+            "exactly one retry — not an unbounded loop"
+        );
     }
 
     // ---- checkpoint dest-dir ref shape: minting, path-vs-bare-name, basename ----
