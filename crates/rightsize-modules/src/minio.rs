@@ -56,17 +56,29 @@
 //! [`rightsize::ImageName`] and checks its repository against `minio/minio` (registry
 //! host, tag, and digest stripped) before ever touching a backend, returning
 //! [`rightsize::RightsizeError::IncompatibleImage`] on a mismatch rather than letting
-//! an unrelated image run all the way to a wait-strategy timeout. Pass
+//! an unrelated image run all the way to a wait-strategy timeout. This check needs no
+//! special case for the `quay.io/minio/minio` move: `ImageName`'s registry-host
+//! stripping already drops the leading `quay.io/` (it contains a `.`, the Docker
+//! convention for a registry host — see `rightsize::ImageName`'s own doc), so
+//! `quay.io/minio/minio:TAG` and `minio/minio:TAG` both parse to the same `minio/minio`
+//! repository and are accepted identically, with no `as_compatible_substitute_for`
+//! needed for either. Pass
 //! `ImageName::parse(image).as_compatible_substitute_for("minio/minio")` to override
-//! for a verified drop-in replacement. [`MinioContainer::new`] goes through the same
-//! check against its own floating reference, so it can never fail in practice.
+//! for some OTHER, unrelated repository as a verified drop-in replacement.
+//! [`MinioContainer::new`] goes through the same check against its own floating
+//! reference, so it can never fail in practice.
 //!
-//! ### `new()` floats to `minio/minio:latest`
+//! ### `new()` floats to `quay.io/minio/minio:latest`
 //!
-//! This module used to pin `minio/minio:RELEASE.2025-09-07T16-13-09Z`; `new()` now
-//! floats to `minio/minio:latest` so the version tracks upstream rather than this
-//! crate's own release cycle. The readiness and auth-enforcement facts above were
-//! verified against that `RELEASE.2025-09-07T16-13-09Z` boot specifically.
+//! This module used to pin `minio/minio:RELEASE.2025-09-07T16-13-09Z`, then floated
+//! to `minio/minio:latest` so the version tracks upstream rather than this crate's
+//! own release cycle. The Docker Hub repository `minio/minio` was subsequently
+//! taken down (a `docker pull minio/minio` now fails "repository does not exist");
+//! upstream's maintained mirror is `quay.io/minio/minio`, so `new()` now floats to
+//! `quay.io/minio/minio:latest` instead. The readiness and auth-enforcement facts
+//! above were verified against a `minio/minio:RELEASE.2025-09-07T16-13-09Z` boot,
+//! back when that repository still existed — nothing about the server itself
+//! changed, only which registry serves the image.
 
 use rightsize::{Container, ContainerGuard, ImageName, Result, Wait};
 
@@ -88,9 +100,11 @@ pub struct MinioContainer {
 }
 
 impl MinioContainer {
-    /// Builds a container from the floating default image (`minio/minio:latest`).
+    /// Builds a container from the floating default image
+    /// (`quay.io/minio/minio:latest` — see the module doc's Docker Hub removal
+    /// note for why this isn't `minio/minio:latest`).
     pub fn new() -> Self {
-        Self::with_image("minio/minio:latest")
+        Self::with_image("quay.io/minio/minio:latest")
     }
 
     /// Builds a container from a caller-chosen image. The repository is checked when
@@ -240,6 +254,32 @@ mod tests {
             .image
             .assert_compatible_with(EXPECTED_REPOSITORY)
             .expect("the floating default must satisfy this module's own check");
+    }
+
+    // The Docker Hub repository `minio/minio` was taken down (a `docker pull
+    // minio/minio` fails "repository does not exist"); `quay.io/minio/minio` is
+    // upstream's maintained mirror.
+
+    #[test]
+    fn the_floating_default_moved_to_the_quay_mirror() {
+        let c = MinioContainer::new();
+        assert_eq!(c.image.as_str(), "quay.io/minio/minio:latest");
+    }
+
+    #[test]
+    fn a_quay_override_is_compatible_with_no_substitute_declaration_needed() {
+        // `quay.io` is stripped as a registry host (it contains a `.` — the same
+        // Docker convention `ImageName` uses elsewhere), so this parses to the
+        // ordinary `minio/minio` repository and passes the automatic check —
+        // exactly like the pre-migration `minio/minio:TAG` override still does.
+        MinioContainer::with_image("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a quay.io/minio/minio override must be accepted with no substitute");
+        MinioContainer::with_image("minio/minio:RELEASE.2025-09-07T16-13-09Z")
+            .image
+            .assert_compatible_with(EXPECTED_REPOSITORY)
+            .expect("a bare minio/minio override must still be accepted the same way");
     }
 
     #[test]

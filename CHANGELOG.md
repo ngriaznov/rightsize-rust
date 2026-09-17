@@ -27,6 +27,12 @@ reaches its first tagged release.
   redundant with what the snapshot itself already carries). Checkpoint create/restore
   semantics are unchanged from the caller's view; only the emitted `msb` command
   changed.
+- **The MinIO module's default image moved to `quay.io/minio/minio:latest`.** The
+  Docker Hub repository `minio/minio` was taken down (a `docker pull minio/minio` now
+  fails "repository does not exist"); `quay.io/minio/minio` is upstream's maintained
+  mirror. `MinioContainer::new()`'s floating default follows; the compatibility check
+  needed no changes — `quay.io/minio/minio:TAG` and `minio/minio:TAG` both already
+  parse to the same `minio/minio` repository and are accepted identically.
 
 ## [0.7.9] - 2026-09-10
 
