@@ -79,6 +79,26 @@ reaches its first tagged release.
   mirror. `MinioContainer::new()`'s floating default follows; the compatibility check
   needed no changes — `quay.io/minio/minio:TAG` and `minio/minio:TAG` both already
   parse to the same `minio/minio` repository and are accepted identically.
+- **Checkpoint archives on the microsandbox backend now go through `msb snapshot
+  load`'s 0.7.1 semantics, not the pre-0.7.1 digest-dir lookup.** `export_to` was
+  already emitting `snapshot save` (upstream renamed `export`/`import` to
+  `save`/`load` back at 0.6.8); `import_from`'s `msb snapshot load` invocation now
+  always carries an explicit `--dest <cache_dir>/checkpoints`, so an imported
+  artifact lands under this library's own checkpoints tree instead of msb's global
+  default snapshot store. More importantly, the EFFECTIVE REF an import resolves
+  to has changed shape: msb 0.7.1's `load` prints the loaded artifact's own
+  absolute path directly (a `group msb-<hex>: head snap_<digest> (Initialized)`
+  line, a digest line, then that path as the LAST stdout line — verified live),
+  so `import_checkpoint` now parses that path the same "last line, required
+  absolute" way `snapshot create`'s own ref already is, and returns it unchanged
+  as `Checkpoint.checkpoint_ref`. The old two-step resolution — parse a
+  digest-derived directory name out of `import`'s output, then confirm it against
+  a `msb snapshot list --format json` entry — is gone entirely; msb 0.7.1's `load`
+  needs no second round trip to learn where it put the artifact. This is a
+  user-visible ref-SHAPE change on a freshly imported checkpoint (an absolute
+  path under `checkpoints/`, not a `sha256-<hex>`-style name) — refs stay opaque
+  either way, and `Container::from_checkpoint` restores from either shape
+  identically.
 
 ## [0.7.9] - 2026-09-10
 

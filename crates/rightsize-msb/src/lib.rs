@@ -15,7 +15,6 @@ mod ls_json;
 pub mod platform;
 pub mod provider;
 pub mod provisioner;
-mod snapshot_json;
 mod watchdog;
 
 pub use backend::MsbCliBackend;

@@ -283,28 +283,27 @@ pub fn snapshot_export(snapshot_ref: &str, dest: &Path) -> Vec<String> {
     ]
 }
 
-/// Builds the argv for `msb snapshot load <archive>` — the checkpoint-archive
-/// feature's import primitive (`SandboxBackend::import_checkpoint`). Takes no ref
-/// argument: msb's import is content-addressed, unpacking under a digest-derived
-/// directory name this backend resolves separately (see
-/// `MsbCliBackend::import_checkpoint`).
-pub fn snapshot_import(archive_path: &Path) -> Vec<String> {
+/// Builds the argv for `msb snapshot load <archive> --dest <dest_dir>` — the
+/// checkpoint-archive feature's import primitive (`SandboxBackend::import_checkpoint`).
+/// `--dest` is ALWAYS passed, pointed at this backend's own checkpoints directory
+/// (`MsbCliBackend::import_checkpoint`'s own `<cache_dir>/checkpoints` — the same
+/// tree [`snapshot_create_in`] writes a created checkpoint under) rather than left
+/// to msb's own default (global) snapshot store, so an imported artifact's ref
+/// lands under the same tree a created one's does. msb's import is
+/// content-addressed — the archive's own original ref plays no role in where the
+/// artifact lands, only in what msb prints back on success: a `group msb-<hex>:
+/// head snap_<digest> (Initialized)` line, a digest line, then the loaded
+/// artifact's own absolute path as the LAST line (verified live against msb
+/// 0.7.1) — see `MsbCliBackend::import_checkpoint`'s doc for how that printed path
+/// becomes the returned ref, the same "parse the last line, require it absolute"
+/// contract [`snapshot_create`]'s own ref already uses.
+pub fn snapshot_import(archive_path: &Path, dest_dir: &Path) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "load".to_string(),
         archive_path.display().to_string(),
-    ]
-}
-
-/// Builds the argv for `msb snapshot list --format json` — confirms an imported
-/// snapshot's digest-derived directory name is registered by matching it against
-/// each entry's `name`/`artifact_path` (see `MsbCliBackend::import_checkpoint`).
-pub fn snapshot_list() -> Vec<String> {
-    vec![
-        "snapshot".to_string(),
-        "list".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
+        "--dest".to_string(),
+        dest_dir.display().to_string(),
     ]
 }
 
@@ -774,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_export_import_list_spellings() {
+    fn snapshot_save_load_spellings() {
         assert_eq!(
             snapshot_export(
                 "rz-ckpt-deadbeefcafe",
@@ -797,12 +796,19 @@ mod tests {
              msb 0.6.6"
         );
         assert_eq!(
-            snapshot_import(std::path::Path::new("/tmp/cp.archive")),
-            vec!["snapshot", "load", "/tmp/cp.archive"]
-        );
-        assert_eq!(
-            snapshot_list(),
-            vec!["snapshot", "list", "--format", "json"]
+            snapshot_import(
+                std::path::Path::new("/tmp/cp.archive"),
+                std::path::Path::new("/cache/checkpoints")
+            ),
+            vec![
+                "snapshot",
+                "load",
+                "/tmp/cp.archive",
+                "--dest",
+                "/cache/checkpoints"
+            ],
+            "load must always carry an explicit --dest so an imported ref lands under this \
+             backend's own checkpoints dir, never msb's global default snapshot store"
         );
     }
 }

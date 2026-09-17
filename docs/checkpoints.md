@@ -362,16 +362,18 @@ checkpoint locally. An archive from an unnamed `checkpoint()` imports fine too; 
 just writes no registry entry, and `import_from` returns an ephemeral
 `Checkpoint`.
 
-**msb's imported ref is a digest-derived directory name, not the original name.**
+**msb's imported ref is the loaded artifact's own path, not the original name.**
 microsandbox's `snapshot load` is content-addressed: the ref an imported
-checkpoint restores under is the digest-dir name it unpacked into (e.g.
-`sha256-b9c0448ee9d54e33`, visible as such in `Checkpoint::find`/`Checkpoint::list`
-results afterward), never the `rz-ckpt-<12hex>` name the archive was exported
-under, and never the full `sha256:<64hex>` digest either — msb doesn't resolve
-that as a snapshot ref. This is harmless — refs are opaque everywhere in this
-library, and `Container::from_checkpoint` restores from it exactly like any
-other — but don't be surprised to see a digest-shaped ref where a `rz-ckpt-` one
-might be expected. Docker's imported ref is the original tag, unchanged.
+checkpoint restores under is the absolute artifact path it unpacked into, under
+this library's own `<cache_dir>/checkpoints` directory (e.g.
+`~/.cache/rightsize/checkpoints/msb-<hex>/snap_<digest>`, visible as such in
+`Checkpoint::find`/`Checkpoint::list` results afterward), never the
+`rz-ckpt-<12hex>` name the archive was exported under, and never a bare digest
+either — msb doesn't resolve one as a snapshot ref. This is harmless — refs are
+opaque everywhere in this library, and `Container::from_checkpoint` restores from
+it exactly like any other — but don't be surprised to see a freshly minted path
+where a `rz-ckpt-` one might be expected. Docker's imported ref is the original
+tag, unchanged.
 
 **Archive size** follows each backend's own artifact: microsandbox's is the
 zstd-compressed disk snapshot, typically small even for a seeded database

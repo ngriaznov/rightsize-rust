@@ -135,9 +135,11 @@ impl Drop for ArchiveCleanup {
 /// `checkpoint_named("<nonce>-archive")` it, `exportTo` an archive file, then
 /// remove the checkpoint (both the disk snapshot AND the registry entry) so the
 /// archive is the ONLY surviving copy. `importFrom` that archive: msb's import is
-/// content-addressed, so the effective ref is a resolved digest — never the
-/// original `rz-ckpt-` name — and `Container::from_checkpoint` on the result must
-/// still restore the marker.
+/// content-addressed, so the effective ref is the loaded artifact's own absolute
+/// path under this library's checkpoints dir (`msb snapshot load ... --dest
+/// <cache_dir>/checkpoints`, verified live) — never the original `rz-ckpt-` name
+/// — and `Container::from_checkpoint` on the result must still restore the
+/// marker.
 #[tokio::test]
 async fn checkpoint_archive_survives_removal_of_the_original_and_restores_the_marker() {
     require_msb!();
@@ -220,21 +222,28 @@ async fn checkpoint_archive_survives_removal_of_the_original_and_restores_the_ma
     cleanup.set_imported_ref(imported.checkpoint_ref.clone());
     assert_ne!(
         imported.checkpoint_ref, cp.checkpoint_ref,
-        "msb's load is content-addressed — the effective ref is a resolved digest, never the \
-         original rz-ckpt- name"
+        "msb's load is content-addressed and lands under a freshly minted group — the \
+         effective ref is the loaded artifact's own path, never the original rz-ckpt- name \
+         or the original checkpoint's own artifact path"
     );
-    // Digest-shaped, not merely different: msb has published both `sha256-<16hex>` (0.6.6)
-    // and a bare 64-hex digest (0.6.8) for a loaded snapshot, so the prefix is optional —
-    // what must hold is that the ref is a content digest. Asserting only "differs from the
-    // original" would accept any renaming msb ever adopts.
-    let digest_body = imported
-        .checkpoint_ref
-        .strip_prefix("sha256-")
-        .unwrap_or(&imported.checkpoint_ref);
+    // An absolute path under this library's own checkpoints dir, not merely different:
+    // `msb snapshot load ... --dest <cache_dir>/checkpoints` prints the loaded artifact's
+    // own path as the last line of its stdout (verified live against msb 0.7.1), and
+    // `import_checkpoint` returns that path unchanged as the effective ref — the same
+    // "the printed path itself is the ref" shape `checkpoint_named`'s own ref already has
+    // (asserted above). Asserting only "differs from the original" would accept any
+    // renaming msb ever adopts, including a return to the pre-0.7.1 digest-name shape.
+    let imported_ref_path = std::path::Path::new(&imported.checkpoint_ref);
     assert!(
-        (16..=64).contains(&digest_body.len())
-            && digest_body.bytes().all(|b| b.is_ascii_hexdigit()),
-        "expected msb's digest-shaped effective ref, got '{}'",
+        imported_ref_path.is_absolute(),
+        "{}",
+        imported.checkpoint_ref
+    );
+    assert!(
+        imported_ref_path
+            .ancestors()
+            .any(|a| a.file_name().and_then(|n| n.to_str()) == Some("checkpoints")),
+        "expected the imported ref to nest somewhere under a 'checkpoints' dir: {}",
         imported.checkpoint_ref
     );
     assert_eq!(imported.backend, "microsandbox");
