@@ -113,18 +113,36 @@ const RESTORE_ACCESS_DENIED_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// snapshot artifact's file handle), so rebooting immediately can race that
 /// release and hit msb's own "sandbox already exists" refusal on the very next
 /// `restore`. Unix releases the name synchronously, so the very first poll —
-/// taken before any sleep — already sees it gone there. A few seconds covers
-/// every Windows lag observed in CI without turning a genuinely stuck teardown
-/// into an indefinite hang.
+/// taken before any sleep — already sees it gone there.
+///
+/// This is a cheap FIRST gate, not the guarantee: `msb ls` only speaks to the
+/// sandbox's DB record, while msb 0.7.1's own `restore`-time collision check
+/// (`prepare_create_target` in `sdk/rust/lib/backend/local/sandbox/create.rs`:
+/// `existing.is_some() || dir_exists`) also blocks on the sandbox's on-disk
+/// directory — a second, independent thing to release that `msb ls` says
+/// nothing about. On Windows the directory can keep a file handle open well
+/// past the DB record's own release (observed on CI exceeding 3.5s under
+/// load), so this budget skips the reboot attempt that's already known to be
+/// doomed without pretending to prove the directory is free too — that's
+/// [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET`]'s job.
 const CHECKPOINT_NAME_RELEASE_BUDGET: Duration = Duration::from_secs(3);
 /// Before retrying [`msb_checkpoint_cycle`]'s own re-boot when it hits msb's
 /// "already exists" refusal despite [`CHECKPOINT_NAME_RELEASE_BUDGET`]'s own
-/// wait having already passed — short, one-shot, mirroring
-/// [`RESTORE_ACCESS_DENIED_RETRY_DELAY`]'s own policy. Defense in depth for
-/// msb's teardown finishing in the gap between that wait passing and the
-/// retried `restore` actually running; the wait above is the primary fix, this
-/// only catches what it might still miss.
-const CHECKPOINT_REBOOT_NAME_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(300);
+/// wait having already passed — the actual guarantee, not the one-shot,
+/// 300ms-delay retry this used to be. That single retry was sized for the
+/// gap between the wait passing and the retry running, not for the directory-
+/// release lag [`CHECKPOINT_NAME_RELEASE_BUDGET`]'s own doc describes, which
+/// CI has observed exceeding 3.5s under load on its own — comfortably past
+/// what one 300ms retry could ever cover. This now polls on the same
+/// install-lock-poll shape as [`INSTALL_LOCK_RETRY_BUDGET`]/
+/// [`INSTALL_LOCK_RETRY_DELAY`]: long enough to outlast every release lag
+/// observed, short enough that a genuinely stuck teardown still fails
+/// clearly instead of hanging. See [`reboot_with_already_exists_retry`] for
+/// the loop itself.
+const CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET: Duration = Duration::from_secs(30);
+/// The poll interval for [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET`] —
+/// see that constant's own doc.
+const CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// An immutable `msb` sandbox reference: its `ContainerSpec` and the name `msb` knows
 /// it by (always `spec.name` for this backend). All mutable per-container state lives
@@ -2374,15 +2392,19 @@ fn wait_for_checkpoint_name_release(
 /// - After `rm`, [`wait_for_checkpoint_name_release`] polls `msb ls` until
 ///   `name` is actually gone (bounded by
 ///   [`CHECKPOINT_NAME_RELEASE_BUDGET`]) before `reboot` is ever called — msb's
-///   own `rm` can return before the name is released on Windows, and rebooting
-///   into that race would otherwise surface as msb's own "already exists"
-///   refusal instead of a clear error naming the stuck sandbox. As defense in
-///   depth, a `reboot` that still hits that refusal (msb's own teardown
-///   finishing in the gap between the wait passing and `reboot` actually
-///   running) is retried once, short backoff, mirroring
-///   [`is_restore_access_denied`]'s own one-shot retry.
+///   own `rm` can return before the sandbox's DB record clears `msb ls`, and
+///   rebooting into that race would otherwise surface as msb's own "already
+///   exists" refusal instead of a clear error naming the stuck sandbox. That
+///   wait is only a cheap first gate, though — see
+///   [`CHECKPOINT_NAME_RELEASE_BUDGET`]'s own doc for the second, independent
+///   thing msb's own collision check blocks on that `msb ls` says nothing
+///   about. So a `reboot` that still hits that refusal is retried by
+///   [`reboot_with_already_exists_retry`] on a bounded budget —
+///   [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET`] at
+///   [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY`] intervals — rather than
+///   the single short-backoff retry this used to be.
 /// - A failure to reboot after a successful snapshot (whether the name-release
-///   wait itself timed out, or the reboot failed even after its own retry)
+///   wait itself timed out, or the reboot's own retry budget ran out)
 ///   surfaces an error naming the full checkpoint ref (parsed from `snapshot
 ///   create`'s stdout, per above) and `Container::from_checkpoint(...)` as the
 ///   recovery path — the sandbox is gone, but its state lives on in the
@@ -2394,6 +2416,66 @@ fn msb_checkpoint_cycle<T>(
     basename: &str,
     dest_dir: &Path,
     attempt_cmdline_capture: bool,
+) -> Result<(String, T, Option<Vec<String>>)> {
+    msb_checkpoint_cycle_inner(
+        invoke,
+        reboot,
+        name,
+        basename,
+        dest_dir,
+        attempt_cmdline_capture,
+        CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET,
+        CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY,
+    )
+}
+
+/// Test-only seam: identical to [`msb_checkpoint_cycle`], but with the reboot
+/// step's "already exists" retry budget/delay overridable instead of hardcoded
+/// to [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET`]/
+/// [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY`] — lets a red-proof shrink
+/// the real ~30s budget down to milliseconds so exhausting it doesn't mean
+/// actually waiting 30 real seconds. Production never calls this; it always
+/// goes through [`msb_checkpoint_cycle`] itself, which hardcodes the real
+/// constants.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn msb_checkpoint_cycle_with_reboot_retry_budget<T>(
+    invoke: &mut dyn FnMut(&[String]) -> Result<ExecResult>,
+    reboot: &mut RebootFn<'_, T>,
+    name: &str,
+    basename: &str,
+    dest_dir: &Path,
+    attempt_cmdline_capture: bool,
+    reboot_retry_budget: Duration,
+    reboot_retry_delay: Duration,
+) -> Result<(String, T, Option<Vec<String>>)> {
+    msb_checkpoint_cycle_inner(
+        invoke,
+        reboot,
+        name,
+        basename,
+        dest_dir,
+        attempt_cmdline_capture,
+        reboot_retry_budget,
+        reboot_retry_delay,
+    )
+}
+
+/// The actual orchestration both [`msb_checkpoint_cycle`] and its test-only
+/// [`msb_checkpoint_cycle_with_reboot_retry_budget`] twin delegate to — see
+/// [`msb_checkpoint_cycle`]'s own doc for the full behavior; `reboot_retry_budget`/
+/// `reboot_retry_delay` are just the already-exists retry's budget/delay,
+/// threaded straight through to [`reboot_with_already_exists_retry`].
+#[allow(clippy::too_many_arguments)]
+fn msb_checkpoint_cycle_inner<T>(
+    invoke: &mut dyn FnMut(&[String]) -> Result<ExecResult>,
+    reboot: &mut RebootFn<'_, T>,
+    name: &str,
+    basename: &str,
+    dest_dir: &Path,
+    attempt_cmdline_capture: bool,
+    reboot_retry_budget: Duration,
+    reboot_retry_delay: Duration,
 ) -> Result<(String, T, Option<Vec<String>>)> {
     let captured_cmdline = attempt_cmdline_capture
         .then(|| invoke(&commands::capture_workload_cmdline(name)))
@@ -2459,25 +2541,54 @@ fn msb_checkpoint_cycle<T>(
         ))
     })?;
 
-    let rebooted = match reboot(&checkpoint_ref, captured_cmdline.as_deref()) {
-        Ok(rebooted) => rebooted,
-        // Defense in depth: the wait above already covers the ordinary case,
-        // but msb's own teardown can still finish in the gap between that wait
-        // passing and this retried `restore` actually running. One short,
-        // one-shot retry — same shape as `RESTORE_ACCESS_DENIED_RETRY_DELAY`'s
-        // own policy — before giving up.
-        Err(RightsizeError::NameConflict { message, .. }) => {
-            std::thread::sleep(CHECKPOINT_REBOOT_NAME_CONFLICT_RETRY_DELAY);
-            reboot(&checkpoint_ref, captured_cmdline.as_deref()).map_err(|e2| {
-                RightsizeError::Backend(format!(
-                    "re-booting sandbox {name} from checkpoint {checkpoint_ref} hit msb's \
-                     \"already exists\" refusal twice in a row ({message}), even after waiting \
-                     for the name to clear `msb ls` and retrying once more ({e2}) — the sandbox \
-                     was removed but its state is preserved in checkpoint {checkpoint_ref}, \
-                     restorable via Container::from_checkpoint(...)"
-                ))
-            })?
-        }
+    let rebooted = reboot_with_already_exists_retry(
+        reboot,
+        &checkpoint_ref,
+        captured_cmdline.as_deref(),
+        name,
+        reboot_retry_budget,
+        reboot_retry_delay,
+    )?;
+
+    Ok((checkpoint_ref, rebooted, captured_cmdline))
+}
+
+/// [`msb_checkpoint_cycle`]'s reboot step, with msb's own "already exists"
+/// refusal retried on a bounded budget instead of surfaced immediately. The
+/// [`wait_for_checkpoint_name_release`] gate that already ran before this is
+/// only a cheap first pass — it proves the sandbox's DB record cleared `msb
+/// ls`, never that msb's own restore-time collision check
+/// (`prepare_create_target`'s `existing.is_some() || dir_exists`, see
+/// [`CHECKPOINT_NAME_RELEASE_BUDGET`]'s own doc) will actually let a `restore`
+/// through — the on-disk directory that second check looks at can keep a
+/// stale Windows file handle open well past the DB record's own release. So
+/// THIS retry, not the `msb ls` wait, is what actually guarantees a reboot
+/// eventually gets a fair shot at a name that is merely slow to free, while
+/// still failing clearly (never hanging) on a genuinely stuck one.
+///
+/// `retry_budget`/`retry_delay` are parameters rather than the bare constants
+/// so the budget-exhaustion red-proof can shrink them to run in milliseconds
+/// instead of the real [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET`] —
+/// production always calls this with that constant and
+/// [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY`] (see
+/// [`msb_checkpoint_cycle`] above).
+///
+/// Only [`RightsizeError::NameConflict`] is retried at all — any other error
+/// `reboot` returns (on the first attempt or a later one) surfaces
+/// immediately, the same as it always has; retrying a non-conflict failure on
+/// this budget would just delay reporting a real problem.
+fn reboot_with_already_exists_retry<T>(
+    reboot: &mut RebootFn<'_, T>,
+    checkpoint_ref: &str,
+    captured_cmdline: Option<&[String]>,
+    name: &str,
+    retry_budget: Duration,
+    retry_delay: Duration,
+) -> Result<T> {
+    let deadline = Instant::now() + retry_budget;
+    let mut last_message = match reboot(checkpoint_ref, captured_cmdline) {
+        Ok(rebooted) => return Ok(rebooted),
+        Err(RightsizeError::NameConflict { message, .. }) => message,
         Err(e) => {
             return Err(RightsizeError::Backend(format!(
                 "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
@@ -2486,8 +2597,33 @@ fn msb_checkpoint_cycle<T>(
             )));
         }
     };
-
-    Ok((checkpoint_ref, rebooted, captured_cmdline))
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RightsizeError::Backend(format!(
+                "re-booting sandbox {name} from checkpoint {checkpoint_ref} kept hitting msb's \
+                 \"already exists\" refusal for {}s after `msb ls` had already confirmed the \
+                 name clear ({last_message}) — msb's own on-disk directory release can lag its \
+                 DB record's own release on a loaded Windows host well past a short wait, but a \
+                 refusal that never clears this long looks like a genuinely stuck sandbox \
+                 rather than a release race; the sandbox was removed but its state is preserved \
+                 in checkpoint {checkpoint_ref}, restorable via Container::from_checkpoint(...)",
+                retry_budget.as_secs(),
+            )));
+        }
+        std::thread::sleep(retry_delay);
+        match reboot(checkpoint_ref, captured_cmdline) {
+            Ok(rebooted) => return Ok(rebooted),
+            Err(RightsizeError::NameConflict { message, .. }) => last_message = message,
+            Err(e) => {
+                return Err(RightsizeError::Backend(format!(
+                    "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) \
+                     after previously hitting msb's \"already exists\" refusal ({last_message}) \
+                     — the sandbox was removed but its state is preserved in checkpoint \
+                     {checkpoint_ref}, restorable via Container::from_checkpoint(...)"
+                )));
+            }
+        }
+    }
 }
 
 /// Parses the checkpoint artifact's own absolute path out of a successful `msb
@@ -3600,12 +3736,20 @@ mod tests {
     }
 
     #[test]
-    fn msb_checkpoint_cycle_retries_the_reboot_once_on_an_already_exists_refusal_then_succeeds() {
-        // Red-proof (c): defense in depth — even after the release wait passes,
-        // msb's own teardown can still finish in the gap before the retried
-        // `restore` actually runs. One short, one-shot retry on msb's own
-        // "already exists" refusal must still let the checkpoint succeed.
+    fn msb_checkpoint_cycle_retries_the_reboot_on_an_already_exists_refusal_past_the_old_one_shot_budget_then_succeeds()
+     {
+        // Red-proof (a): defense in depth — even after the release wait passes,
+        // msb's own teardown (specifically the on-disk sandbox directory, which
+        // `msb ls` says nothing about — see `CHECKPOINT_NAME_RELEASE_BUDGET`'s
+        // own doc) can still be finishing well after the retried `restore`
+        // starts. Five already-exists refusals in a row — a count the OLD
+        // one-shot retry (budget for exactly one extra attempt) could never
+        // survive — must still let the checkpoint succeed once the sixth
+        // attempt clears, proving this is a real bounded RETRY BUDGET now, not
+        // a single retry. The budget/delay are shrunk to run in milliseconds
+        // instead of the real ~30s/2s shape.
         let reboot_calls = RefCell::new(0u32);
+        const ALREADY_EXISTS_REFUSALS: u32 = 5;
         let dest_dir_buf =
             std::env::temp_dir().join("rz-msb-checkpoint-cycle-reboot-already-exists");
         let dest_dir = dest_dir_buf.as_path();
@@ -3629,7 +3773,7 @@ mod tests {
             let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
                 let mut n = reboot_calls.borrow_mut();
                 *n += 1;
-                if *n == 1 {
+                if *n <= ALREADY_EXISTS_REFUSALS {
                     return Err(RightsizeError::NameConflict {
                         message: "sandbox 'rz-abc-1' already exists".to_string(),
                         source: None,
@@ -3637,32 +3781,42 @@ mod tests {
                 }
                 Ok(())
             };
-            msb_checkpoint_cycle(
+            msb_checkpoint_cycle_with_reboot_retry_budget(
                 &mut invoke,
                 &mut reboot,
                 "rz-abc-1",
                 "rz-ckpt-deadbeefcafe",
                 dest_dir,
                 false,
+                Duration::from_millis(200),
+                Duration::from_millis(1),
             )
         };
-        result.expect("an already-exists refusal must be retried once, not fail the checkpoint");
+        result.expect(
+            "the reboot budget must survive more already-exists refusals than the old one-shot \
+             retry ever could, and still let the checkpoint succeed once they stop",
+        );
         assert_eq!(
             *reboot_calls.borrow(),
-            2,
-            "the reboot must be retried exactly once on an already-exists refusal"
+            ALREADY_EXISTS_REFUSALS + 1,
+            "exactly one reboot attempt per refusal, plus the one that finally succeeds"
         );
     }
 
     #[test]
-    fn msb_checkpoint_cycle_an_already_exists_refusal_twice_in_a_row_surfaces_a_real_error_not_an_infinite_retry()
+    fn msb_checkpoint_cycle_an_already_exists_refusal_that_never_clears_fails_clearly_once_the_budget_runs_out()
      {
-        // The retry in the previous test is one-shot, not a loop: a persistent
-        // "already exists" refusal (not just a transient race) must still
-        // surface as a real, actionable error rather than retry forever.
+        // Red-proof (b): a PERSISTENT "already exists" refusal (not just a
+        // transient release race) must still surface as a real, actionable
+        // error once the retry budget is exhausted — never retry forever, and
+        // never silently succeed. The budget/delay are overridden to a few
+        // milliseconds so exhausting them doesn't mean actually waiting out the
+        // real ~30s budget.
         let reboot_calls = RefCell::new(0u32);
+        let budget = Duration::from_millis(200);
+        let delay = Duration::from_millis(1);
         let dest_dir_buf =
-            std::env::temp_dir().join("rz-msb-checkpoint-cycle-reboot-already-exists-twice");
+            std::env::temp_dir().join("rz-msb-checkpoint-cycle-reboot-already-exists-forever");
         let dest_dir = dest_dir_buf.as_path();
         let result = {
             let mut invoke = |args: &[String]| {
@@ -3688,23 +3842,28 @@ mod tests {
                     source: None,
                 })
             };
-            msb_checkpoint_cycle(
+            msb_checkpoint_cycle_with_reboot_retry_budget(
                 &mut invoke,
                 &mut reboot,
                 "rz-abc-1",
                 "rz-ckpt-deadbeefcafe",
                 dest_dir,
                 false,
+                budget,
+                delay,
             )
         };
-        let err = result.expect_err("a persistent already-exists refusal must not retry forever");
+        let err = result.expect_err(
+            "an already-exists refusal that never clears must not retry forever, nor succeed",
+        );
         let msg = err.to_string();
-        assert!(msg.contains("twice in a row"), "{msg}");
+        assert!(msg.contains("already exists"), "{msg}");
         assert!(msg.contains("Container::from_checkpoint"), "{msg}");
-        assert_eq!(
-            *reboot_calls.borrow(),
-            2,
-            "exactly one retry — not an unbounded loop"
+        assert!(
+            *reboot_calls.borrow() > 2,
+            "the budget must allow strictly more attempts than the old one-shot retry's fixed \
+             two, even at this shrunk size: got {}",
+            *reboot_calls.borrow()
         );
     }
 

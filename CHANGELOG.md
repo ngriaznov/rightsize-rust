@@ -175,8 +175,17 @@ reaches its first tagged release.
 - **The checkpoint cycle now waits out msb's asynchronous sandbox-name
   release on Windows before rebooting from the snapshot**, polling `msb ls`
   (bounded, briefly) after `rm` so the reboot no longer races a lingering
-  name into msb's own "already exists" refusal, with one short retry of the
-  reboot itself as defense in depth if that refusal still slips through.
+  DB-record entry into msb's own "already exists" refusal. That `msb ls`
+  wait is only a cheap first gate, though — msb 0.7.1's own restore-time
+  collision check also blocks on the sandbox's on-disk directory, a second,
+  independent release `msb ls` says nothing about and which can lag well
+  behind the DB record on a loaded Windows host. So the reboot itself now
+  retries any "already exists" refusal on a real ~30-second budget (2-second
+  intervals, the same shape this backend already polls msb's install-operation
+  lock with), not the single 300ms one-shot retry this used to be — that
+  one-shot retry was sized for the gap between the wait passing and the retry
+  running, not for a directory-release lag CI has observed exceeding 3.5s
+  under load on its own.
 
 ## [0.7.9] - 2026-09-10
 
