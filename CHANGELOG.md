@@ -107,6 +107,72 @@ reaches its first tagged release.
   pre-0.7.1 code relied on — covering both possible shapes instead of assuming
   one.
 
+### Fixed
+
+- **A restored container now has its workload actually restarted.** `msb
+  restore` (0.7.1+) only brings the guest agent back up — verified live
+  against a real msb 0.7.1: `guest ps` on a restored sandbox shows only
+  `/init.krun` and kernel threads, the checkpoint's own workload command never
+  re-runs, `msb start` on it boots idle too, and `msb logs` returns nothing.
+  Every restore this library has produced under 0.7.1 was therefore breaking
+  its own checkpoint contract (a restored container should behave like a
+  started one — workload running, ports served, wait strategies satisfiable,
+  logs flowing): the rust checkpoint tests kept passing only because they
+  assert via `exec` against the otherwise-idle guest, while the equivalent
+  kotlin/node integration suites, which wait on actual workload log output,
+  hung until timeout with zero log lines. The microsandbox backend now spawns
+  `msb exec [-e KEY=value]... <name> -- <argv>` as a long-lived attached child
+  immediately after a restore reaches `Running` — both the checkpoint
+  feature's own re-boot and an ordinary `Container::from_checkpoint(...)`
+  restore — and hands that child back as the boot's own live child, so
+  child-exit-based death detection, `stop()`'s reap, and every other place
+  that already treats an attached child apply to it unchanged. This exec is
+  also how the checkpoint's env reaches the revived workload now: `restore`
+  itself still has no `-e`/`--env` flag (unchanged from the note above), but
+  `exec` does, and carries `spec.env` as repeated `-e` flags.
+  `Container::start()`'s own configured wait strategy now runs AFTER this
+  exec is spawned, not against an idle sandbox.
+
+  `<argv>` comes from the checkpoint's own explicit `command` when it has one
+  (every test this fixes already uses an explicit command, so this path alone
+  turns them green); when the container was started from the image's default
+  entrypoint instead, `ContainerGuard::checkpoint`/`checkpoint_named` now
+  captures the guest's actual running command right before stopping it for
+  the snapshot — a small POSIX-`sh` script execed into the guest walks
+  `/proc/[0-9]*/stat` for the first process whose parent is PID 1 that isn't
+  `init.krun` or a kernel thread, and prints its `/proc/<pid>/cmdline`
+  NUL-separated — and carries the parsed argv forward: in-process immediately
+  for that same re-boot, and, for a NAMED checkpoint, in a new additive,
+  internal `capturedCmdline` field on the `<name>.json` registry entry (an old
+  entry without it still parses fine via `#[serde(default)]`) so a LATER
+  restore — a different process, or a different host — has it too. A
+  checkpoint with neither an explicit command nor a captured one (taken by an
+  older release, before this capture existed) now fails its restore outright
+  with an actionable `RightsizeError::Backend` naming the reason, rather than
+  booting the sandbox silently idle the way every restore used to. The public
+  `Checkpoint` type and every checkpoint builder are unchanged; the guest
+  cmdline capture itself is best-effort in every direction — a failed or
+  unparseable capture just means a later restore falls back to the same typed
+  error, never a failed checkpoint.
+
+  A workload exec that exits nonzero right after being spawned is a
+  classified boot failure carrying its own output; one that exits 0 right
+  away is judged exactly like an attached `run` child's own fast-exit case —
+  success when the sandbox's own state backs it up, the same failure path
+  otherwise.
+
+- **A transient Windows `msb restore` failure right after the source
+  sandbox's teardown is now retried once.** Intermittently on Windows CI,
+  `restore` exits 1 with output containing `io error: Access is denied. (os
+  error 5)` — the OS still finishing its own deferred release of the
+  just-written snapshot artifact's file handle (msb's own docs describe this
+  deferred-release behavior on Windows), not a real permissions problem. This
+  is classified conservatively (msb's own "Access is denied" phrase together
+  with either "io error" or "os error 5") and retried once after a short
+  delay, mirroring this backend's existing one-shot transient-retry policy
+  (the same shape already applied to msb's state-database migration race).
+  The signature is checked unconditionally in code but never occurs on unix.
+
 ## [0.7.9] - 2026-09-10
 
 ### Changed

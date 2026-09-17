@@ -234,6 +234,28 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
+    /// The workload cmdline this backend captured from `handle`'s guest during its
+    /// most recent [`Self::create_checkpoint`] call, when that checkpoint's own
+    /// spec had no explicit `command` — an image's default entrypoint, which only
+    /// a live guest process table can reveal (see
+    /// `ContainerSpec::checkpoint_captured_cmdline`'s own doc for the full story).
+    /// Called once, right after `create_checkpoint` succeeds, by
+    /// `ContainerGuard::checkpoint`/`checkpoint_named`, which folds the result into
+    /// the `Checkpoint`/registry entry they return.
+    ///
+    /// `None` covers every case that isn't "this backend just captured
+    /// something": the checkpointed spec already had an explicit `command` (there
+    /// was nothing to capture), the capture itself failed or produced nothing
+    /// parseable, or — the default here — this backend's checkpoint mechanism
+    /// doesn't restart the workload in the first place
+    /// ([`Capabilities::checkpoint_restarts_workload`] is `false`) and so never
+    /// attempts a capture at all. Deliberately synchronous: this only ever reads
+    /// state the backend already captured earlier in the same call, never makes a
+    /// fresh runtime call of its own.
+    fn last_checkpoint_captured_cmdline(&self, _handle: &dyn SandboxHandle) -> Option<Vec<String>> {
+        None
+    }
+
     /// Best-effort removal of a checkpoint this backend created (see
     /// [`Self::create_checkpoint`]): docker `DELETE`s the tagged image; microsandbox
     /// runs `msb snapshot rm`. "Not found" is success, matching

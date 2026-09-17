@@ -265,6 +265,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                captured_cmdline: None,
             },
         }
     }

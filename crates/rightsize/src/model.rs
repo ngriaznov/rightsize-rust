@@ -141,6 +141,25 @@ pub struct ContainerSpec {
     /// (`RightsizeError::NetworkDisabledConflict`). Part of the reuse identity
     /// hash, exactly like `memory_limit_mb`. Defaults to `false`.
     pub network_disabled: bool,
+    /// The workload cmdline [`crate::ContainerGuard::checkpoint`]/`checkpoint_named`
+    /// captured from the guest at checkpoint time, for a restore whose checkpoint
+    /// spec has no explicit `command` — an image's default entrypoint, which the
+    /// checkpoint's own capture step recovered by walking the guest's process
+    /// table right before stopping it for the snapshot (see the `rightsize-msb`
+    /// crate's `commands::capture_workload_cmdline`/`parse_captured_cmdline`).
+    /// Threaded through by [`crate::Container::from_checkpoint`] from
+    /// [`crate::Checkpoint::spec`] (in turn either the in-memory value an
+    /// unnamed `checkpoint()` returned, or a named checkpoint's registry entry
+    /// — see `crate::checkpoint::NamedRegistrySpec`'s own additive field).
+    ///
+    /// A backend whose checkpoint mechanism restarts the workload
+    /// (`Capabilities::checkpoint_restarts_workload`) consults this ONLY when
+    /// `command` above is `None` — an explicit command always wins — to decide
+    /// what to re-run after a restore reaches its idle post-boot state; a
+    /// backend that leaves the container undisturbed (docker) never reads it.
+    /// Internal plumbing, in the same spirit as `checkpoint_ref` above — no
+    /// public builder sets this directly. Defaults to `None`.
+    pub checkpoint_captured_cmdline: Option<Vec<String>>,
 }
 
 impl ContainerSpec {
@@ -167,6 +186,7 @@ impl ContainerSpec {
             disk_limit_mb: None,
             tmpfs_root_mb: None,
             network_disabled: false,
+            checkpoint_captured_cmdline: None,
         }
     }
 }
@@ -193,6 +213,7 @@ mod tests {
         assert_eq!(spec.disk_limit_mb, None);
         assert_eq!(spec.tmpfs_root_mb, None);
         assert!(!spec.network_disabled);
+        assert!(spec.checkpoint_captured_cmdline.is_none());
     }
 
     #[test]

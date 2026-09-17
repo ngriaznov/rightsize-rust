@@ -119,10 +119,27 @@ pub(crate) struct NamedRegistrySpec {
     pub exposed_ports: Vec<u16>,
     #[serde(rename = "memoryLimitMb")]
     pub memory_limit_mb: Option<u64>,
+    /// ADDITIVE, internal field — not part of the pinned cross-language contract
+    /// the other fields on this type are (see the module doc). Carries the
+    /// workload cmdline a microsandbox checkpoint captured from the guest when
+    /// `command` above is `None` (see `ContainerSpec::checkpoint_captured_cmdline`'s
+    /// own doc for the full story of where it comes from and how a restore uses
+    /// it). `#[serde(default)]` so a registry entry written before this field
+    /// existed — or by a language port that hasn't added it yet — still parses
+    /// cleanly (`None`, same as "never captured"); `skip_serializing_if` keeps a
+    /// docker checkpoint's entry (which never populates this) byte-identical to
+    /// what it always wrote, rather than growing a stray `"capturedCmdline":
+    /// null`.
+    #[serde(
+        rename = "capturedCmdline",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub captured_cmdline: Option<Vec<String>>,
 }
 
 impl NamedRegistrySpec {
-    /// Reduces a full `ContainerSpec` down to the four fields this shape persists —
+    /// Reduces a full `ContainerSpec` down to the fields this shape persists —
     /// the same reduction `ContainerGuard::checkpoint_named` and
     /// `Checkpoint::export_to` both need, factored out here so it's written once.
     pub(crate) fn from_container_spec(spec: &ContainerSpec) -> Self {
@@ -131,6 +148,7 @@ impl NamedRegistrySpec {
             command: spec.command.clone(),
             exposed_ports: spec.ports.iter().map(|p| p.guest_port).collect(),
             memory_limit_mb: spec.memory_limit_mb,
+            captured_cmdline: spec.checkpoint_captured_cmdline.clone(),
         }
     }
 }
@@ -361,6 +379,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                captured_cmdline: None,
             },
         }
     }
@@ -468,6 +487,58 @@ mod tests {
         assert!(!raw.contains("created_iso"), "{raw}");
         assert!(!raw.contains("exposed_ports"), "{raw}");
         assert!(!raw.contains("memory_limit_mb"), "{raw}");
+    }
+
+    #[test]
+    fn a_registry_entry_written_before_captured_cmdline_existed_still_parses() {
+        // The additive-field contract: an old `<name>.json` on disk (or one
+        // written by a language port that hasn't added the field yet) has no
+        // `capturedCmdline` key at all — `#[serde(default)]` must still parse
+        // it, as `None`, rather than fail to read the whole entry.
+        let cache = temp_cache_dir("no-captured-cmdline-field");
+        std::fs::create_dir_all(cache.join("checkpoints")).unwrap();
+        std::fs::write(
+            cache.join("checkpoints").join("seeded-db.json"),
+            br#"{
+                "name": "seeded-db",
+                "ref": "rz-ckpt-seeded-db",
+                "backend": "microsandbox",
+                "createdIso": "2025-01-01T00:00:00Z",
+                "spec": {
+                    "env": {"A": "1"},
+                    "command": null,
+                    "exposedPorts": [6379],
+                    "memoryLimitMb": 256
+                }
+            }"#,
+        )
+        .unwrap();
+        let registry = Registry::new(&cache, "seeded-db");
+        let entry = registry
+            .read()
+            .expect("an entry missing only the additive field must still parse");
+        assert_eq!(entry.spec.captured_cmdline, None);
+    }
+
+    #[test]
+    fn captured_cmdline_round_trips_and_is_omitted_from_json_when_absent() {
+        let cache = temp_cache_dir("captured-cmdline-round-trip");
+        let registry = Registry::new(&cache, "seeded-db");
+        let mut with_capture = sample_entry();
+        with_capture.spec.command = None;
+        with_capture.spec.captured_cmdline = Some(vec![
+            "redis-server".to_string(),
+            "--daemonize".to_string(),
+            "no".to_string(),
+        ]);
+        registry.write_atomic(&with_capture).unwrap();
+        assert_eq!(registry.read(), Some(with_capture));
+
+        // The ordinary (explicit-command) case never populates this — the
+        // written JSON must not grow a stray `"capturedCmdline": null`.
+        registry.write_atomic(&sample_entry()).unwrap();
+        let raw = fs::read_to_string(cache.join("checkpoints").join("seeded-db.json")).unwrap();
+        assert!(!raw.contains("capturedCmdline"), "{raw}");
     }
 
     #[test]

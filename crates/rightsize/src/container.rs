@@ -97,6 +97,13 @@ pub struct Container {
     /// `rightsize_msb::commands::restore`'s doc). `None` for every ordinarily-built
     /// `Container`.
     checkpoint_captured_env: Option<Vec<(String, String)>>,
+    /// Set by [`Container::from_checkpoint`] to `cp.spec.checkpoint_captured_cmdline`
+    /// — the workload cmdline the source checkpoint captured from the guest, when
+    /// it has no explicit `command` of its own. Threaded onto the started spec's
+    /// [`crate::model::ContainerSpec::checkpoint_captured_cmdline`] unchanged;
+    /// `None` for every ordinarily-built `Container`. See that field's own doc for
+    /// the full story.
+    checkpoint_captured_cmdline: Option<Vec<String>>,
     /// Test/module seam: overrides the named-checkpoint registry's cache dir —
     /// see [`Self::with_checkpoint_cache_dir_override`].
     checkpoint_cache_dir_override: Option<std::path::PathBuf>,
@@ -131,6 +138,7 @@ impl Container {
             checkpoint_ref: None,
             checkpoint_backend: None,
             checkpoint_captured_env: None,
+            checkpoint_captured_cmdline: None,
             checkpoint_cache_dir_override: None,
         }
     }
@@ -171,6 +179,12 @@ impl Container {
     /// `cp.spec.env` — an actual override attempt msb's `restore` has no flag to
     /// carry (a caller replaying the checkpoint's own captured env unchanged, the
     /// common case, is never refused: `restore` already replays it from disk).
+    /// Also carries over `cp.spec.checkpoint_captured_cmdline` — the guest
+    /// cmdline a checkpoint with no explicit `command` had captured at
+    /// checkpoint time (see that field's own doc) — unchanged, so a backend
+    /// whose restore boots the sandbox idle (microsandbox: `msb restore` only
+    /// brings the guest agent up, never the workload) still knows what to
+    /// re-run.
     pub fn from_checkpoint(cp: &Checkpoint) -> Container {
         let mut c = Container::new(&cp.checkpoint_ref);
         c.env = cp.spec.env.clone();
@@ -180,6 +194,7 @@ impl Container {
         c.checkpoint_ref = Some(cp.checkpoint_ref.clone());
         c.checkpoint_backend = Some(cp.backend.clone());
         c.checkpoint_captured_env = Some(cp.spec.env.clone());
+        c.checkpoint_captured_cmdline = cp.spec.checkpoint_captured_cmdline.clone();
         c
     }
 
@@ -597,6 +612,7 @@ impl Container {
             self.spec_customizer.as_deref(),
             self.reaper_cache_dir_override.as_deref(),
             self.checkpoint_ref.as_deref(),
+            self.checkpoint_captured_cmdline.as_deref(),
         )
         .await?;
 
@@ -693,6 +709,7 @@ async fn create_started_container(
     spec_customizer: Option<&SpecCustomizer>,
     reaper_cache_dir_override: Option<&std::path::Path>,
     checkpoint_ref: Option<&str>,
+    checkpoint_captured_cmdline: Option<&[String]>,
 ) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
     let mut quarantine = ConflictQuarantine(Vec::new());
@@ -724,6 +741,7 @@ async fn create_started_container(
             disk_limit_mb,
             tmpfs_root_mb,
             network_disabled,
+            checkpoint_captured_cmdline: checkpoint_captured_cmdline.map(<[String]>::to_vec),
         };
 
         if let Some(customizer) = spec_customizer {
@@ -1201,6 +1219,8 @@ async fn try_adopt(
         disk_limit_mb: container.disk_limit_mb,
         tmpfs_root_mb: container.tmpfs_root_mb,
         network_disabled: container.network_disabled,
+        // Same rationale as `checkpoint_ref` above.
+        checkpoint_captured_cmdline: None,
     };
 
     let Ok(Some(handle)) = backend.find_running(&adopted_spec).await else {
@@ -1299,6 +1319,7 @@ async fn create_and_start_reuse_sandbox(
             disk_limit_mb: container.disk_limit_mb,
             tmpfs_root_mb: container.tmpfs_root_mb,
             network_disabled: container.network_disabled,
+            checkpoint_captured_cmdline: None,
         };
         if let Some(customizer) = &container.spec_customizer {
             let lookup: std::collections::HashMap<u16, u16> =
@@ -1873,7 +1894,19 @@ impl ContainerGuard {
     ) -> Result<(String, ContainerSpec)> {
         let backend_ref = self.microsandbox_checkpoint_ref(nonce_or_name)?;
         let checkpoint_ref = self.backend.create_checkpoint(handle, &backend_ref).await?;
+        let mut spec = handle.spec().clone();
         if self.backend.capabilities().checkpoint_restarts_workload {
+            // Only a backend that actually restarts the workload ever captures a
+            // guest cmdline in the first place — see
+            // `SandboxBackend::last_checkpoint_captured_cmdline`'s own doc. Folded
+            // into the returned spec BEFORE the wait strategy runs (the wait
+            // strategy's own re-run below is what actually observes whatever
+            // `create_checkpoint` — including its own re-boot's phase-3 workload
+            // exec — already did; this is just carrying the capture result
+            // forward so a LATER restore from this same `Checkpoint`/registry
+            // entry knows what to run too).
+            spec.checkpoint_captured_cmdline =
+                self.backend.last_checkpoint_captured_cmdline(handle);
             if !self.network_links.is_empty() {
                 self.backend
                     .install_network_links(handle, &self.network_links)
@@ -1882,7 +1915,7 @@ impl ContainerGuard {
             let target = GuardWaitTarget { guard: self };
             self.wait_strategy.wait_until_ready(&target).await?;
         }
-        Ok((checkpoint_ref, handle.spec().clone()))
+        Ok((checkpoint_ref, spec))
     }
 
     /// Streams log lines to `consumer` as they're produced. Closing (or dropping) the
@@ -2458,6 +2491,11 @@ fn checkpoint_from_reduced(
             disk_limit_mb: None,
             tmpfs_root_mb: None,
             network_disabled: false,
+            // The one field `NamedRegistrySpec` IS extended with (an additive,
+            // internal one — see its own doc): real, not a placeholder, so a
+            // restore of a no-explicit-command checkpoint still knows what to
+            // run.
+            checkpoint_captured_cmdline: spec.captured_cmdline,
         },
     }
 }
@@ -3692,6 +3730,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                captured_cmdline: None,
             },
         }
     }
@@ -4288,6 +4327,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                captured_cmdline: None,
             },
         }
     }

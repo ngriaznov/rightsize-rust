@@ -131,17 +131,19 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 ///
 /// Carries over `-p` port mappings and `-m` memory (if set), matching [`run`].
 /// Deliberately does NOT carry over:
-/// - **env** — `restore` has no `-e`/`--env` flag at all. A restore of a
-///   disk-scope snapshot replays whatever configuration was captured on disk, so re-passing the
-///   captured spec's env (what `run --from-snapshot` used to do, via the same `-e`
-///   flags an ordinary boot gets) is now both impossible and redundant — `spec.env`
-///   simply never reaches this function's argv. `Container::start()`, one layer
-///   up, is what keeps that "redundant" from silently becoming "lossy": it
-///   refuses a `Container::from_checkpoint(...)` restore whose final `env` no
-///   longer matches the checkpoint's own captured one (a genuine `.with_env`/
+/// - **env** — `restore` itself has no `-e`/`--env` flag at all, so `spec.env`
+///   never reaches THIS argv. That no longer means the restored workload never
+///   sees it, though: `restore` only brings the guest agent up (verified live —
+///   the captured/default workload command does NOT re-run on its own), and
+///   [`crate::backend::try_restore_and_await_running`]'s own phase 3 re-starts
+///   the workload right after via [`exec_workload`], which DOES carry `spec.env`
+///   as repeated `-e` flags. `Container::start()`, one layer up, still refuses a
+///   `Container::from_checkpoint(...)` restore whose final `env` no longer
+///   matches the checkpoint's own captured one (a genuine `.with_env`/
 ///   `.remove_env` override, not just a replay) with a typed
-///   `RightsizeError::UnsupportedByBackend`, rather than booting here with the
-///   override silently dropped.
+///   `RightsizeError::UnsupportedByBackend` — that gate is about `restore`'s own
+///   disk-scope replay having no way to honor a CHANGED env, not about env
+///   reaching the workload at all.
 /// - **mounts** — `--mount-file` has no restore equivalent; restore's `-v`/
 ///   `--volume` is a different, unrelated concept (selecting a captured private
 ///   disk, or binding an external source), not this backend's host-file bind
@@ -314,6 +316,121 @@ pub fn exec(name: &str, cmd: &[String]) -> Vec<String> {
     argv
 }
 
+/// Builds the argv for `msb exec [-e KEY=value]... <name> -- <argv...>` — the
+/// workload-revival exec [`crate::backend::try_restore_and_await_running`] spawns
+/// as a LONG-LIVED attached child once a checkpoint restore reaches `Running`.
+/// Upstream's own `restore` (msb 0.7.1+) boots the sandbox with only `agentd`
+/// inside — the captured workload command never re-runs on its own, verified live
+/// — so this backend re-starts it itself, the same role a `run`'s trailing `--
+/// <command>` plays for an ordinary boot, but through `exec` since the sandbox is
+/// already running.
+///
+/// `env` pairs are emitted as repeated `-e KEY=value` flags, BEFORE the sandbox
+/// name (`msb exec --help`: `-e, --env <ENV>`, repeatable — same flag spelling as
+/// [`run`]'s own env, same "flags before the positional name" placement
+/// [`exec_stream`]'s `--stream` already uses). This is how a checkpoint's captured
+/// env reaches the revived workload even though [`restore`] itself has no
+/// `-e`/`--env` flag at all — see that function's own doc for why `restore` can't
+/// carry it and this can.
+pub fn exec_workload(name: &str, env: &[(String, String)], cmd: &[String]) -> Vec<String> {
+    let mut argv = vec!["exec".to_string()];
+    for (k, v) in env {
+        argv.push("-e".to_string());
+        argv.push(format!("{k}={v}"));
+    }
+    argv.push(name.to_string());
+    argv.push("--".to_string());
+    argv.extend(cmd.iter().cloned());
+    argv
+}
+
+/// Builds the argv for the guest cmdline capture msb `exec`:
+/// `msb exec <name> -- sh -c '<CAPTURE_CMDLINE_SCRIPT>'`, run once by
+/// `MsbCliBackend::create_checkpoint` — via `msb_checkpoint_cycle` — right BEFORE
+/// stopping the source sandbox, and only when the checkpoint's own spec has no
+/// explicit `command` (see [`CAPTURE_CMDLINE_SCRIPT`]'s own doc for what the
+/// script does and [`parse_captured_cmdline`] for how its stdout is read back).
+pub fn capture_workload_cmdline(name: &str) -> Vec<String> {
+    exec(
+        name,
+        &[
+            "sh".to_string(),
+            "-c".to_string(),
+            CAPTURE_CMDLINE_SCRIPT.to_string(),
+        ],
+    )
+}
+
+/// A small POSIX-`sh` script, deliberately using no non-`sh`-builtin tool beyond
+/// `cat` and `sed` (both present on the busybox-based guest images `msb` boots —
+/// no `awk`/`cut`/`pgrep`/`ps` assumed), that finds the first non-kernel child of
+/// PID 1 and prints its `/proc/<pid>/cmdline` — the workload command a checkpoint
+/// with no explicit `command` was actually running, straight from the guest's own
+/// process table, since that's the only place it still exists once the container
+/// was booted from the image's default entrypoint rather than a caller-supplied
+/// override.
+///
+/// For each numeric `/proc/<pid>`: reads `stat`, extracts `comm` (the text between
+/// the FIRST `(` and the LAST `)` — the kernel's own convention for a name that may
+/// itself contain spaces or parens) and, from what follows it, the `ppid` field
+/// (`/proc/<pid>/stat`'s field 4 in the conventional 1-indexed numbering: pid, comm,
+/// state, ppid, ...). Skips `init.krun` (msb's own guest init, the direct parent of
+/// everything else including this exec's own shell) and anything whose `comm` is
+/// itself bracketed (`[kworker/0:1]`-style — the kernel's own convention for marking
+/// a kernel thread, as opposed to `init.krun`'s plain unbracketed name) — neither is
+/// ever the workload. The first pid whose `ppid` is `1` and that survives those two
+/// exclusions is printed via `cat /proc/<pid>/cmdline`, NUL-separated exactly as the
+/// kernel writes it (never re-joined or re-quoted, so [`parse_captured_cmdline`] can
+/// split on `\0` byte-for-byte); `exec` hands the whole script process over to `cat`
+/// so its exit status is `cat`'s.
+///
+/// Not itself a byte-for-byte replacement for `ps`/`pgrep` (skips setuid concerns,
+/// multiple non-kernel children, zombies) — deliberately minimal for exactly the
+/// shape a checkpointed container's guest actually has: `init.krun`, some kernel
+/// threads, and ONE workload process tree, since `ContainerSpec` never runs more
+/// than one top-level command to begin with.
+pub const CAPTURE_CMDLINE_SCRIPT: &str = concat!(
+    "for d in /proc/[0-9]*; do ",
+    "[ -r \"$d/stat\" ] || continue; ",
+    "stat=$(cat \"$d/stat\") || continue; ",
+    "comm=$(printf '%s' \"$stat\" | sed -n 's/^[0-9]*[[:space:]]*(\\(.*\\))[[:space:]].*/\\1/p'); ",
+    "case \"$comm\" in ",
+    "init.krun|'['*']') continue ;; ",
+    "esac; ",
+    "rest=$(printf '%s' \"$stat\" | sed 's/^[0-9]*[[:space:]]*(.*)[[:space:]]*//'); ",
+    "set -- $rest; ",
+    "ppid=$2; ",
+    "if [ \"$ppid\" = \"1\" ]; then ",
+    "pid=${d#/proc/}; ",
+    "exec cat \"/proc/$pid/cmdline\"; ",
+    "fi; ",
+    "done",
+);
+
+/// Parses [`CAPTURE_CMDLINE_SCRIPT`]'s stdout back into a `Vec<String>`. The exec
+/// invocation that captured it (`MsbCliBackend::invoke`/`invoke_standalone`, which
+/// this always goes through) buffers output a LINE at a time and re-appends a `\n`
+/// after whatever it captured — including the final flush at EOF, which is what
+/// this sees for output that (like the script's own, NUL-separated) never
+/// contained a `\n` to begin with — so a single trailing `\n` is stripped first,
+/// never required.
+///
+/// What's left is split on `\0`, exactly as the kernel wrote
+/// `/proc/<pid>/cmdline` — every `argv` element NUL-terminated, including the
+/// last, so splitting always yields one trailing empty segment that's dropped
+/// (never more than one: a real empty-string argument elsewhere in `argv` is
+/// preserved). `None` for anything that isn't a genuine, non-empty argv after
+/// that — empty output (no matching process; the script found nothing) or a bare
+/// NUL terminator with nothing before it.
+pub fn parse_captured_cmdline(stdout: &str) -> Option<Vec<String>> {
+    let trimmed = stdout.strip_suffix('\n').unwrap_or(stdout);
+    let mut argv: Vec<String> = trimmed.split('\0').map(str::to_string).collect();
+    if argv.last().is_some_and(String::is_empty) {
+        argv.pop();
+    }
+    if argv.is_empty() { None } else { Some(argv) }
+}
+
 /// Builds the argv for `msb exec --stream` — the only guest data path microsandbox
 /// exposes, used exclusively by the exec-tunnel network-link emulation.
 pub fn exec_stream(name: &str, cmd: &[String]) -> Vec<String> {
@@ -424,6 +541,7 @@ mod tests {
             disk_limit_mb: None,
             tmpfs_root_mb: None,
             network_disabled: false,
+            checkpoint_captured_cmdline: None,
         }
     }
 
@@ -770,6 +888,113 @@ mod tests {
             snapshot_inspect("rz-ckpt-deadbeefcafe"),
             vec!["snapshot", "inspect", "rz-ckpt-deadbeefcafe"]
         );
+    }
+
+    #[test]
+    fn exec_workload_emits_dash_e_pairs_before_the_name_then_dash_dash_and_the_argv() {
+        let cmd = exec_workload(
+            "rz-abc-1",
+            &[
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+            &[
+                "redis-server".to_string(),
+                "--port".to_string(),
+                "6379".to_string(),
+            ],
+        );
+        assert_eq!(
+            cmd,
+            vec![
+                "exec",
+                "-e",
+                "A=1",
+                "-e",
+                "B=2",
+                "rz-abc-1",
+                "--",
+                "redis-server",
+                "--port",
+                "6379",
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_workload_with_no_env_omits_dash_e_entirely() {
+        let cmd = exec_workload("rz-abc-1", &[], &["true".to_string()]);
+        assert_eq!(cmd, vec!["exec", "rz-abc-1", "--", "true"]);
+        assert!(!cmd.contains(&"-e".to_string()));
+    }
+
+    #[test]
+    fn capture_workload_cmdline_execs_sh_c_with_the_capture_script() {
+        let cmd = capture_workload_cmdline("rz-abc-1");
+        assert_eq!(
+            cmd,
+            vec!["exec", "rz-abc-1", "--", "sh", "-c", CAPTURE_CMDLINE_SCRIPT]
+        );
+        // Every branch this script depends on must actually be present — a
+        // regression here would silently turn the capture into a no-op.
+        assert!(CAPTURE_CMDLINE_SCRIPT.contains("/proc/"));
+        assert!(CAPTURE_CMDLINE_SCRIPT.contains("init.krun"));
+        assert!(CAPTURE_CMDLINE_SCRIPT.contains("cmdline"));
+    }
+
+    #[test]
+    fn parse_captured_cmdline_splits_on_nul_and_drops_the_terminator() {
+        assert_eq!(
+            parse_captured_cmdline("redis-server\0--port\x006379\0\n"),
+            Some(vec![
+                "redis-server".to_string(),
+                "--port".to_string(),
+                "6379".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_captured_cmdline_tolerates_a_missing_trailing_newline_or_nul() {
+        // Not every capture goes through the line-draining `\n` normalization the
+        // same way, and a `cmdline` file is not strictly guaranteed to end in a
+        // NUL on every kernel — both shapes must still parse.
+        assert_eq!(
+            parse_captured_cmdline("redis-server\0--port\x006379"),
+            Some(vec![
+                "redis-server".to_string(),
+                "--port".to_string(),
+                "6379".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_captured_cmdline_preserves_a_genuine_empty_argument() {
+        // Only ONE trailing empty segment (the NUL terminator) is ever dropped —
+        // a real empty-string argument elsewhere in argv must survive.
+        assert_eq!(
+            parse_captured_cmdline("prog\0\0arg\0\n"),
+            Some(vec!["prog".to_string(), String::new(), "arg".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_captured_cmdline_is_none_when_the_script_found_no_process_at_all() {
+        // The script's own "found nothing" output — no matching pid, so it never
+        // reaches its `cat`. Neither shape carries a NUL at all.
+        assert_eq!(parse_captured_cmdline(""), None);
+        assert_eq!(parse_captured_cmdline("\n"), None);
+    }
+
+    #[test]
+    fn parse_captured_cmdline_a_lone_nul_is_one_empty_argument_not_nothing() {
+        // Never produced by the real script (a process always has a non-empty
+        // argv0), but the parser's own rule is consistent either way: exactly
+        // ONE trailing NUL terminator is dropped, so what's left of a lone NUL
+        // is a single empty-string argument, not "nothing captured".
+        assert_eq!(parse_captured_cmdline("\0"), Some(vec![String::new()]));
+        assert_eq!(parse_captured_cmdline("\0\n"), Some(vec![String::new()]));
     }
 
     #[test]
