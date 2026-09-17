@@ -98,7 +98,14 @@ reaches its first tagged release.
   user-visible ref-SHAPE change on a freshly imported checkpoint (an absolute
   path under `checkpoints/`, not a `sha256-<hex>`-style name) — refs stay opaque
   either way, and `Container::from_checkpoint` restores from either shape
-  identically.
+  identically. The "artifact path on stdout's last line" shape is verified live
+  only for a FRESH, successful `load`; what `load` prints on an "already
+  exists" outcome (still tolerated as success, same as the pre-0.7.1 `import`
+  verb) is not independently verified, so `import_checkpoint` tries that same
+  stdout parse first and, only if it finds nothing, falls back to pulling the
+  path out of the `error: snapshot already exists: <path>` stderr line the
+  pre-0.7.1 code relied on — covering both possible shapes instead of assuming
+  one.
 
 ## [0.7.9] - 2026-09-10
 

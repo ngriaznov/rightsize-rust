@@ -567,6 +567,23 @@ fn parse_snapshot_load_ref(stdout: &str) -> Option<String> {
     parse_last_line_as_absolute_path(stdout)
 }
 
+/// Fallback for [`msb_import_checkpoint_cycle`]'s "already exists" outcome when
+/// [`parse_snapshot_load_ref`] finds nothing on stdout: pulls the artifact path
+/// out of msb's `error: snapshot already exists: <path>` stderr line (see
+/// [`is_snapshot_already_exists`]) the same way the pre-0.7.1 `import` verb's
+/// digest-dir parse did — the LAST whitespace-separated token on the last
+/// non-empty line, required to parse as an absolute path. Unlike
+/// [`parse_last_line_as_absolute_path`], the line itself does not have to be
+/// nothing but the path, since here it is always prefixed with msb's own
+/// `error: snapshot already exists:` wording.
+fn parse_already_exists_stderr_ref(stderr: &str) -> Option<String> {
+    let last_line = stderr.lines().rev().find(|line| !line.trim().is_empty())?;
+    let candidate = last_line.split_whitespace().last()?;
+    Path::new(candidate)
+        .is_absolute()
+        .then(|| candidate.to_string())
+}
+
 /// Before retrying a boot that hit msb's state-database error — enough for a winning
 /// concurrent invocation's migration transaction to commit; the retry's own `msb run`
 /// startup dwarfs this either way.
@@ -2092,8 +2109,7 @@ fn msb_export_checkpoint_cycle(
 /// [`msb_checkpoint_cycle`]'s own shape, so this orchestration is unit-testable
 /// without a real `msb` binary), treating msb's "already exists" wording as
 /// success (see [`is_snapshot_already_exists`]) the same as the pre-0.7.1 `import`
-/// verb did. Returns the loaded artifact's own absolute path — parsed from
-/// stdout's last line, see [`parse_snapshot_load_ref`] — as
+/// verb did. Returns the loaded artifact's own absolute path as
 /// [`MsbCliBackend::import_checkpoint`]'s effective ref.
 ///
 /// **No `snapshot list` round trip any more.** Earlier msb releases' `import`
@@ -2101,23 +2117,38 @@ fn msb_export_checkpoint_cycle(
 /// separately confirmed against `msb snapshot list --format json`'s output; msb
 /// 0.7.1's `load` prints the artifact's own full path directly (the same
 /// "parse the printed path" contract [`msb_checkpoint_cycle`]'s `snapshot create`
-/// step already uses), so there is nothing left to resolve — the printed path IS
-/// the ref, and a `list` call would only be extra round-trip cost for no benefit.
+/// step already uses) for a fresh, successful load, so nothing needs resolving
+/// via `list` in that case.
+///
+/// **Ref resolution, and the one thing that is NOT verified.** A fresh,
+/// successful `load` (exit 0) printing the group/digest/path lines to stdout,
+/// last line the artifact's own absolute path, is empirically verified against a
+/// real msb 0.7.1 binary — see [`parse_snapshot_load_ref`]. What `load` prints
+/// on an "already exists" outcome (nonzero exit, tolerated as success) is NOT
+/// verified: the pre-0.7.1 `import` verb it replaces put that path only in the
+/// `error: snapshot already exists: <path>` stderr line, with stdout empty, so
+/// this still tries `parse_snapshot_load_ref` on stdout first (covering the
+/// possibility that `load` prints its usual group/digest/path lines up front
+/// even when it then exits nonzero) and, only if that finds nothing, falls back
+/// to pulling the path out of the "already exists" stderr line the same way the
+/// pre-0.7.1 code did (see [`parse_already_exists_stderr_ref`]). Both shapes are
+/// covered by tests; a real msb 0.7.1 binary should confirm which one it
+/// actually uses before this ships.
 ///
 /// Failure handling: an import failure that ISN'T "already exists" surfaces with
 /// its stderr, never touching stdout. A successful (or already-exists) import
-/// whose stdout has no parseable absolute last line surfaces its own actionable
-/// error quoting the raw output, rather than trusting garbage.
+/// for which NEITHER stdout NOR (on "already exists") the stderr line yields a
+/// parseable absolute path surfaces its own actionable error quoting the raw
+/// output, rather than trusting garbage.
 fn msb_import_checkpoint_cycle(
     invoke_import: &mut dyn FnMut() -> Result<ExecResult>,
 ) -> Result<String> {
     let import_result = invoke_import()?;
-    if import_result.exit_code != 0
-        && !is_snapshot_already_exists(&format!(
-            "{}\n{}",
-            import_result.stdout, import_result.stderr
-        ))
-    {
+    let already_exists = is_snapshot_already_exists(&format!(
+        "{}\n{}",
+        import_result.stdout, import_result.stderr
+    ));
+    if import_result.exit_code != 0 && !already_exists {
         return Err(RightsizeError::Backend(format!(
             "msb snapshot load failed (exit {}): {}",
             import_result.exit_code,
@@ -2125,13 +2156,21 @@ fn msb_import_checkpoint_cycle(
         )));
     }
 
-    parse_snapshot_load_ref(&import_result.stdout).ok_or_else(|| {
-        RightsizeError::Backend(format!(
-            "msb snapshot load succeeded but its stdout did not end with a recognizable \
-             absolute artifact path\nraw stdout:\n{}",
-            import_result.stdout,
-        ))
-    })
+    if let Some(ref_path) = parse_snapshot_load_ref(&import_result.stdout) {
+        return Ok(ref_path);
+    }
+    if already_exists {
+        if let Some(ref_path) = parse_already_exists_stderr_ref(&import_result.stderr) {
+            return Ok(ref_path);
+        }
+    }
+
+    Err(RightsizeError::Backend(format!(
+        "msb snapshot load succeeded but its stdout did not end with a recognizable absolute \
+         artifact path, and no fallback path was found in stderr either\nraw stdout:\n{}\nraw \
+         stderr:\n{}",
+        import_result.stdout, import_result.stderr,
+    )))
 }
 
 /// Waits (bounded by [`ATTACHED_STOP_TIMEOUT`]) for an already-signalled-to-stop
@@ -3059,6 +3098,42 @@ mod tests {
         assert_eq!(parse_snapshot_load_ref(""), None);
     }
 
+    // ---- parse_already_exists_stderr_ref: the untested "already exists"
+    // fallback, restoring the pre-0.7.1-verified stderr-only shape ----
+
+    #[test]
+    fn parse_already_exists_stderr_ref_takes_the_trailing_path_on_the_error_line() {
+        let artifact = std::env::temp_dir()
+            .join("checkpoints")
+            .join("msb-deadbeef")
+            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
+        assert_eq!(
+            parse_already_exists_stderr_ref(&format!(
+                "error: snapshot already exists: {}",
+                artifact.display()
+            )),
+            Some(artifact.display().to_string())
+        );
+    }
+
+    #[test]
+    fn parse_already_exists_stderr_ref_none_when_the_trailing_token_is_not_absolute() {
+        assert_eq!(
+            parse_already_exists_stderr_ref("error: snapshot already exists: relative/path"),
+            None
+        );
+        assert_eq!(
+            parse_already_exists_stderr_ref("just some prose, no path"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_already_exists_stderr_ref_none_on_entirely_blank_output() {
+        assert_eq!(parse_already_exists_stderr_ref(""), None);
+        assert_eq!(parse_already_exists_stderr_ref("\n\n"), None);
+    }
+
     // ---- parse_snapshot_create_ref: msb 0.7.1's dest-dir artifact path, parsed
     // back out of `snapshot create`'s own stdout ----
     //
@@ -3147,7 +3222,7 @@ mod tests {
     }
 
     #[test]
-    fn msb_import_checkpoint_cycle_treats_already_exists_as_success() {
+    fn msb_import_checkpoint_cycle_treats_already_exists_as_success_when_stdout_has_the_path() {
         let artifact = std::env::temp_dir()
             .join("checkpoints")
             .join("msb-deadbeef")
@@ -3171,6 +3246,60 @@ mod tests {
             artifact.display().to_string(),
             "an already-exists import is success for a content-addressed archive, resolving to \
              the same artifact path a fresh import would"
+        );
+    }
+
+    /// The UNVERIFIED branch: if `load` on an "already exists" outcome turns out
+    /// to behave the way the pre-0.7.1 `import` verb did — nothing usable on
+    /// stdout, the path only in the `error: snapshot already exists: <path>`
+    /// stderr line — the cycle must still resolve the ref via
+    /// [`parse_already_exists_stderr_ref`] rather than failing outright. This is
+    /// the previously-established shape this branch restores coverage for; see
+    /// [`msb_import_checkpoint_cycle`]'s own doc.
+    #[test]
+    fn msb_import_checkpoint_cycle_already_exists_falls_back_to_stderr_when_stdout_has_no_path() {
+        let artifact = std::env::temp_dir()
+            .join("checkpoints")
+            .join("msb-deadbeef")
+            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("error: snapshot already exists: {}", artifact.display()),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import)
+        };
+        assert_eq!(
+            result.unwrap(),
+            artifact.display().to_string(),
+            "an already-exists import with an empty stdout must still resolve the ref, parsed \
+             off the \"already exists\" stderr line the same way the pre-0.7.1 `import` verb did"
+        );
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_already_exists_with_no_path_anywhere_fails_with_a_clear_error() {
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "error: snapshot already exists: relative/looking/path".to_string(),
+                })
+            };
+            msb_import_checkpoint_cycle(&mut invoke_import)
+        };
+        let err = result.expect_err(
+            "an already-exists outcome with no parseable absolute path on either stream must \
+             never resolve to a bogus ref",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("did not end with a recognizable"),
+            "{message}"
         );
     }
 
@@ -3923,30 +4052,42 @@ mod tests {
 
     // ---- checkpoint-archive export/import against a fake msb binary ----
 
-    /// The loaded artifact path the fake `snapshot load` case always prints as its
-    /// stdout's last line, regardless of `import_exit_code`/`import_stderr` — msb
-    /// 0.7.1 prints the group/digest/path lines up front either way (see
-    /// `write_fake_msb_for_archives`'s own doc), so an "already exists" run gets
-    /// the identical path a fresh one would.
+    /// The loaded artifact path a fake `snapshot load` prints, when it prints one
+    /// at all — see [`fake_load_stdout_with_path`] and
+    /// [`write_fake_msb_for_archives`]'s own doc for why an "already exists" run
+    /// does NOT always get this on stdout the way a fresh one does.
     #[cfg(unix)]
     const FAKE_LOADED_ARTIFACT_PATH: &str =
         "/home/u/.microsandbox/checkpoints/msb-fakegroup1234/snap_fakedigest1234fakedigest1234";
 
+    /// The stdout a fresh, successful `snapshot load` empirically prints against
+    /// a real msb 0.7.1 binary: a `group ...: head ... (Initialized)` line, a
+    /// digest line, then the loaded artifact's absolute path as the LAST line.
+    #[cfg(unix)]
+    fn fake_load_stdout_with_path() -> String {
+        format!(
+            "group msb-fakegroup1234: head snap_fakedigest1234fakedigest1234 (Initialized)\n\
+             digest: sha256:fakedigest1234fakedigest1234fulldigesthere\n{FAKE_LOADED_ARTIFACT_PATH}\n"
+        )
+    }
+
     /// Writes a stub `msb` replacement that answers `snapshot save` and `snapshot
     /// load` — the two subcommands `export_checkpoint`/`import_checkpoint` drive
     /// on msb 0.7.1 (no more `snapshot list` round trip — see
-    /// `msb_import_checkpoint_cycle`'s doc for why). `import_exit_code`/
-    /// `import_stderr` let a test choose between a fresh-import success (exit 0)
-    /// and an already-exists "success" (nonzero exit, msb's own wording on
-    /// stderr) — both of which [`MsbCliBackend::import_checkpoint`] must resolve
-    /// to the same effective ref, [`FAKE_LOADED_ARTIFACT_PATH`]. `load`'s stdout
-    /// mirrors msb 0.7.1's own verified shape: a `group ...: head ... (Initialized)`
-    /// line, a digest line, then the loaded artifact's absolute path as the LAST
-    /// line.
+    /// `msb_import_checkpoint_cycle`'s doc for why). `import_exit_code` lets a
+    /// test choose between a fresh-import success (exit 0) and an already-exists
+    /// "success" (nonzero exit, msb's own wording on `import_stderr`) — both of
+    /// which [`MsbCliBackend::import_checkpoint`] must resolve to an effective
+    /// ref. `import_stdout` is passed through verbatim (typically
+    /// [`fake_load_stdout_with_path`] for a case known to print the artifact
+    /// path, or `""` for the UNVERIFIED already-exists case where msb might
+    /// print nothing useful on stdout — see [`msb_import_checkpoint_cycle`]'s own
+    /// doc on why that branch is not assumed away).
     #[cfg(unix)]
     fn write_fake_msb_for_archives(
         dir: &Path,
         import_exit_code: u8,
+        import_stdout: &str,
         import_stderr: &str,
     ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -3960,9 +4101,7 @@ mod tests {
              ;;\n\
              \"snapshot load\")\n\
              echo '{import_stderr}' 1>&2\n\
-             echo 'group msb-fakegroup1234: head snap_fakedigest1234fakedigest1234 (Initialized)'\n\
-             echo 'digest: sha256:fakedigest1234fakedigest1234fulldigesthere'\n\
-             echo '{FAKE_LOADED_ARTIFACT_PATH}'\n\
+             printf '%s' '{import_stdout}'\n\
              exit {import_exit_code}\n\
              ;;\n\
              esac\n\
@@ -3979,7 +4118,7 @@ mod tests {
     #[tokio::test]
     async fn export_checkpoint_and_import_checkpoint_round_trip_via_a_fake_msb_binary() {
         let dir = unique_test_dir("archive-fake-binary-fresh");
-        let script = write_fake_msb_for_archives(&dir, 0, "");
+        let script = write_fake_msb_for_archives(&dir, 0, &fake_load_stdout_with_path(), "");
         let backend = MsbCliBackend::new(script);
 
         let dest = dir.join("cp.archive-payload");
@@ -4013,6 +4152,7 @@ mod tests {
         let script = write_fake_msb_for_archives(
             &dir,
             1,
+            &fake_load_stdout_with_path(),
             &format!("error: snapshot already exists: {FAKE_LOADED_ARTIFACT_PATH}"),
         );
         let backend = MsbCliBackend::new(script);
@@ -4023,6 +4163,37 @@ mod tests {
             .expect(
                 "an already-exists import must resolve exactly like a fresh one, not surface \
                  as an error",
+            );
+        assert_eq!(effective_ref, FAKE_LOADED_ARTIFACT_PATH);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The UNVERIFIED-against-a-real-binary branch, exercised end to end: an
+    /// "already exists" `load` that (like the pre-0.7.1 `import` verb it
+    /// replaces) prints nothing usable on stdout, with the artifact path only in
+    /// the `error: snapshot already exists: <path>` stderr line. Must still
+    /// resolve to the same ref a fresh import would — see
+    /// `parse_already_exists_stderr_ref` and `msb_import_checkpoint_cycle`'s own
+    /// doc for why this fallback exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_checkpoint_already_exists_with_empty_stdout_falls_back_to_stderr() {
+        let dir = unique_test_dir("archive-fake-binary-exists-stderr-only");
+        let script = write_fake_msb_for_archives(
+            &dir,
+            1,
+            "",
+            &format!("error: snapshot already exists: {FAKE_LOADED_ARTIFACT_PATH}"),
+        );
+        let backend = MsbCliBackend::new(script);
+
+        let effective_ref = backend
+            .import_checkpoint(Path::new("/does/not/matter/for/this/stub"), "whatever-ref")
+            .await
+            .expect(
+                "an already-exists import with nothing useful on stdout must still resolve via \
+                 the stderr fallback, not surface as an error",
             );
         assert_eq!(effective_ref, FAKE_LOADED_ARTIFACT_PATH);
 
