@@ -375,14 +375,21 @@ pub fn capture_workload_cmdline(name: &str) -> Vec<String> {
 /// itself contain spaces or parens) and, from what follows it, the `ppid` field
 /// (`/proc/<pid>/stat`'s field 4 in the conventional 1-indexed numbering: pid, comm,
 /// state, ppid, ...). Skips `init.krun` (msb's own guest init, the direct parent of
-/// everything else including this exec's own shell) and anything whose `comm` is
+/// everything else including this exec's own shell), anything whose `comm` is
 /// itself bracketed (`[kworker/0:1]`-style — the kernel's own convention for marking
-/// a kernel thread, as opposed to `init.krun`'s plain unbracketed name) — neither is
-/// ever the workload. The first pid whose `ppid` is `1` and that survives those two
-/// exclusions is printed via `cat /proc/<pid>/cmdline`, NUL-separated exactly as the
-/// kernel writes it (never re-joined or re-quoted, so [`parse_captured_cmdline`] can
-/// split on `\0` byte-for-byte); `exec` hands the whole script process over to `cat`
-/// so its exit status is `cat`'s.
+/// a kernel thread, as opposed to `init.krun`'s plain unbracketed name), and — before
+/// either of those — the script's OWN pid (`/proc/$$`, checked first so a self-match
+/// never even reads its own `stat`). That self-exclusion matters because this script
+/// runs as `msb exec <name> -- sh -c '<script>'`: it is itself injected as a new
+/// child of PID 1 into the very process set it is walking, and the plain `for d in
+/// /proc/[0-9]*` glob visits pids in lexicographic string order, not spawn order — so
+/// without the exclusion this shell could discover itself before the real workload
+/// and capture its own `sh -c <script>` invocation instead. None of the three
+/// exclusions is ever the workload. The first pid whose `ppid` is `1` and that
+/// survives all three is printed via `cat /proc/<pid>/cmdline`, NUL-separated exactly
+/// as the kernel writes it (never re-joined or re-quoted, so [`parse_captured_cmdline`]
+/// can split on `\0` byte-for-byte); `exec` hands the whole script process over to
+/// `cat` so its exit status is `cat`'s.
 ///
 /// Not itself a byte-for-byte replacement for `ps`/`pgrep` (skips setuid concerns,
 /// multiple non-kernel children, zombies) — deliberately minimal for exactly the
@@ -391,6 +398,7 @@ pub fn capture_workload_cmdline(name: &str) -> Vec<String> {
 /// than one top-level command to begin with.
 pub const CAPTURE_CMDLINE_SCRIPT: &str = concat!(
     "for d in /proc/[0-9]*; do ",
+    "[ \"$d\" = \"/proc/$$\" ] && continue; ",
     "[ -r \"$d/stat\" ] || continue; ",
     "stat=$(cat \"$d/stat\") || continue; ",
     "comm=$(printf '%s' \"$stat\" | sed -n 's/^[0-9]*[[:space:]]*(\\(.*\\))[[:space:]].*/\\1/p'); ",
@@ -940,6 +948,101 @@ mod tests {
         assert!(CAPTURE_CMDLINE_SCRIPT.contains("/proc/"));
         assert!(CAPTURE_CMDLINE_SCRIPT.contains("init.krun"));
         assert!(CAPTURE_CMDLINE_SCRIPT.contains("cmdline"));
+        assert!(
+            CAPTURE_CMDLINE_SCRIPT.contains("/proc/$$"),
+            "must exclude the script's own pid — it runs as a new sibling child of \
+             PID 1 in the exact process set it walks (msb exec <name> -- sh -c \
+             '<script>'), so without this the lexicographic /proc/[0-9]* glob order \
+             can land on the capture script's own `sh` before the real workload"
+        );
+    }
+
+    /// Regression test for the finding that the capture script can discover ITSELF
+    /// instead of the real workload: it runs as `msb exec <name> -- sh -c '<script>'`,
+    /// which injects a new sibling child of PID 1 into the very process set the
+    /// script walks, and `for d in /proc/[0-9]*` visits entries in lexicographic
+    /// order, not spawn order. This drives a real `sh` over a fake `/proc`-shaped
+    /// tree — substituting the literal `"/proc"` prefix for a temp directory (the
+    /// only way the script ever names it), so the parsing and exclusion logic under
+    /// test is exactly [`CAPTURE_CMDLINE_SCRIPT`], untouched — with two `ppid == 1`
+    /// candidates: the script's own `$$` and the real workload, with the workload's
+    /// fake pid chosen to sort lexicographically AFTER any pid a real OS could hand
+    /// `sh` (max ~7 digits even at Linux's largest configurable `pid_max`), so
+    /// without the `/proc/$$` exclusion the self-match would always be visited first
+    /// and this test would fail.
+    #[test]
+    #[cfg(unix)]
+    fn capture_workload_cmdline_script_never_captures_its_own_invocation() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!(
+            "rightsize-capture-cmdline-it-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake /proc root");
+        let root_str = root.to_str().expect("temp dir path is valid UTF-8");
+        let script = CAPTURE_CMDLINE_SCRIPT.replace("/proc", root_str);
+
+        // The real workload: ppid 1, a plain (unbracketed, non-"init.krun") comm.
+        let workload_dir = root.join("999999999");
+        std::fs::create_dir_all(&workload_dir).unwrap();
+        std::fs::write(
+            workload_dir.join("stat"),
+            "999999999 (workload) S 1 999999999 999999999 0 -1",
+        )
+        .unwrap();
+        std::fs::write(workload_dir.join("cmdline"), b"workload\0--flag\0value\0").unwrap();
+
+        // init.krun and a kernel thread — both must be skipped by name regardless of
+        // where they sort.
+        std::fs::create_dir_all(root.join("1")).unwrap();
+        std::fs::write(root.join("1").join("stat"), "1 (init.krun) S 0 1 1 0 -1").unwrap();
+        std::fs::write(root.join("1").join("cmdline"), b"init.krun\0").unwrap();
+        std::fs::create_dir_all(root.join("2")).unwrap();
+        std::fs::write(
+            root.join("2").join("stat"),
+            "2 ([kworker/0:1]) S 1 2 2 0 -1",
+        )
+        .unwrap();
+        std::fs::write(root.join("2").join("cmdline"), b"").unwrap();
+
+        // The fixture that fabricates the script's OWN entry runs in the exact same
+        // `sh` process as the script itself (one combined `-c` argument), so `$$`
+        // inside the fixture and inside the script are the identical pid — the only
+        // way to reproduce "the capture script discovers itself" deterministically,
+        // since a separate shell's pid can't be known ahead of time.
+        let fixture = format!(
+            "selfdir=\"{root_str}/$$\"; mkdir -p \"$selfdir\"; \
+             printf '%s (sh) S 1 %s %s 0 -1' \"$$\" \"$$\" \"$$\" > \"$selfdir/stat\"; \
+             printf 'sh\\0-c\\0<the-capture-script-itself>\\0' > \"$selfdir/cmdline\"; "
+        );
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{fixture}{script}"))
+            .output()
+            .expect("spawn sh");
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {output:?}"
+        );
+        assert_eq!(
+            parse_captured_cmdline(&String::from_utf8_lossy(&output.stdout)),
+            Some(vec![
+                "workload".to_string(),
+                "--flag".to_string(),
+                "value".to_string(),
+            ]),
+            "must capture the real workload's cmdline, never the capture script's own \
+             `sh -c` invocation — even though the script's own pid directory sorts \
+             before the workload's fake one"
+        );
     }
 
     #[test]
