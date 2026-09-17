@@ -846,10 +846,15 @@ async fn require_isolation_gates_start_per_backend_hardware_isolation() {
 // ============================ checkpoint / restore =================================
 
 /// checkpoint contract: both real backends succeed and return a well-formed,
-/// backend-specific ref — docker tags `rightsize/checkpoint:<12hex>`, microsandbox
-/// mints an absolute `<cache_dir>/checkpoints/rz-ckpt-<12hex>` artifact path (the
-/// snapshot is created there via `--dest-dir` and restored by path) — and
-/// `Checkpoint::backend` names the backend that created it. Cleans up via
+/// backend-specific ref — docker tags `rightsize/checkpoint:<12hex>`; microsandbox
+/// (msb 0.7.1's dest-dir snapshot store, verified live) mints an absolute path
+/// SOMEWHERE under `<cache_dir>/checkpoints`, with an msb-minted `snap_<hex-digest>`
+/// basename — never `<cache_dir>/checkpoints/rz-ckpt-<12hex>` directly: the
+/// artifact nests one level deeper, under the source sandbox's own name, and the
+/// `rz-ckpt-<12hex>` name this checkpoint was taken under never appears in the
+/// path at all, only in msb's own index (`rightsize-msb`'s backend parses
+/// `snapshot create`'s stdout for the real artifact path — see its own doc for
+/// why). `Checkpoint::backend` names the backend that created it. Cleans up via
 /// `SandboxBackend::remove_checkpoint` (SPI-only — no shelling out to either CLI
 /// directly), keeping shared CI backend state clean.
 #[tokio::test]
@@ -868,16 +873,22 @@ async fn checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specifi
         .expect("checkpoint must succeed on both real backends");
     assert_eq!(cp.backend, backend_name);
 
-    let artifact_name = if backend_name == "docker" {
-        cp.checkpoint_ref
+    if backend_name == "docker" {
+        let artifact_name = cp
+            .checkpoint_ref
             .strip_prefix("rightsize/checkpoint:")
             .unwrap_or_else(|| {
                 panic!(
                     "expected the rightsize/checkpoint: prefix, got {}",
                     cp.checkpoint_ref
                 )
-            })
-            .to_string()
+            });
+        assert_eq!(artifact_name.len(), 12, "{}", cp.checkpoint_ref);
+        assert!(
+            artifact_name.chars().all(|c| c.is_ascii_hexdigit()),
+            "{}",
+            cp.checkpoint_ref
+        );
     } else {
         let ref_path = std::path::Path::new(&cp.checkpoint_ref);
         assert!(
@@ -885,26 +896,26 @@ async fn checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specifi
             "expected an absolute artifact path ref, got {}",
             cp.checkpoint_ref
         );
-        assert_eq!(
-            ref_path.parent().and_then(|p| p.file_name()),
-            Some(std::ffi::OsStr::new("checkpoints")),
-            "expected the ref to sit in a 'checkpoints' dir: {}",
+        assert!(
+            ref_path
+                .ancestors()
+                .any(|a| a.file_name() == Some(std::ffi::OsStr::new("checkpoints"))),
+            "expected the ref to nest somewhere under a 'checkpoints' dir: {}",
             cp.checkpoint_ref
         );
-        let name = ref_path
+        let basename = ref_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_else(|| panic!("unreadable artifact name in {}", cp.checkpoint_ref));
-        name.strip_prefix("rz-ckpt-")
-            .unwrap_or_else(|| panic!("expected the rz-ckpt- prefix, got {}", cp.checkpoint_ref))
-            .to_string()
-    };
-    assert_eq!(artifact_name.len(), 12, "{}", cp.checkpoint_ref);
-    assert!(
-        artifact_name.chars().all(|c| c.is_ascii_hexdigit()),
-        "{}",
-        cp.checkpoint_ref
-    );
+        let digest = basename
+            .strip_prefix("snap_")
+            .unwrap_or_else(|| panic!("expected the snap_ prefix, got {}", cp.checkpoint_ref));
+        assert!(
+            !digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected a hex digest after snap_, got {}",
+            cp.checkpoint_ref
+        );
+    }
 
     let backend = raw_backend_for(&backend_name);
     let _ = backend.remove_checkpoint(&cp.checkpoint_ref).await;
@@ -1773,10 +1784,13 @@ async fn checkpointing_a_tmpfs_root_container_is_refused() {
 }
 
 /// Checkpoint dest-dir contract (msb-only — docker checkpoints are image tags, not
-/// filesystem artifacts, so there is no cache-dir path to prove): the ref minted by
-/// `checkpoint()` is an absolute path under `<cache dir>/checkpoints`, that path is a
-/// real directory containing `snapshot.json`, `Container::from_checkpoint` restores a
-/// marker file written before the checkpoint, and `remove_checkpoint` deletes the
+/// filesystem artifacts, so there is no cache-dir path to prove): the ref
+/// `checkpoint()` returns is an absolute path that NESTS somewhere under `<cache
+/// dir>/checkpoints` — msb 0.7.1's dest-dir snapshot store puts the artifact one
+/// level deeper, under the source sandbox's own name, never directly in
+/// `checkpoints/` itself (verified live) — that path is a real directory
+/// containing `snapshot.json`, `Container::from_checkpoint` restores a marker
+/// file written before the checkpoint, and `remove_checkpoint` deletes the
 /// artifact directory.
 #[tokio::test]
 async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_it() {
@@ -1809,8 +1823,20 @@ async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_
 
     let ref_path = Path::new(&cp.checkpoint_ref);
     assert!(ref_path.is_absolute(), "{}", cp.checkpoint_ref);
-    let expected_parent = rightsize::cache_dir::dir().join("checkpoints");
-    assert_eq!(ref_path.parent(), Some(expected_parent.as_path()));
+    let expected_ancestor = rightsize::cache_dir::dir().join("checkpoints");
+    assert!(
+        ref_path.ancestors().any(|a| a == expected_ancestor),
+        "expected {expected_ancestor:?} to be an ancestor of {}",
+        cp.checkpoint_ref
+    );
+    assert!(
+        ref_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("snap_")),
+        "{}",
+        cp.checkpoint_ref
+    );
     assert!(ref_path.is_dir(), "{}", cp.checkpoint_ref);
     assert!(
         ref_path.join("snapshot.json").is_file(),

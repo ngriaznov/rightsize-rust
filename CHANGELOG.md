@@ -16,24 +16,63 @@ reaches its first tagged release.
   keep their existing default). One driven CLI flag was renamed upstream —
   `msb snapshot create --from` became `--from-sandbox` — and this library's
   checkpoint machinery now emits the new spelling; nothing changes for callers.
-- **Checkpoint restore now goes through `msb restore --disk-only`.** Upstream 0.7.1
-  removed `msb run --from-snapshot` entirely (it's now a rejected, unrecognized flag)
-  in favor of a dedicated `msb restore <path> --name <name> --disk-only` command. This
-  library's microsandbox backend follows: both the checkpoint feature's own re-boot
-  and an ordinary `Container::from_checkpoint(...)` restore now emit `restore`, still
-  carrying the same name, `-p` port mappings, and `-m` memory as before. `restore` has
-  no `-e`/`--env` flag — a disk-only restore replays whatever configuration was
+- **Checkpoint restore now goes through `msb restore`.** Upstream 0.7.1 removed
+  `msb run --from-snapshot` entirely (it's now a rejected, unrecognized flag) in
+  favor of a dedicated `msb restore <path> --name <name>` command. This library's
+  microsandbox backend follows: both the checkpoint feature's own re-boot and an
+  ordinary `Container::from_checkpoint(...)` restore now emit `restore`, still
+  carrying the same name, `-p` port mappings, and `-m` memory as before. `restore`
+  never passes `--disk-only`: msb 0.7.1 REJECTS that flag against the disk-scope
+  snapshots this backend creates (`invalid config: disk_only requires a full
+  snapshot with checkpoint state`, verified live against real msb) — restoring one
+  is inherently a cold boot of the captured disk already, without the flag. (An
+  earlier commit on this same line of work had this backend pass `--disk-only`
+  unconditionally; live verification against real msb 0.7.1 superseded that —
+  this is the emitted command as of this release.) `restore` has no `-e`/`--env`
+  flag — a restore of a disk-scope snapshot replays whatever configuration was
   captured on disk, so the captured spec's env is no longer re-passed (it was
-  redundant with what the snapshot itself already carries). Checkpoint create/restore
-  semantics are unchanged from the caller's view; only the emitted `msb` command
-  changed — with one exception: on the microsandbox backend, calling `.with_env(...)`/
-  `.remove_env(...)` on a `Container::from_checkpoint(...)` restore to actually change
-  the checkpoint's captured env (rather than merely replay it unchanged) now returns a
-  typed `RightsizeError::UnsupportedByBackend` from `start()` instead of silently
-  booting with the old, unchanged env — `restore` has no flag to carry that override,
-  so this used-to-work combination on `msb run --from-snapshot` must now fail loudly.
-  Docker's checkpoint restore is unaffected; it ignores `checkpoint_ref` and threads
-  env through its ordinary create path either way.
+  redundant with what the snapshot itself already carries). Checkpoint
+  create/restore semantics are unchanged from the caller's view; only the emitted
+  `msb` command changed — with one exception: on the microsandbox backend, calling
+  `.with_env(...)`/`.remove_env(...)` on a `Container::from_checkpoint(...)`
+  restore to actually change the checkpoint's captured env (rather than merely
+  replay it unchanged) now returns a typed `RightsizeError::UnsupportedByBackend`
+  from `start()` instead of silently booting with the old, unchanged env —
+  `restore` has no flag to carry that override, so this used-to-work combination
+  on `msb run --from-snapshot` must now fail loudly. Docker's checkpoint restore
+  is unaffected; it ignores `checkpoint_ref` and threads env through its ordinary
+  create path either way.
+- **Checkpoint refs on the microsandbox backend now point at msb's own snapshot
+  store artifact layout, not a name this library controls.** msb 0.7.1's
+  `--from-sandbox`/`--dest-dir` disk snapshot no longer lands at
+  `<dest-dir>/<name>`: the artifact nests one level deeper, under the source
+  sandbox's own name, with an msb-minted digest basename —
+  `<dest-dir>/<source-sandbox>/snap_<hex digest>` (verified live). The name this
+  library still asks `snapshot create` for (`rz-ckpt-<nonce-or-name>`) only ever
+  reaches msb's own index (`<source>:<name>` in `msb snapshot list`) and
+  `snapshot inspect` output now, never the artifact's filesystem path. This
+  backend captures the real path by parsing `snapshot create`'s own stdout (the
+  last non-empty line, required to be an absolute path — anything else fails
+  loudly, quoting the raw output, rather than minting a bogus ref) and uses it as
+  the `Checkpoint.checkpoint_ref` returned to callers, and for every later
+  `restore`/`snapshot rm`/`snapshot inspect` against that checkpoint. This is a
+  user-visible ref-SHAPE change on the microsandbox backend only — the ref stays
+  an opaque, backend-native string either way, and a ref minted by an earlier
+  release (bare-name or the old `<dest-dir>/rz-ckpt-<hex>` shape) keeps working
+  everywhere it's accepted. `snapshot rm`/`snapshot inspect` now resolve a
+  dest-dir snapshot by that artifact path only — never by a bare name or
+  `group:member` spelling (verified live) — so `remove_checkpoint` passes the ref
+  through unchanged instead of reducing it to a basename, and now passes `-f`.
+  Separately: removing a checkpoint that is the NEWEST of several taken from the
+  same source sandbox is refused by msb outright (`invalid config: cannot remove
+  current head snap_...; first select another snapshot with 'msb snapshot head
+  src:<snapshot>'`, verified live) — this library does not attempt automatic head
+  rotation to work around that refusal, and leaves that one artifact behind, but
+  the microsandbox backend's `remove_checkpoint` now propagates that refusal (and
+  any other real removal failure) as an `Err` rather than reporting `Ok(())`; only
+  "not found" still counts as success, the same best-effort contract the docker
+  backend's own `remove_checkpoint` already follows. See the checkpoints docs'
+  "Cleanup" section for the by-hand remedy.
 - **The MinIO module's default image moved to `quay.io/minio/minio:latest`.** The
   Docker Hub repository `minio/minio` was taken down (a `docker pull minio/minio` now
   fails "repository does not exist"); `quay.io/minio/minio` is upstream's maintained

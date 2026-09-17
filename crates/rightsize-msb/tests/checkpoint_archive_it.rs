@@ -111,8 +111,12 @@ impl Drop for ArchiveCleanup {
         let _ = std::fs::remove_file(&self.archive_path);
         if let Some(effective_ref) = self.imported_ref.borrow().clone() {
             if let Ok(msb_path) = rightsize_msb::provisioner::ensure_installed() {
+                // `-f`: msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` by
+                // their own artifact path (verified live) — same spelling as
+                // `commands::snapshot_rm`, shelled out directly here since a
+                // `Drop` impl cannot `.await` the async SPI.
                 let _ = Command::new(msb_path)
-                    .args(["snapshot", "rm", &effective_ref])
+                    .args(["snapshot", "rm", &effective_ref, "-f"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -161,15 +165,26 @@ async fn checkpoint_archive_survives_removal_of_the_original_and_restores_the_ma
         .checkpoint_named(&name)
         .await
         .expect("checkpoint_named must succeed on msb via disk snapshot");
-    // The msb ref is the absolute artifact path under <cache_dir>/checkpoints —
-    // created there via --dest-dir and restored by path.
+    // The msb ref is the absolute artifact path msb 0.7.1 itself reports on
+    // `snapshot create`'s stdout, under <cache_dir>/checkpoints somewhere — NOT
+    // <cache_dir>/checkpoints/<name>: it nests one level deeper, under the
+    // source sandbox's own name, with an msb-minted `snap_<digest>` basename
+    // (verified live) — the `rz-ckpt-` name this checkpoint was minted under
+    // never appears in the path at all, only in msb's own index.
     let ref_path = std::path::Path::new(&cp.checkpoint_ref);
     assert!(ref_path.is_absolute(), "{}", cp.checkpoint_ref);
     assert!(
         ref_path
+            .ancestors()
+            .any(|a| a.file_name().and_then(|n| n.to_str()) == Some("checkpoints")),
+        "expected the ref to nest somewhere under a 'checkpoints' dir: {}",
+        cp.checkpoint_ref
+    );
+    assert!(
+        ref_path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("rz-ckpt-")),
+            .is_some_and(|n| n.starts_with("snap_")),
         "{}",
         cp.checkpoint_ref
     );

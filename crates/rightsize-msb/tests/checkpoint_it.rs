@@ -76,8 +76,12 @@ macro_rules! require_msb {
 /// needs a synchronous tool invocation).
 fn remove_snapshot_blocking(snapshot_ref: &str) {
     if let Ok(msb_path) = rightsize_msb::provisioner::ensure_installed() {
+        // `-f`: msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` by their
+        // own artifact path (verified live) — same spelling as
+        // `commands::snapshot_rm`, shelled out directly here since a `Drop` impl
+        // cannot `.await` the async SPI.
         let _ = Command::new(msb_path)
-            .args(["snapshot", "rm", snapshot_ref])
+            .args(["snapshot", "rm", snapshot_ref, "-f"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -140,15 +144,26 @@ async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() 
         .checkpoint()
         .await
         .expect("checkpoint must succeed on msb via disk snapshot");
-    // The msb ref is the absolute artifact path under <cache_dir>/checkpoints —
-    // created there via --dest-dir and restored by path.
+    // The msb ref is the absolute artifact path msb 0.7.1 itself reports on
+    // `snapshot create`'s stdout, under <cache_dir>/checkpoints somewhere — NOT
+    // <cache_dir>/checkpoints/<name>: it nests one level deeper, under the
+    // source sandbox's own name, with an msb-minted `snap_<digest>` basename
+    // (verified live) — the `rz-ckpt-` name this test's checkpoint was minted
+    // under never appears in the path at all, only in msb's own index.
     let ref_path = std::path::Path::new(&cp.checkpoint_ref);
     assert!(ref_path.is_absolute(), "{}", cp.checkpoint_ref);
     assert!(
         ref_path
+            .ancestors()
+            .any(|a| a.file_name().and_then(|n| n.to_str()) == Some("checkpoints")),
+        "expected the ref to nest somewhere under a 'checkpoints' dir: {}",
+        cp.checkpoint_ref
+    );
+    assert!(
+        ref_path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("rz-ckpt-")),
+            .is_some_and(|n| n.starts_with("snap_")),
         "{}",
         cp.checkpoint_ref
     );

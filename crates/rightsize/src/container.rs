@@ -154,12 +154,14 @@ impl Container {
     /// Sets both `image` and [`crate::model::ContainerSpec::checkpoint_ref`] to
     /// `cp.ref` — docker ignores the latter (the ref already is a normal image tag,
     /// so the ordinary create path just works); microsandbox, when it's set, boots
-    /// via `msb restore <ref> --name <name> --disk-only` instead of its normal
-    /// image boot (msb 0.7.1 replaced `run --from-snapshot` with this dedicated
-    /// `restore` command — the env this builder copies from `cp.spec` below still
-    /// reaches docker's ordinary create path unchanged, but microsandbox's
-    /// `restore` has no `-e`/`--env` flag, so it never sees it: a disk-only
-    /// restore replays whatever configuration the snapshot already captured).
+    /// via `msb restore <ref> --name <name>` instead of its normal image boot (msb
+    /// 0.7.1 replaced `run --from-snapshot` with this dedicated `restore`
+    /// command, never `--disk-only` — msb rejects that flag against the
+    /// disk-scope snapshots this backend creates — the env this builder copies
+    /// from `cp.spec` below still reaches docker's ordinary create path
+    /// unchanged, but microsandbox's `restore` has no `-e`/`--env` flag, so it
+    /// never sees it: a restore of a disk-scope snapshot replays whatever
+    /// configuration the snapshot already captured).
     /// `start()` refuses before any backend work — [`RightsizeError::CheckpointBackendMismatch`]
     /// — if the active backend's name doesn't match `cp.backend`,
     /// [`RightsizeError::ReuseCheckpointConflict`] if `.reuse(true)` is also active,
@@ -477,8 +479,8 @@ impl Container {
             }
 
             // msb 0.7.1's `restore` has no `-e`/`--env` flag at all (see
-            // `rightsize_msb::commands::restore`'s own doc), so a disk-only restore
-            // can only ever replay whatever env the checkpoint's own disk state
+            // `rightsize_msb::commands::restore`'s own doc), so a restore of a
+            // disk-scope snapshot can only ever replay whatever env the checkpoint's own disk state
             // already captured — never a caller-supplied override. Replaying that
             // captured env unchanged (what `from_checkpoint` seeds `self.env` with,
             // and what most restores do) is harmless to drop silently: msb never
@@ -495,8 +497,8 @@ impl Container {
                     return Err(RightsizeError::unsupported_with_remedy(
                         "env override on a checkpoint restore",
                         backend.name(),
-                        "msb's restore command has no -e/--env flag, so a disk-only \
-                         restore cannot apply an environment different from the one \
+                        "msb's restore command has no -e/--env flag, so a restore of a \
+                         disk-scope snapshot cannot apply an environment different from the one \
                          the checkpoint already captured — set the desired env before \
                          taking the checkpoint instead of after restoring it, or \
                          restore this checkpoint under RIGHTSIZE_BACKEND=docker",

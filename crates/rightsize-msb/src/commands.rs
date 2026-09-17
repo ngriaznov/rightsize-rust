@@ -105,9 +105,9 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
     argv
 }
 
-/// Builds the argv for `msb restore <path> --name <name> ... --disk-only` — the
-/// checkpoint restore path on msb 0.7.1+, which replaced `msb run --from-snapshot
-/// <ref>` with a dedicated `restore` subcommand (upstream removed `--from-snapshot`
+/// Builds the argv for `msb restore <path> --name <name> ...` — the checkpoint
+/// restore path on msb 0.7.1+, which replaced `msb run --from-snapshot <ref>`
+/// with a dedicated `restore` subcommand (upstream removed `--from-snapshot`
 /// outright; see the crate `CHANGELOG`). Used for both re-boot paths that resume a
 /// disk snapshot under the same name: the checkpoint feature's own stop → snapshot
 /// → rm → re-boot cycle (`MsbCliBackend::create_checkpoint`), and an ordinary
@@ -116,22 +116,23 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 /// `crate::backend`, which is what decides `run` vs `restore` by checking
 /// `spec.checkpoint_ref`.
 ///
-/// `snapshot_path` is the absolute path to the checkpoint's dest-dir artifact —
-/// the same string `spec.checkpoint_ref` carries — passed as restore's
+/// `snapshot_path` is the absolute path to the snapshot artifact — the same
+/// string `spec.checkpoint_ref` carries — passed as restore's
 /// `SNAPSHOT-OR-ARCHIVE-PATH` positional, exactly where `--from-snapshot` used to
 /// take it.
 ///
-/// Always passes `--disk-only`: msb 0.7.1's restore defaults to a FULL restore,
-/// resuming the captured RAM/processes and requiring the captured cpu/memory
-/// geometry to match. `--disk-only` cold-boots only the captured disk instead —
-/// the semantics `run --from-snapshot` always had, and the semantics this
-/// backend's checkpoint feature (a filesystem capture, not a memory capture) has
-/// always relied on.
+/// Never passes `--disk-only`: this backend's own `--from-sandbox`/`--dest-dir`
+/// snapshot create always produces a DISK-scope snapshot (never a full
+/// RAM+processes one), and msb 0.7.1 REJECTS `--disk-only` against a disk-scope
+/// snapshot outright (`invalid config: disk_only requires a full snapshot with
+/// checkpoint state`, verified live) — restoring one is inherently a cold boot of
+/// the captured disk already, the same semantics `run --from-snapshot` and the
+/// old, now-removed `--disk-only` flag both used to spell out explicitly.
 ///
 /// Carries over `-p` port mappings and `-m` memory (if set), matching [`run`].
 /// Deliberately does NOT carry over:
-/// - **env** — `restore` has no `-e`/`--env` flag at all. A disk-only restore
-///   replays whatever configuration was captured on disk, so re-passing the
+/// - **env** — `restore` has no `-e`/`--env` flag at all. A restore of a
+///   disk-scope snapshot replays whatever configuration was captured on disk, so re-passing the
 ///   captured spec's env (what `run --from-snapshot` used to do, via the same `-e`
 ///   flags an ordinary boot gets) is now both impossible and redundant — `spec.env`
 ///   simply never reaches this function's argv. `Container::start()`, one layer
@@ -174,8 +175,6 @@ pub fn restore(spec: &ContainerSpec, snapshot_path: &str) -> Vec<String> {
         argv.push("-p".to_string());
         argv.push(format!("{}:{}", port.host_port, port.guest_port));
     }
-
-    argv.push("--disk-only".to_string());
 
     argv
 }
@@ -227,19 +226,40 @@ pub fn snapshot_create_in(sandbox_name: &str, snapshot_name: &str, dest_dir: &Pa
     argv
 }
 
-/// Builds the argv for `msb snapshot rm <snapshot>` — the checkpoint feature's
+/// Builds the argv for `msb snapshot rm <snapshot> -f` — the checkpoint feature's
 /// cleanup primitive (`SandboxBackend::remove_checkpoint`).
+///
+/// `-f` is verified live as part of the working invocation, not carried over
+/// from an older spelling — pass it. Separately (and `-f` does NOT change
+/// this): msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` (and
+/// `inspect`) by their own ARTIFACT PATH only — a bare name or a
+/// `group:member` spelling does not resolve at all (verified live) — so
+/// `snapshot_name` here is expected to be that path for any ref this backend
+/// minted after the dest-dir migration, a bare legacy name otherwise (see
+/// `crate::backend::path_ref_dir`'s doc). msb also refuses to remove the
+/// current HEAD of a group with older siblings from the same source sandbox
+/// even with `-f` (`invalid config: cannot remove current head snap_...; first
+/// select another snapshot with 'msb snapshot head src:<snapshot>'`, verified
+/// live) — this backend does not attempt automatic head rotation to work
+/// around that (see `MsbCliBackend::remove_checkpoint`'s doc and the
+/// checkpoints docs' "Cleanup" section for the resulting limitation).
 pub fn snapshot_rm(snapshot_name: &str) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "rm".to_string(),
         snapshot_name.to_string(),
+        "-f".to_string(),
     ]
 }
 
 /// Builds the argv for `msb snapshot inspect <snapshot>` — the named-checkpoint
 /// existence probe (`SandboxBackend::has_checkpoint`): exit 0 means the snapshot
-/// still exists.
+/// still exists. Only reached for a bare legacy ref (a path ref is probed on the
+/// filesystem instead, never via this command — see
+/// `crate::backend::MsbCliBackend::has_checkpoint`'s doc) — worth calling out
+/// because, same as [`snapshot_rm`], msb 0.7.1 resolves a dest-dir disk-scope
+/// snapshot by its own artifact path only; a name or `group:member` spelling
+/// does not resolve (verified live).
 pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
     vec![
         "snapshot".to_string(),
@@ -620,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_command_carries_name_ports_memory_and_always_ends_in_disk_only() {
+    fn restore_command_carries_name_ports_and_memory_with_no_disk_only_flag() {
         let mut spec = full_spec();
         spec.memory_limit_mb = Some(1024);
         let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
@@ -635,7 +655,6 @@ mod tests {
                 "1024M",
                 "-p",
                 "12345:6379",
-                "--disk-only",
             ]
         );
     }
@@ -644,18 +663,29 @@ mod tests {
     fn restore_command_omits_dash_m_when_memory_limit_is_unset() {
         let cmd = restore(&full_spec(), "/cache/checkpoints/rz-ckpt-deadbeefcafe");
         assert!(!cmd.contains(&"-m".to_string()));
-        assert_eq!(cmd.last().unwrap(), "--disk-only");
+        assert_eq!(cmd.last().unwrap(), "12345:6379");
     }
 
     #[test]
-    fn restore_command_never_carries_env_mounts_net_or_root_disk_flags() {
+    fn restore_command_never_carries_env_mounts_net_root_disk_or_disk_only_flags() {
         // `full_spec()` sets env, a mount, and a command — none of them have a
         // restore equivalent (see `restore`'s own doc), and none may leak through.
+        // `--disk-only` is checked here too: msb 0.7.1 rejects it outright against
+        // the disk-scope snapshots this backend creates (verified live), so it must
+        // never come back.
         let mut spec = full_spec();
         spec.network_disabled = true;
         spec.disk_limit_mb = Some(2048);
         let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
-        for forbidden in ["-e", "A=1", "--mount-file", "--net", "--root-disk", "--"] {
+        for forbidden in [
+            "-e",
+            "A=1",
+            "--mount-file",
+            "--net",
+            "--root-disk",
+            "--disk-only",
+            "--",
+        ] {
             assert!(
                 !cmd.iter().any(|a| a == forbidden),
                 "restore argv must never contain {forbidden:?}: {cmd:?}"
@@ -664,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_command_with_no_ports_or_memory_is_just_path_name_disk_only() {
+    fn restore_command_with_no_ports_or_memory_is_just_path_and_name() {
         let spec = ContainerSpec::new("rz-bare-1", "alpine:3.19", "bare");
         let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-bare");
         assert_eq!(
@@ -674,7 +704,6 @@ mod tests {
                 "/cache/checkpoints/rz-ckpt-bare",
                 "--name",
                 "rz-bare-1",
-                "--disk-only",
             ]
         );
     }
@@ -725,7 +754,18 @@ mod tests {
         );
         assert_eq!(
             snapshot_rm("rz-ckpt-deadbeefcafe"),
-            vec!["snapshot", "rm", "rz-ckpt-deadbeefcafe"]
+            vec!["snapshot", "rm", "rz-ckpt-deadbeefcafe", "-f"]
+        );
+        assert_eq!(
+            snapshot_rm("/cache/checkpoints/rz-abc-1/snap_deadbeefcafedeadbeefcafedeadbeef"),
+            vec![
+                "snapshot",
+                "rm",
+                "/cache/checkpoints/rz-abc-1/snap_deadbeefcafedeadbeefcafedeadbeef",
+                "-f"
+            ],
+            "an artifact-path ref must pass through unchanged — msb 0.7.1 resolves a \
+             dest-dir disk-scope snapshot by its own path only"
         );
         assert_eq!(
             snapshot_inspect("rz-ckpt-deadbeefcafe"),
