@@ -16,6 +16,17 @@ reaches its first tagged release.
   keep their existing default). One driven CLI flag was renamed upstream —
   `msb snapshot create --from` became `--from-sandbox` — and this library's
   checkpoint machinery now emits the new spelling; nothing changes for callers.
+- **Checkpoint restore now goes through `msb restore --disk-only`.** Upstream 0.7.1
+  removed `msb run --from-snapshot` entirely (it's now a rejected, unrecognized flag)
+  in favor of a dedicated `msb restore <path> --name <name> --disk-only` command. This
+  library's microsandbox backend follows: both the checkpoint feature's own re-boot
+  and an ordinary `Container::from_checkpoint(...)` restore now emit `restore`, still
+  carrying the same name, `-p` port mappings, and `-m` memory as before. `restore` has
+  no `-e`/`--env` flag — a disk-only restore replays whatever configuration was
+  captured on disk, so the captured spec's env is no longer re-passed (it was
+  redundant with what the snapshot itself already carries). Checkpoint create/restore
+  semantics are unchanged from the caller's view; only the emitted `msb` command
+  changed.
 
 ## [0.7.9] - 2026-09-10
 

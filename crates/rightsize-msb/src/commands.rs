@@ -13,18 +13,23 @@ use rightsize::model::ContainerSpec;
 
 /// Builds the argv for `msb run`, in the pinned order: name, memory (if set),
 /// root-disk (if a disk limit or tmpfs root is set), net (if network is disabled),
-/// ports, env, mounts, image-or-snapshot, then `-- <command>` iff `spec.command`
+/// ports, env, mounts, image, then `-- <command>` iff `spec.command`
 /// is `Some` — a `None` command means "run the image's default
 /// `ENTRYPOINT`/`CMD`", which requires omitting the trailing `--` entirely rather
 /// than passing it with no arguments after it.
 ///
-/// When `spec.checkpoint_ref` is set (this container was built from
-/// [`rightsize::Container::from_checkpoint`]), `--from-snapshot <ref>` replaces the plain
-/// image argument — `--from-snapshot` exists only on `msb run`, mutually exclusive with
-/// the IMAGE positional, and boots a fresh sandbox from that disk snapshot instead
-/// of pulling an image. Every other flag (name, memory, ports, env, mounts, the
-/// trailing command) stays identical either way.
+/// A spec with `checkpoint_ref` set (built from
+/// [`rightsize::Container::from_checkpoint`]) must never reach this function —
+/// msb 0.7.1 removed `run --from-snapshot` entirely (clap now rejects it outright);
+/// the restore path is [`restore`], a dedicated command with its own, narrower
+/// flag surface. The `debug_assert!` below exists to catch a caller that forgets
+/// this and routes a restore-shaped spec through `run` by mistake.
 pub fn run(spec: &ContainerSpec) -> Vec<String> {
+    debug_assert!(
+        spec.checkpoint_ref.is_none(),
+        "commands::run must never be called for a spec with checkpoint_ref set — msb 0.7.1 \
+         removed `run --from-snapshot`; use commands::restore instead"
+    );
     let mut argv = vec!["run".to_string(), "--name".to_string(), spec.name.clone()];
 
     // `msb run --help`: -m/--memory <MEMORY>, e.g. 512M/1G — right after --name.
@@ -90,18 +95,80 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
         ));
     }
 
-    match &spec.checkpoint_ref {
-        Some(snapshot_ref) => {
-            argv.push("--from-snapshot".to_string());
-            argv.push(snapshot_ref.clone());
-        }
-        None => argv.push(spec.image.clone()),
-    }
+    argv.push(spec.image.clone());
 
     if let Some(command) = &spec.command {
         argv.push("--".to_string());
         argv.extend(command.iter().cloned());
     }
+
+    argv
+}
+
+/// Builds the argv for `msb restore <path> --name <name> ... --disk-only` — the
+/// checkpoint restore path on msb 0.7.1+, which replaced `msb run --from-snapshot
+/// <ref>` with a dedicated `restore` subcommand (upstream removed `--from-snapshot`
+/// outright; see the crate `CHANGELOG`). Used for both re-boot paths that resume a
+/// disk snapshot under the same name: the checkpoint feature's own stop → snapshot
+/// → rm → re-boot cycle (`MsbCliBackend::create_checkpoint`), and an ordinary
+/// [`rightsize::Container::from_checkpoint`] restore — both funnel through the same
+/// `spawn_and_await_running`/`try_spawn_and_await_running` call site in
+/// `crate::backend`, which is what decides `run` vs `restore` by checking
+/// `spec.checkpoint_ref`.
+///
+/// `snapshot_path` is the absolute path to the checkpoint's dest-dir artifact —
+/// the same string `spec.checkpoint_ref` carries — passed as restore's
+/// `SNAPSHOT-OR-ARCHIVE-PATH` positional, exactly where `--from-snapshot` used to
+/// take it.
+///
+/// Always passes `--disk-only`: msb 0.7.1's restore defaults to a FULL restore,
+/// resuming the captured RAM/processes and requiring the captured cpu/memory
+/// geometry to match. `--disk-only` cold-boots only the captured disk instead —
+/// the semantics `run --from-snapshot` always had, and the semantics this
+/// backend's checkpoint feature (a filesystem capture, not a memory capture) has
+/// always relied on.
+///
+/// Carries over `-p` port mappings and `-m` memory (if set), matching [`run`].
+/// Deliberately does NOT carry over:
+/// - **env** — `restore` has no `-e`/`--env` flag at all. A disk-only restore
+///   replays whatever configuration was captured on disk, so re-passing the
+///   captured spec's env (what `run --from-snapshot` used to do, via the same `-e`
+///   flags an ordinary boot gets) is now both impossible and redundant.
+/// - **mounts** — `--mount-file` has no restore equivalent; restore's `-v`/
+///   `--volume` is a different, unrelated concept (selecting a captured private
+///   disk, or binding an external source), not this backend's host-file bind
+///   mount. `Container::from_checkpoint` never carries a checkpoint's own mounts
+///   over in the first place (they're already baked into the captured disk), and
+///   no caller-added mount on a restored container was ever exercised by a test
+///   before this migration.
+/// - **`--net private`** — restore has no equivalent "profile" flag; `run`'s
+///   `--net private` and restore's `--no-net` are different policies (see
+///   `Container::with_network_disabled`'s doc), and `network_disabled` is not one
+///   of the fields `Container::from_checkpoint` carries over either.
+/// - **`--root-disk`** — restore has no such flag at all; the snapshot pins its
+///   own root-disk geometry. This matches the OLD behavior in spirit: msb itself
+///   already rejected `--root-disk` combined with `--from-snapshot` at its own CLI
+///   layer (see `Container::with_disk_limit`/`with_tmpfs_root`'s docs), so this
+///   was never a combination a caller could rely on either.
+pub fn restore(spec: &ContainerSpec, snapshot_path: &str) -> Vec<String> {
+    let mut argv = vec![
+        "restore".to_string(),
+        snapshot_path.to_string(),
+        "--name".to_string(),
+        spec.name.clone(),
+    ];
+
+    if let Some(mb) = spec.memory_limit_mb {
+        argv.push("-m".to_string());
+        argv.push(format!("{mb}M"));
+    }
+
+    for port in &spec.ports {
+        argv.push("-p".to_string());
+        argv.push(format!("{}:{}", port.host_port, port.guest_port));
+    }
+
+    argv.push("--disk-only".to_string());
 
     argv
 }
@@ -538,31 +605,71 @@ mod tests {
     }
 
     #[test]
-    fn run_command_uses_dash_dash_snapshot_instead_of_the_image_when_checkpoint_ref_is_set() {
+    #[should_panic(expected = "commands::run must never be called")]
+    fn run_panics_in_debug_when_checkpoint_ref_is_set() {
         let mut spec = full_spec();
-        spec.checkpoint_ref = Some("rz-ckpt-deadbeefcafe".to_string());
-        let cmd = run(&spec);
+        spec.checkpoint_ref = Some("/cache/checkpoints/rz-ckpt-deadbeefcafe".to_string());
+        let _ = run(&spec);
+    }
+
+    #[test]
+    fn restore_command_carries_name_ports_memory_and_always_ends_in_disk_only() {
+        let mut spec = full_spec();
+        spec.memory_limit_mb = Some(1024);
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
         assert_eq!(
             cmd,
             vec![
-                "run",
+                "restore",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
                 "--name",
                 "rz-abc-1",
+                "-m",
+                "1024M",
                 "-p",
                 "12345:6379",
-                "-e",
-                "A=1",
-                "--mount-file",
-                "/tmp/f.conf:/etc/f.conf:rw,nodev",
-                "--from-snapshot",
-                "rz-ckpt-deadbeefcafe",
-                "--",
-                "redis-server",
-                "--port",
-                "6379",
+                "--disk-only",
             ]
         );
-        assert!(!cmd.contains(&spec.image));
+    }
+
+    #[test]
+    fn restore_command_omits_dash_m_when_memory_limit_is_unset() {
+        let cmd = restore(&full_spec(), "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert!(!cmd.contains(&"-m".to_string()));
+        assert_eq!(cmd.last().unwrap(), "--disk-only");
+    }
+
+    #[test]
+    fn restore_command_never_carries_env_mounts_net_or_root_disk_flags() {
+        // `full_spec()` sets env, a mount, and a command — none of them have a
+        // restore equivalent (see `restore`'s own doc), and none may leak through.
+        let mut spec = full_spec();
+        spec.network_disabled = true;
+        spec.disk_limit_mb = Some(2048);
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        for forbidden in ["-e", "A=1", "--mount-file", "--net", "--root-disk", "--"] {
+            assert!(
+                !cmd.iter().any(|a| a == forbidden),
+                "restore argv must never contain {forbidden:?}: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_command_with_no_ports_or_memory_is_just_path_name_disk_only() {
+        let spec = ContainerSpec::new("rz-bare-1", "alpine:3.19", "bare");
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-bare");
+        assert_eq!(
+            cmd,
+            vec![
+                "restore",
+                "/cache/checkpoints/rz-ckpt-bare",
+                "--name",
+                "rz-bare-1",
+                "--disk-only",
+            ]
+        );
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //! full `sha256:<64hex>` digest does NOT resolve as a snapshot ref at all —
 //! `msb snapshot inspect sha256:<full>` fails "snapshot not found" (msb treats it
 //! as a literal path) — only the digest-dir name resolves for `inspect`, `rm`, and
-//! `run --from-snapshot`. So the effective ref this backend must return is the
+//! `restore` (the msb 0.7.1+ command that replaced `run --from-snapshot`). So the
+//! effective ref this backend must return is the
 //! digest-dir name itself; this module's job is only to confirm it via `msb
 //! snapshot list --format json` (matching it against an entry's `name` or
 //! `artifact_path`) and hand it back unchanged.

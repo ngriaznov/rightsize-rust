@@ -421,11 +421,11 @@ fn path_ref_dir(checkpoint_ref: &str) -> Option<PathBuf> {
 
 /// A path ref's own snapshot NAME — what msb itself was given at `snapshot
 /// create` time and still knows it as (`snapshot rm`/`snapshot inspect` both take
-/// this, never the dest-dir path; `snapshot save` and `run --from-snapshot` are
-/// the opposite — they resolve names against the DEFAULT snapshots directory
-/// only, so a dest-dir artifact reaches them as the full path, verified live
-/// both ways). For a bare-name ref this is a no-op: it's already just its own
-/// basename.
+/// this, never the dest-dir path; `snapshot save` and `restore` (the msb 0.7.1+
+/// command that replaced `run --from-snapshot`) are the opposite — they resolve
+/// names against the DEFAULT snapshots directory only, so a dest-dir artifact
+/// reaches them as the full path, verified live both ways). For a bare-name ref
+/// this is a no-op: it's already just its own basename.
 fn ref_basename(checkpoint_ref: &str) -> String {
     Path::new(checkpoint_ref)
         .file_name()
@@ -916,8 +916,11 @@ impl SandboxBackend for MsbCliBackend {
 
     /// Disk-snapshot checkpointing: `msb stop <name>` → `msb snapshot create --from
     /// <name> rz-ckpt-<nonce> --dest-dir <cache>/checkpoints` → `msb rm <name>` → a
-    /// fresh ATTACHED `msb run --from-snapshot <ref>` re-boot under the same
-    /// name/ports/env/memory — see `msb_checkpoint_cycle` for the orchestration and
+    /// fresh ATTACHED `msb restore <ref> --name <name> --disk-only` re-boot under
+    /// the same name/ports/memory (msb 0.7.1 replaced `run --from-snapshot` with
+    /// this dedicated `restore` command; env is no longer re-passed — see
+    /// `commands::restore`'s own doc for what changed and why) — see
+    /// `msb_checkpoint_cycle` for the orchestration and
     /// its own unit tests for the failure paths. Runs on a blocking thread, like
     /// every other multi-step msb invocation in this backend. The re-boot reuses
     /// [`spawn_and_await_running`], this backend's own normal boot path (already
@@ -1335,10 +1338,17 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Child> {
     }
 }
 
-/// One `msb run` attempt: spawns the child, polls until `Running`, and returns either
-/// the live child or a classified [`PreRunningFailure`]. Never retries by itself —
-/// [`spawn_and_await_running`] is the only caller and owns the one-shot heal+retry
-/// policy.
+/// One `msb run`/`msb restore` attempt: spawns the child, polls until `Running`,
+/// and returns either the live child or a classified [`PreRunningFailure`]. Never
+/// retries by itself — [`spawn_and_await_running`] is the only caller and owns the
+/// one-shot heal+retry policy.
+///
+/// `spec.checkpoint_ref` decides which command this builds: `Some` means a
+/// checkpoint restore (`commands::restore`, `--disk-only`, on msb 0.7.1+), `None`
+/// means an ordinary boot (`commands::run`). Both this backend's normal `start()`
+/// path (a [`rightsize::Container::from_checkpoint`]-built spec, spec.checkpoint_ref
+/// already set) and [`MsbCliBackend::create_checkpoint`]'s own re-boot reach this
+/// same branch.
 ///
 /// The tail drained here carries msb's own boot output only — registry/pull errors,
 /// a crash before the sandbox exists — never the workload's. `logs()` never reads
@@ -1358,7 +1368,10 @@ fn try_spawn_and_await_running(
     msb: &Path,
     spec: &ContainerSpec,
 ) -> std::result::Result<Child, PreRunningFailure> {
-    let argv = commands::run(spec);
+    let argv = match &spec.checkpoint_ref {
+        Some(snapshot_path) => commands::restore(spec, snapshot_path),
+        None => commands::run(spec),
+    };
     let mut child = spawn_msb_command(|| {
         let mut cmd = Command::new(msb);
         cmd.args(&argv)
@@ -1607,10 +1620,10 @@ fn invoke_standalone(msb: &Path, args: &[String], timeout: Duration) -> Result<E
 /// `ERROR_ACCESS_DENIED` whenever msb runs inside a job object that doesn't grant
 /// breakaway rights, which is exactly a Gradle/cargo test process on a Windows CI
 /// runner. The denial is deterministic, not transient, so no retry fixes it.
-/// Attached `msb run` (this backend's normal boot, including `--from-snapshot` boots)
-/// has no such problem, so once the snapshot exists, the stopped sandbox is
-/// removed and this backend's own create/boot path re-creates it from that
-/// snapshot instead of resuming it.
+/// Attached `msb run`/`msb restore` (this backend's normal boot, including the
+/// `restore --disk-only` re-boot) has no such problem, so once the snapshot
+/// exists, the stopped sandbox is removed and this backend's own create/boot path
+/// re-creates it from that snapshot instead of resuming it.
 ///
 /// Failure handling:
 /// - `msb stop` failing short-circuits before any snapshot/rm/reboot attempt.
@@ -2402,6 +2415,80 @@ mod tests {
 
         let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
         assert_eq!(log.trim(), "snapshot rm rz-ckpt-deadbeefcafe");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- run vs restore: `try_spawn_and_await_running`'s own branch ----
+    //
+    // The argv-logging stub exits 0 unconditionally for every subcommand,
+    // including the `ls`/`logs` fast-exit post-mortem calls this makes after a
+    // clean exit — none of those fabricate JSON `ls`/`logs` output, so the
+    // fast-exit check never confirms the sandbox and this always ends in the
+    // generic "before reaching Running" error either way. That failure is
+    // expected and irrelevant here. What these tests assert on is which
+    // subcommand `try_spawn_and_await_running` chose to spawn in the first
+    // place — found by its distinctive leading word rather than by log
+    // position, since the readiness-poll loop can race an `ls` check (a
+    // SEPARATE `msb` invocation, logged independently) against the primary
+    // child's own exit before either write lands.
+
+    /// The one logged call starting with `leading_word` — the primary `run`/
+    /// `restore` invocation, told apart from the loop's own incidental `ls`/
+    /// `logs` post-mortem calls by its distinctive first word.
+    fn find_logged_call(dir: &Path, leading_word: &str) -> Option<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with(leading_word))
+            .map(ToString::to_string)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_spawn_and_await_running_emits_msb_run_when_checkpoint_ref_is_unset() {
+        let dir = unique_test_dir("run-vs-restore-plain");
+        let script = write_argv_logging_stub(&dir);
+        let spec = ContainerSpec::new("rz-plain-1", "alpine:3.19", "run-1");
+
+        let _ = try_spawn_and_await_running(&script, &spec);
+
+        assert_eq!(
+            find_logged_call(&dir, "run "),
+            Some("run --name rz-plain-1 alpine:3.19".to_string())
+        );
+        assert_eq!(
+            find_logged_call(&dir, "restore "),
+            None,
+            "an unrestored spec must never invoke `msb restore`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_spawn_and_await_running_emits_msb_restore_disk_only_when_checkpoint_ref_is_set() {
+        let dir = unique_test_dir("run-vs-restore-checkpoint");
+        let script = write_argv_logging_stub(&dir);
+        let mut spec = ContainerSpec::new("rz-restored-1", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/cache/checkpoints/rz-ckpt-deadbeefcafe".to_string());
+
+        let _ = try_spawn_and_await_running(&script, &spec);
+
+        assert_eq!(
+            find_logged_call(&dir, "restore "),
+            Some(
+                "restore /cache/checkpoints/rz-ckpt-deadbeefcafe --name rz-restored-1 \
+                 --disk-only"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            find_logged_call(&dir, "run "),
+            None,
+            "must never fall back to `msb run` once checkpoint_ref is set"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

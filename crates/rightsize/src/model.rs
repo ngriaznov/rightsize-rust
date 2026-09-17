@@ -106,9 +106,12 @@ pub struct ContainerSpec {
     /// `ref` — the checkpoint feature's own signal to the backend that this spec's
     /// `image` is a checkpoint reference, not an ordinary image. docker ignores this
     /// (the ref already IS a normal image tag; the ordinary create path just works);
-    /// microsandbox, when this is set, boots via `msb run --from-snapshot <ref>`
-    /// instead of its normal image boot, keeping every other flag identical.
-    /// Deliberately NOT part of the reuse identity hash — reuse and
+    /// microsandbox, when this is set, boots via `msb restore <ref> --name <name>
+    /// --disk-only` instead of its normal image boot (msb 0.7.1 replaced `run
+    /// --from-snapshot` with this dedicated `restore` command, which carries over
+    /// only name/ports/memory — see the `rightsize-msb` crate's own
+    /// `commands::restore` for the full list of what it does and doesn't carry
+    /// over from this spec). Deliberately NOT part of the reuse identity hash — reuse and
     /// `from_checkpoint` are not a supported combination (see
     /// `RightsizeError::ReuseCheckpointConflict`). Defaults to `None`.
     pub checkpoint_ref: Option<String>,

@@ -143,8 +143,13 @@ impl Container {
     /// Sets both `image` and [`crate::model::ContainerSpec::checkpoint_ref`] to
     /// `cp.ref` — docker ignores the latter (the ref already is a normal image tag,
     /// so the ordinary create path just works); microsandbox, when it's set, boots
-    /// via `msb run --from-snapshot <ref>` instead of its normal image boot. `start()`
-    /// refuses before any backend work — [`RightsizeError::CheckpointBackendMismatch`]
+    /// via `msb restore <ref> --name <name> --disk-only` instead of its normal
+    /// image boot (msb 0.7.1 replaced `run --from-snapshot` with this dedicated
+    /// `restore` command — the env this builder copies from `cp.spec` below still
+    /// reaches docker's ordinary create path unchanged, but microsandbox's
+    /// `restore` has no `-e`/`--env` flag, so it never sees it: a disk-only
+    /// restore replays whatever configuration the snapshot already captured).
+    /// `start()` refuses before any backend work — [`RightsizeError::CheckpointBackendMismatch`]
     /// — if the active backend's name doesn't match `cp.backend`, and
     /// [`RightsizeError::ReuseCheckpointConflict`] if `.reuse(true)` is also active,
     /// since reuse identity has no concept of a checkpoint reference.
@@ -253,8 +258,9 @@ impl Container {
     /// ceiling and ignores this. The ceiling grows only on an msb reboot, never
     /// shrinks back down. Mutually exclusive with [`Self::with_tmpfs_root`] —
     /// `start()` returns [`RightsizeError::RootDiskConflict`] if both are set.
-    /// msb rejects a root-disk setting on a [`Container::from_checkpoint`]
-    /// restore before boot — the snapshot pins the root disk.
+    /// Has no effect on a [`Container::from_checkpoint`] restore — msb's
+    /// `restore` command has no `--root-disk` flag at all, so the snapshot's own
+    /// captured root disk is what boots either way.
     pub fn with_disk_limit(mut self, megabytes: u64) -> Self {
         self.disk_limit_mb = Some(megabytes);
         self
@@ -269,8 +275,9 @@ impl Container {
     /// in that case — msb's own error at boot is already precise there). Mutually
     /// exclusive with [`Self::with_disk_limit`] —
     /// [`RightsizeError::RootDiskConflict`] if both are set. A tmpfs root is
-    /// ephemeral and cannot be checkpointed, and msb rejects a root-disk
-    /// setting on a [`Container::from_checkpoint`] restore before boot.
+    /// ephemeral and cannot be checkpointed, and — like [`Self::with_disk_limit`]
+    /// — has no effect on a [`Container::from_checkpoint`] restore, since
+    /// `restore` has no `--root-disk` flag to carry it through.
     pub fn with_tmpfs_root(mut self, megabytes: u64) -> Self {
         self.tmpfs_root_mb = Some(megabytes);
         self
@@ -280,7 +287,9 @@ impl Container {
     /// ports and private-range links keep working); docker ignores this and runs
     /// with normal networking. Mutually exclusive with [`Self::with_network`] —
     /// `start()` returns [`RightsizeError::NetworkDisabledConflict`] if both are
-    /// set.
+    /// set. Also has no effect on a [`Container::from_checkpoint`] restore: `msb
+    /// restore` has no equivalent "private" network profile flag, only a
+    /// differently-shaped `--no-net`/allowlist policy this builder does not drive.
     pub fn with_network_disabled(mut self) -> Self {
         self.network_disabled = true;
         self
