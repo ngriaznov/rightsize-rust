@@ -208,6 +208,15 @@ pub struct MsbCliBackend {
     msb: PathBuf,
     started_names: Mutex<HashSet<String>>,
     handles: Mutex<HashMap<String, HandleState>>,
+    /// The job-free broker [`MsbCliBackend::create_checkpoint`]'s own candidate walk
+    /// escalates to once it has seen the Windows access-denied class — see POLICY
+    /// v2 in the "job-free restore broker" module section. `Some` only on Windows
+    /// in production ([`MsbCliBackend::new`]'s own `cfg!(windows)` gate); `None`
+    /// everywhere else, so the escalation check itself (a plain "if escalated, and
+    /// a broker is configured, use it") has no OS-specific logic of its own and
+    /// naturally never brokers off Windows. [`MsbCliBackend::with_restore_broker`]
+    /// injects a fake here for tests, on any host.
+    restore_broker: Option<Arc<RestoreLauncher>>,
 }
 
 // Aliases are interpolated into a `sh -c` `/etc/hosts` echo (see `install_network_links`
@@ -228,6 +237,25 @@ impl MsbCliBackend {
             msb: msb_path,
             started_names: Mutex::new(HashSet::new()),
             handles: Mutex::new(HashMap::new()),
+            restore_broker: cfg!(windows)
+                .then(|| Arc::new(real_broker_restore_launcher) as Arc<RestoreLauncher>),
+        }
+    }
+
+    /// Test-only seam: identical to [`MsbCliBackend::new`], but with
+    /// [`MsbCliBackend::restore_broker`] set to `broker` regardless of host OS —
+    /// lets a pure-Rust test exercise the checkpoint reboot's escalation/brokered-
+    /// output-classification behavior without a real Windows host, `powershell`,
+    /// or WMI. Production never calls this; it always goes through
+    /// [`MsbCliBackend::new`], which gates the broker on `cfg!(windows)`.
+    #[cfg(test)]
+    fn with_restore_broker(
+        msb_path: PathBuf,
+        broker: impl Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + Send + Sync + 'static,
+    ) -> Self {
+        MsbCliBackend {
+            restore_broker: Some(Arc::new(broker)),
+            ..Self::new(msb_path)
         }
     }
 
@@ -457,6 +485,17 @@ fn is_name_conflict(output: &str) -> bool {
 fn is_restore_access_denied(output: &str) -> bool {
     output.contains("Access is denied")
         && (output.contains("io error") || output.contains("os error 5"))
+}
+
+/// The checkpoint reboot's own candidate walk (see [`MsbCliBackend::create_checkpoint`]
+/// and [`spawn_and_await_reboot_restore`]) surfaces the access-denied class as a plain
+/// [`RightsizeError::Backend`] carrying [`is_restore_access_denied`]-matchable text —
+/// never a same-name retry the way [`spawn_and_await_running`]'s own ordinary-restore
+/// policy still is (see that function's own doc for why the two paths differ). This is
+/// the classifier [`reboot_with_already_exists_retry`]'s retry loop, and the reboot
+/// closure's own escalation check, both use to recognize that surfaced error again.
+fn is_restore_access_denied_error(e: &RightsizeError) -> bool {
+    matches!(e, RightsizeError::Backend(message) if is_restore_access_denied(message))
 }
 
 /// The marker line msb's guest agent writes to the SYSTEM log once it has actually
@@ -1091,35 +1130,62 @@ impl SandboxBackend for MsbCliBackend {
     /// that fails AFTER msb's own artifact-integrity check (e.g. the Windows
     /// post-teardown access-denied transient) can leave that candidate behind
     /// as a stopped sandbox record, so `fresh_names` is a BATCH this method
-    /// walks in order — on a classified refusal (msb's "already exists," which
-    /// is also where a same-candidate access-denied retry inside
-    /// [`spawn_and_await_running`] ends up once msb's own record exists — see
-    /// that function's own doc for the access-denied retry itself) it
-    /// best-effort `msb rm`s the failed candidate and advances to the next one,
-    /// never re-trying the one that just collided. Same ports/memory/env as
-    /// before either way (msb 0.7.1 replaced `run --from-snapshot` with this
-    /// dedicated `restore` command, and no longer takes `--disk-only` for a
-    /// disk-scope snapshot — see `commands::restore`'s own doc for what
-    /// changed and why) — see `msb_checkpoint_cycle`/
+    /// walks in order — on a classified refusal it best-effort `msb rm`s the
+    /// failed candidate and advances to the next one, never re-trying the one
+    /// that just collided.
+    ///
+    /// **POLICY v2 (round 10) — the Windows access-denied class escalates to a
+    /// job-free broker, and is never retried under the same name.** A four-round
+    /// live diagnostic campaign traced the access-denied transient's root cause
+    /// on Windows CI (never on unix, where the signature simply never occurs):
+    /// msb's own detached-restore spawn always passes `DETACHED_PROCESS |
+    /// CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`, and Gradle test
+    /// workers / `cargo test` binaries run inside a Windows job object that does
+    /// not grant breakaway — so `CreateProcess` is refused outright, even though
+    /// msb's own `persist_start` stage has ALREADY inserted the candidate's DB
+    /// record by the time that spawn runs. Retrying the SAME candidate (as this
+    /// method used to, via [`spawn_and_await_running`]'s own one-shot policy)
+    /// therefore never recovers — it just converts the access-denied into msb's
+    /// own "already exists" refusal on the retry, burning a whole candidate per
+    /// occurrence and exhausting the batch. So this method's own `reboot`
+    /// closure now calls [`spawn_and_await_reboot_restore`] instead, which
+    /// surfaces the access-denied class as its own outcome with NO inline
+    /// same-name retry, and [`reboot_with_already_exists_retry`] now advances to
+    /// the next candidate on that outcome exactly as it already does for msb's
+    /// own "already exists." Once this reboot has seen access-denied once, every
+    /// REMAINING attempt of the SAME reboot launches through
+    /// [`MsbCliBackend::restore_broker`] (Windows only; the WMI-launched process
+    /// runs outside this process's own job hierarchy, so its own breakaway spawn
+    /// is never blocked by a job this process never put it in — live-verified).
+    /// The first attempt of every reboot is always direct, regardless of
+    /// platform. See the "job-free restore broker" module section for the
+    /// broker's own mechanics.
+    ///
+    /// Same ports/memory/env as before either way (msb 0.7.1 replaced `run
+    /// --from-snapshot` with this dedicated `restore` command, and no longer
+    /// takes `--disk-only` for a disk-scope snapshot — see `commands::restore`'s
+    /// own doc for what changed and why) — see `msb_checkpoint_cycle`/
     /// [`reboot_with_already_exists_retry`] for the orchestration this
     /// method's own `reboot` closure walks candidates underneath, and their
     /// unit tests for the failure paths. Runs on a blocking thread, like every
     /// other multi-step msb invocation in this backend. The re-boot reuses
-    /// [`spawn_and_await_running`], this backend's own normal boot path
-    /// (already the shape `Container::from_checkpoint`'s restores use — those
-    /// have always minted a fresh name of their own, never hitting this
-    /// Windows directory-retention issue in the first place) — see the module
-    /// docs for why an msb `start` resume is not used here, and for why that
-    /// re-boot (an `msb restore`, same as any other checkpoint restore) never
-    /// yields a live child: the handle's held attached child is swapped to
-    /// whatever the re-boot returns on success — `None` in practice, since this
-    /// path always restores — clearing out the pre-checkpoint `msb run` child it
-    /// held before, if any. This handle's identity DOES change: the returned
-    /// handle carries whichever `fresh_names` candidate actually won, and this
-    /// backend's own per-container state (`self.handles`, and
-    /// `self.started_names` when this handle isn't `keep_alive`) moves from
-    /// `id`'s key to that winner's — see the trait method's own doc for why
-    /// the caller must adopt it.
+    /// [`spawn_and_await_reboot_restore`] (this backend's own normal boot path,
+    /// [`spawn_and_await_running`], for everything BUT the access-denied policy
+    /// above — see that function's own doc for the two differences) — already
+    /// the shape `Container::from_checkpoint`'s ordinary restores use, via
+    /// [`spawn_and_await_running`] — those have always minted a fresh name of
+    /// their own, never hitting the directory-retention issue in the first
+    /// place — see the module docs for why an msb `start` resume is not used
+    /// here, and for why that re-boot (an `msb restore`, same as any other
+    /// checkpoint restore) never yields a live child: the handle's held
+    /// attached child is swapped to whatever the re-boot returns on success —
+    /// `None` in practice, since this path always restores — clearing out the
+    /// pre-checkpoint `msb run` child it held before, if any. This handle's
+    /// identity DOES change: the returned handle carries whichever
+    /// `fresh_names` candidate actually won, and this backend's own
+    /// per-container state (`self.handles`, and `self.started_names` when this
+    /// handle isn't `keep_alive`) moves from `id`'s key to that winner's — see
+    /// the trait method's own doc for why the caller must adopt it.
     ///
     /// **The returned ref is NOT `<dest_dir>/<name>`.** msb 0.7.1's dest-dir disk
     /// snapshot store nests the artifact one level deeper than the name it was
@@ -1185,6 +1251,11 @@ impl SandboxBackend for MsbCliBackend {
             .to_string_lossy()
             .into_owned();
         let msb = self.msb.clone();
+        // POLICY v2 (round 10): `Some` only on Windows in production — see
+        // `restore_broker`'s own doc — cloned into the blocking closure below
+        // alongside `msb` for the SAME reason: this whole cycle runs on a
+        // blocking thread, never `.await`ing again until it's done.
+        let restore_broker = self.restore_broker.clone();
         let reboot_spec_template = handle.spec().clone();
         // Mirrors `start()`'s own `keep_alive` read — needed below to keep
         // `started_names` in the same keep_alive-excluded shape `start()` gives it.
@@ -1242,6 +1313,17 @@ impl SandboxBackend for MsbCliBackend {
                 // every one of them already has its own reaping-ledger entry
                 // by the time this runs.
                 let mut attempted = 0usize;
+                // POLICY v2 (round 10): flips true the first time an attempt this
+                // reboot makes hits the classified Windows access-denied transient
+                // (see `is_restore_access_denied_error`) — from then on, every
+                // REMAINING attempt of THIS reboot launches through the job-free
+                // broker instead of a direct spawn (Windows only — `restore_broker`
+                // is `None` everywhere else, so the launcher selection below falls
+                // straight back to direct regardless of this flag). The very first
+                // attempt of any reboot is always direct, matching POLICY v2 item 1
+                // exactly, since `escalated` starts `false` and nothing before the
+                // first `reboot()` call could have set it.
+                let mut escalated = false;
                 let mut reboot = |real_ref: &str, captured: Option<&[String]>| {
                     if attempted > 0 {
                         // Best-effort: never lets a failed candidate's leftover
@@ -1266,15 +1348,20 @@ impl SandboxBackend for MsbCliBackend {
                     }
                     let Some(candidate) = candidates.get(attempted) else {
                         // Every candidate has already been tried and refused —
-                        // a non-`NameConflict` error here ends
-                        // `reboot_with_already_exists_retry`'s retry loop
-                        // immediately (rather than waiting out the rest of its
-                        // time budget re-trying a name that can't possibly
-                        // work), surfacing exactly what the trait doc promises:
-                        // the last real failure, not a bare timeout.
+                        // by msb's own "already exists" check, the classified
+                        // Windows access-denied class (POLICY v2), or a mix of
+                        // the two. Neither `RightsizeError::NameConflict` nor
+                        // an `is_restore_access_denied`-matching `Backend`
+                        // error, so this ends `reboot_with_already_exists_
+                        // retry`'s retry loop immediately (rather than waiting
+                        // out the rest of its time budget re-trying a batch
+                        // that can no longer possibly work), surfacing exactly
+                        // what the trait doc promises: the last real failure,
+                        // not a bare timeout.
                         return Err(RightsizeError::Backend(format!(
-                            "every candidate sandbox name was tried and refused by msb's \
-                             \"already exists\" check ({} candidates)",
+                            "every candidate sandbox name was tried and refused ({} \
+                             candidates) — by msb's own \"already exists\" check, the \
+                             Windows job-object access-denied transient, or both",
                             candidates.len(),
                         )));
                     };
@@ -1290,7 +1377,32 @@ impl SandboxBackend for MsbCliBackend {
                     // needed for the in-process case.
                     reboot_spec.checkpoint_ref = Some(real_ref.to_string());
                     reboot_spec.checkpoint_captured_cmdline = captured.map(<[String]>::to_vec);
-                    spawn_and_await_running(&msb, &reboot_spec)
+
+                    // Launcher selection, per POLICY v2: direct unless this reboot
+                    // has already escalated AND a broker is actually configured
+                    // (i.e. we are — really, or via a test's injected fake — on
+                    // Windows). `broker_fallback` has to be bound in THIS scope
+                    // (not a temporary) so the `&dyn Fn` handed to
+                    // `spawn_and_await_reboot_restore` below outlives the call.
+                    let broker_fallback;
+                    let launcher: &dyn Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> =
+                        match (escalated, restore_broker.as_deref()) {
+                            (true, Some(broker)) => {
+                                broker_fallback =
+                                    broker_with_direct_fallback(broker, &direct_restore_launcher);
+                                &broker_fallback
+                            }
+                            _ => &direct_restore_launcher,
+                        };
+
+                    let result =
+                        spawn_and_await_reboot_restore(&msb, &reboot_spec, real_ref, launcher);
+                    if let Err(e) = &result {
+                        if is_restore_access_denied_error(e) {
+                            escalated = true;
+                        }
+                    }
+                    result
                 };
                 let result = msb_checkpoint_cycle(
                     &mut invoke,
@@ -1798,6 +1910,182 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Option<Ch
     }
 }
 
+/// [`MsbCliBackend::create_checkpoint`]'s own reboot attempt — like
+/// [`spawn_and_await_running`]'s restore branch, but restore-only (a reboot is
+/// always a restore, never an ordinary `msb run`) and different in exactly the two
+/// ways POLICY v2 (round 10) requires:
+///
+/// 1. **The restore launch itself is injectable** — `launcher` is
+///    [`direct_restore_launcher`] for this reboot's first attempt, and every
+///    attempt before the candidate walk has seen the access-denied class; the
+///    walk's own `reboot` closure swaps it for the backend's `restore_broker`
+///    (Windows only) once it has — see [`MsbCliBackend::create_checkpoint`]'s own
+///    doc for where that choice is made, and [`broker_with_direct_fallback`] for
+///    what happens if the broker itself can't even launch.
+/// 2. **The Windows post-teardown access-denied transient is never retried in
+///    place.** [`spawn_and_await_running`]'s own policy — one same-name retry — is
+///    right for an ordinary restore, where there is only one name to try again.
+///    It is wrong for a candidate walk: msb's own `persist_start` stage inserts
+///    the sandbox's DB record BEFORE the spawn that can fail with access-denied
+///    (live-verified), so a same-name retry here just converts the access-denied
+///    into msb's own "already exists" refusal — burning a whole candidate on what
+///    is, in practice, the structural, always-repeats-under-a-job-object denial
+///    POLICY v2 exists to work around (see [`is_restore_access_denied`]'s own
+///    doc). So this surfaces the access-denied class as its own classified
+///    outcome immediately (a [`RightsizeError::Backend`] carrying
+///    [`is_restore_access_denied`]-matchable text — see
+///    [`is_restore_access_denied_error`]), letting the caller
+///    ([`MsbCliBackend::create_checkpoint`]'s own `reboot` closure, via
+///    [`reboot_with_already_exists_retry`], which now retries this class exactly
+///    like msb's own [`RightsizeError::NameConflict`]) advance to the NEXT
+///    candidate right away, rather than exhausting the whole batch one
+///    access-denied at a time.
+///
+/// Every other classified transient (image-cache corruption, the state-database
+/// migration race, the install lock) keeps [`spawn_and_await_running`]'s own
+/// one-shot heal/retry policy unchanged — POLICY v2 only ever touches the
+/// access-denied path. Duplicated here rather than parameterized into
+/// [`spawn_and_await_running`] itself: that function also drives the ordinary
+/// `run` boot path (which has no restore launcher, and never wants this policy
+/// change at all), and keeping the two match arms textually separate makes each
+/// one's own retry policy auditable on its own, the way this module already
+/// prefers (see [`try_run_and_await_running`] vs [`try_restore_and_await_running`]
+/// for the same trade-off made elsewhere).
+fn spawn_and_await_reboot_restore<L>(
+    msb: &Path,
+    spec: &ContainerSpec,
+    snapshot_path: &str,
+    launcher: &L,
+) -> Result<Option<Child>>
+where
+    L: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
+{
+    match try_restore_and_await_running_with_launcher(msb, spec, snapshot_path, launcher) {
+        Ok(child) => Ok(child),
+        Err(PreRunningFailure::Other(e)) => Err(e),
+        Err(PreRunningFailure::RestoreAccessDenied { output }) => {
+            Err(RightsizeError::Backend(format!(
+                "msb restore for sandbox {} hit the Windows job-object access-denied \
+                 transient — this attempt's own candidate is left for the walk's \
+                 best-effort cleanup; the next candidate is tried immediately, escalated \
+                 to the job-free broker on Windows (see the CHANGELOG for the underlying \
+                 cause): {output}",
+                spec.name,
+            )))
+        }
+        Err(PreRunningFailure::InstallLockActive { output }) => {
+            let deadline = Instant::now() + INSTALL_LOCK_RETRY_BUDGET;
+            let mut last = output;
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(RightsizeError::Backend(format!(
+                        "msb restore for sandbox {} was refused for {}s by msb's \
+                         install-operation lock — both observed occurrences cleared within \
+                         seconds, so a lock held this long looks like a genuinely stuck msb \
+                         install on this host.\n{last}",
+                        spec.name,
+                        INSTALL_LOCK_RETRY_BUDGET.as_secs(),
+                    )));
+                }
+                std::thread::sleep(INSTALL_LOCK_RETRY_DELAY);
+                match try_restore_and_await_running_with_launcher(
+                    msb,
+                    spec,
+                    snapshot_path,
+                    launcher,
+                ) {
+                    Ok(child) => return Ok(child),
+                    Err(PreRunningFailure::InstallLockActive { output }) => last = output,
+                    Err(PreRunningFailure::Other(e)) => return Err(e),
+                    Err(PreRunningFailure::RestoreAccessDenied { output }) => {
+                        return Err(RightsizeError::Backend(format!(
+                            "msb restore for sandbox {} hit the Windows job-object \
+                             access-denied transient: {output}",
+                            spec.name,
+                        )));
+                    }
+                    Err(PreRunningFailure::StateDbError { output })
+                    | Err(PreRunningFailure::CacheCorruption { output }) => {
+                        return Err(RightsizeError::Backend(format!(
+                            "msb restore for sandbox {} exited before reaching Running:\n{output}",
+                            spec.name,
+                        )));
+                    }
+                }
+            }
+        }
+        Err(PreRunningFailure::StateDbError { output }) => {
+            std::thread::sleep(STATE_DB_RETRY_DELAY);
+            match try_restore_and_await_running_with_launcher(msb, spec, snapshot_path, launcher) {
+                Ok(child) => Ok(child),
+                Err(PreRunningFailure::StateDbError {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb restore for sandbox {} hit msb's state-database error twice in a \
+                     row — the usual cause (concurrent msb invocations racing startup \
+                     migrations) is transient and one retry covers it, so this looks like \
+                     real state-database trouble on this host.\nfirst attempt:\n{output}\n\
+                     after retry:\n{retry_output}",
+                    spec.name,
+                ))),
+                Err(PreRunningFailure::CacheCorruption {
+                    output: retry_output,
+                })
+                | Err(PreRunningFailure::InstallLockActive {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb restore for sandbox {} exited before reaching Running:\n{retry_output}",
+                    spec.name,
+                ))),
+                Err(PreRunningFailure::RestoreAccessDenied {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb restore for sandbox {} hit the Windows job-object access-denied \
+                     transient: {retry_output}",
+                    spec.name,
+                ))),
+                Err(PreRunningFailure::Other(e)) => Err(e),
+            }
+        }
+        Err(PreRunningFailure::CacheCorruption { output }) => {
+            let heal_result = heal_image_cache(msb, &spec.image);
+            match try_restore_and_await_running_with_launcher(msb, spec, snapshot_path, launcher) {
+                Ok(child) => Ok(child),
+                Err(PreRunningFailure::Other(e)) => Err(e),
+                Err(PreRunningFailure::StateDbError {
+                    output: retry_output,
+                })
+                | Err(PreRunningFailure::InstallLockActive {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb restore for sandbox {} exited before reaching Running:\n{retry_output}",
+                    spec.name,
+                ))),
+                Err(PreRunningFailure::RestoreAccessDenied {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb restore for sandbox {} hit the Windows job-object access-denied \
+                     transient: {retry_output}",
+                    spec.name,
+                ))),
+                Err(PreRunningFailure::CacheCorruption {
+                    output: retry_output,
+                }) => Err(RightsizeError::Backend(format!(
+                    "msb restore for sandbox {} hit its image cache error twice in a row for \
+                     image '{}', even after removing that image's cache entry ({}) and \
+                     retrying — this is likely a deeper cache corruption than this backend's \
+                     one-shot heal covers; try clearing the msb image cache by hand \
+                     (`msb image prune` or removing the cache directory under MSB_HOME).\n\
+                     first attempt:\n{output}\nafter heal + retry:\n{retry_output}",
+                    spec.name,
+                    spec.image,
+                    describe_heal_result(&heal_result),
+                ))),
+            }
+        }
+    }
+}
+
 /// One `msb run`/`msb restore` attempt: dispatches on `spec.checkpoint_ref` — `Some`
 /// means a checkpoint restore (`commands::restore`, on msb 0.7.1+ — never
 /// `--disk-only`, which that command rejects against the disk-scope snapshots this
@@ -2019,20 +2307,73 @@ fn try_restore_and_await_running(
     spec: &ContainerSpec,
     snapshot_path: &str,
 ) -> std::result::Result<Option<Child>, PreRunningFailure> {
-    let argv = commands::restore(spec, snapshot_path);
+    try_restore_and_await_running_with_launcher(msb, spec, snapshot_path, &direct_restore_launcher)
+}
+
+/// One [`RestoreLauncher`] attempt's outcome — see that type's own doc for the
+/// direct-vs-broker abstraction this exists for. `TimedOut` is kept distinct from
+/// `Exited { success: false, .. }` rather than folded into it: a launcher that never
+/// learned whether `msb restore` itself finished has no exit status to report at
+/// all, and [`try_restore_and_await_running_with_launcher`]'s own timeout message
+/// (below) is specific to that — it must never be run through the ordinary
+/// exit-code classification cascade, which assumes a real, classifiable failure
+/// exists to match against.
+#[derive(Debug)]
+enum RestoreLaunch {
+    /// The restore invocation itself exited (successfully or not) within budget.
+    /// `code` is the real process exit code when the launcher can report one — the
+    /// direct launcher always can; the broker can only when its own ecFile actually
+    /// appeared (see [`real_broker_restore_launcher`]'s own doc) — `None` otherwise,
+    /// purely a diagnostic nicety, never required for classification (`success`
+    /// alone gates that).
+    Exited {
+        success: bool,
+        code: Option<i32>,
+        output: String,
+    },
+    /// It never exited (or, for the broker, never confirmed one way or the other —
+    /// see [`real_broker_restore_launcher`]'s own doc) within the launcher's own
+    /// budget.
+    TimedOut { output: String },
+}
+
+/// Injectable seam for launching one `msb restore <ref> --name <name> ...` attempt
+/// and waiting (bounded) to learn whether it activated — abstracts over "spawned as
+/// this process's own child" ([`direct_restore_launcher`], every restore attempt's
+/// default) and "spawned by Windows' WMI provider, outside this process's own job
+/// object" ([`real_broker_restore_launcher`], via [`MsbCliBackend::restore_broker`])
+/// so [`try_restore_and_await_running_with_launcher`]'s own classification cascade,
+/// and the phases after it, never need to know which one ran — see the module docs
+/// and [`MsbCliBackend::create_checkpoint`]'s own doc for POLICY v2, the policy this
+/// seam exists to implement. `argv` is `commands::restore(spec, snapshot_path)`'s
+/// own output — msb's subcommand args, never including the `msb` binary itself
+/// (that's `msb`, the first parameter, threaded separately since the broker embeds
+/// the full path inside a nested command it builds, not just runs directly).
+///
+/// Held as a plain `dyn Fn` (never `FnMut`/`FnOnce`) since every real and fake
+/// implementation is stateless per call — any state (a temp-file counter, a fake's
+/// call log) lives behind its own interior mutability, exactly like every other
+/// injectable seam in this module (`RebootFn` is the one `FnMut` exception, and
+/// that's because the checkpoint reboot's OWN candidate-walking state genuinely has
+/// to mutate across calls).
+type RestoreLauncher = dyn Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + Send + Sync;
+
+/// [`RestoreLauncher`]'s default, ordinary implementation — spawns `msb <argv>` as
+/// this process's own child (piped stdout/stderr, drained into a tail exactly like
+/// every other `msb` invocation in this module) and waits for it to exit, bounded by
+/// [`FIRST_RUN_TIMEOUT`]. Every restore attempt used exactly this shape before
+/// POLICY v2 introduced the broker; factored out, unchanged, so both the ordinary
+/// restore path ([`try_restore_and_await_running`]) and the checkpoint reboot's own
+/// pre-escalation attempts ([`MsbCliBackend::create_checkpoint`]'s `reboot` closure)
+/// share the one implementation.
+fn direct_restore_launcher(msb: &Path, argv: &[String]) -> std::io::Result<RestoreLaunch> {
     let mut child = spawn_msb_command(|| {
         let mut cmd = Command::new(msb);
-        cmd.args(&argv)
+        cmd.args(argv)
             .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
-    })
-    .map_err(|e| {
-        PreRunningFailure::Other(RightsizeError::Backend(format!(
-            "failed to spawn msb {}: {e}",
-            argv.join(" ")
-        )))
     })?;
 
     let stdout_pipe = child.stdout.take().expect("piped stdout");
@@ -2041,23 +2382,67 @@ fn try_restore_and_await_running(
     let t_out = spawn_tail_drain(stdout_pipe, tail.clone());
     let t_err = spawn_tail_drain(stderr_pipe, tail.clone());
 
-    // Phase 1: wait (bounded) for the detached `restore` invocation itself to exit —
-    // see this function's own doc for why that, not `Running`, is the event this
-    // phase waits on.
     let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| PreRunningFailure::Other(RightsizeError::from(e)))?
-        {
-            break status;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let _ = t_out.join();
+            let _ = t_err.join();
+            return Ok(RestoreLaunch::Exited {
+                success: status.success(),
+                code: status.code(),
+                output: collect_tail(&tail),
+            });
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             let _ = t_out.join();
             let _ = t_err.join();
-            let output = collect_tail(&tail);
+            return Ok(RestoreLaunch::TimedOut {
+                output: collect_tail(&tail),
+            });
+        }
+        std::thread::sleep(READINESS_POLL);
+    }
+}
+
+/// The launcher-abstracted body of [`try_restore_and_await_running`] — see that
+/// function's own doc (below this one, since it now just delegates here with
+/// [`direct_restore_launcher`]) for the full three-phase behavior. `launcher`
+/// replaces phase 1's own direct spawn+wait; phases 2 and 3 (the `msb ls` poll,
+/// the workload-revival exec) are unchanged either way, since by the time phase 1
+/// returns, activation has already succeeded or failed regardless of how it was
+/// launched.
+fn try_restore_and_await_running_with_launcher<L>(
+    msb: &Path,
+    spec: &ContainerSpec,
+    snapshot_path: &str,
+    launcher: &L,
+) -> std::result::Result<Option<Child>, PreRunningFailure>
+where
+    L: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
+{
+    let argv = commands::restore(spec, snapshot_path);
+    // Shared across phases 1 and 2, exactly like the pre-launcher-abstraction shape
+    // of this function ("Three phases, one budget" — see its own doc): `launcher`
+    // times phase 1 out against its OWN, independently-computed
+    // `Instant::now() + FIRST_RUN_TIMEOUT` (started within microseconds of this
+    // one), so this is functionally the same one-budget contract for
+    // [`direct_restore_launcher`] — phase 2's own poll loop below is what actually
+    // reads this variable.
+    let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
+
+    // Phase 1: wait (bounded) for the detached `restore` invocation itself to exit —
+    // see `try_restore_and_await_running`'s own doc for why that, not `Running`, is
+    // the event this phase waits on.
+    let (status_success, status_code, output) = match launcher(msb, &argv) {
+        Err(e) => {
+            return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+                "failed to launch msb {}: {e}",
+                argv.join(" ")
+            ))));
+        }
+        Ok(RestoreLaunch::TimedOut { output }) => {
             return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
                 "msb restore for sandbox {} did not exit within {}s — a successful detached \
                  restore activates and exits within seconds, so msb itself may be overloaded \
@@ -2066,13 +2451,14 @@ fn try_restore_and_await_running(
                 FIRST_RUN_TIMEOUT.as_secs()
             ))));
         }
-        std::thread::sleep(READINESS_POLL);
+        Ok(RestoreLaunch::Exited {
+            success,
+            code,
+            output,
+        }) => (success, code, output),
     };
-    let _ = t_out.join();
-    let _ = t_err.join();
-    let output = collect_tail(&tail);
 
-    if !status.success() {
+    if !status_success {
         if is_image_cache_corruption(&output) {
             return Err(PreRunningFailure::CacheCorruption { output });
         }
@@ -2108,7 +2494,7 @@ fn try_restore_and_await_running(
             "msb restore for sandbox {} exited (code {}) — the restore itself failed, so the \
              sandbox never activated; check the snapshot and `msb restore` output below:\n{output}",
             spec.name,
-            status.code().unwrap_or(-1)
+            status_code.unwrap_or(-1)
         ))));
     }
 
@@ -2148,6 +2534,341 @@ fn try_restore_and_await_running(
         }
         std::thread::sleep(READINESS_POLL);
     }
+}
+
+// ---- POLICY v2: the job-free restore broker ----
+//
+// msb's detached restore spawn on Windows (`DETACHED_PROCESS | CREATE_NEW_PROCESS_
+// GROUP | CREATE_BREAKAWAY_FROM_JOB`, upstream sdk/rust/lib/runtime/spawn.rs) is
+// refused with `Access is denied. (os error 5)` — [`is_restore_access_denied`]'s
+// own signature — whenever the calling `msb.exe` sits inside a Windows job object
+// that does not grant breakaway (a Gradle test worker's, or a `cargo test`
+// binary's, own job — live-verified: `inJob=True, limitFlags=0x0`). The mitigation,
+// also live-verified: launching the identical `msb restore` through Windows' WMI
+// provider (`Invoke-CimMethod -ClassName Win32_Process -MethodName Create`) works,
+// because WMI's own child process (`WmiPrvSE.exe`'s) runs OUTSIDE this process's
+// job hierarchy entirely, so ITS OWN internal breakaway spawn is never blocked by a
+// job this process never put it in. [`real_broker_restore_launcher`] is that
+// broker, wired in via [`MsbCliBackend::restore_broker`] and selected only after
+// [`MsbCliBackend::create_checkpoint`]'s own candidate walk has seen the
+// access-denied class once — see that method's own doc for the full policy.
+//
+// Everything below is plain, portable Rust — no `#[cfg(windows)]` anywhere in this
+// section, including [`real_broker_restore_launcher`] itself — so it all compiles
+// and unit-tests (escaping shape, classification) on any host. The Windows gate is
+// a runtime one: [`MsbCliBackend::new`] only ever populates
+// [`MsbCliBackend::restore_broker`] with this launcher when `cfg!(windows)` is
+// true, so it is never REACHED in production off Windows even though it always
+// COMPILES there — see that field's own doc.
+
+/// Escapes `s` for embedding inside a PowerShell single-quoted string literal
+/// (`'...'`) — doubles any embedded single quote, PowerShell's own escape for one.
+/// Mirrors [`watchdog_kill_script`]'s existing `msb.replace('\'', "''")`, factored
+/// out here since the broker's script interpolates several more paths/args than
+/// that one site ever needed to.
+fn powershell_single_quote_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Single-quotes `s` as a PowerShell string literal — [`powershell_single_quote_escape`]
+/// plus the surrounding quotes, since every call site immediately wraps it.
+fn powershell_quoted(s: &str) -> String {
+    format!("'{}'", powershell_single_quote_escape(s))
+}
+
+/// Picks a fresh, non-colliding temp file path for one broker attempt's `label`
+/// (`"script"`, `"out"`, or `"ec"`) — mirrors `provisioner::temp_file_in`'s own
+/// PID+counter shape (no `tempfile` crate dependency for one call site; concurrent
+/// *attempts* within this process are already serialized by the checkpoint reboot's
+/// own candidate walk, so a per-process counter is enough uniqueness here too).
+fn broker_temp_file(label: &str, ext: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        ".rz-restore-broker-{label}-{}-{n}.{ext}",
+        std::process::id()
+    ))
+}
+
+/// Escapes `s` for embedding inside a PowerShell DOUBLE-quoted string literal
+/// (`"..."`) — the escape character there is the backtick, and only backtick,
+/// double-quote, and dollar (which would otherwise trigger `$var`/`$(expr)`
+/// interpolation) need it; a single quote is an ordinary, unescaped character in
+/// a double-quoted context (unlike [`powershell_single_quote_escape`]'s own
+/// single-quoted one). Backtick itself is escaped FIRST, or the escapes just
+/// added for the other two would be reinterpreted as more escapes.
+fn powershell_double_quote_escape(s: &str) -> String {
+    s.replace('`', "``").replace('"', "`\"").replace('$', "`$")
+}
+
+/// Builds the job-free broker's own outer PowerShell script — pure string
+/// building, no I/O, kept separate from [`real_broker_restore_launcher`] (which
+/// writes and runs it) so its shape/escaping is unit-testable on any host. See the
+/// module docs (POLICY v2) for the mechanics this implements:
+///
+/// 1. `msb`/each `argv` element/`out_file`/`ec_file` are each single-quoted via
+///    [`powershell_quoted`] and joined into `& '<msb>' <argv...> *> '<out_file>';
+///    $LASTEXITCODE | Set-Content -Path '<ec_file>'` — this text is valid
+///    PowerShell SOURCE for the SPAWNED process to parse (each single-quoted
+///    token round-trips through that parser's own doubled-quote rule).
+/// 2. That text is wrapped as `powershell -NoProfile -Command "<text>"` — a
+///    plain Win32 command-line string (`"..."` here groups it into ONE argv
+///    token for `CommandLineToArgvW`, nothing PowerShell-specific) — and this
+///    whole thing becomes `CommandLine`'s value for `Invoke-CimMethod
+///    Win32_Process Create`. Embedding it as a literal in THIS (outer) script
+///    uses [`powershell_double_quote_escape`], not another round of
+///    single-quote doubling: the single quotes from step 1 must reach the
+///    spawned process completely UNCHANGED (doubled exactly once, for that
+///    process's own parser, never twice), which is exactly what double-quote
+///    embedding gives for free — single quotes are inert there. Only the
+///    `"`/`$` this step's own wrapping just added need escaping at this layer.
+/// 3. Prints the CIM call's own `ReturnValue`/`ProcessId` (diagnostics only),
+///    waits (bounded to ~30s) for `<ec_file>` to appear, then prints
+///    `EC:<contents>` (only if it appeared) and `<out_file>`'s own contents
+///    between `OUT_BEGIN`/`OUT_END` markers — [`parse_broker_script_output`]'s own
+///    counterpart for these markers. `<ec_file>`/`<out_file>` are single-quoted
+///    directly here too (a single, un-nested embedding — [`powershell_quoted`]
+///    alone is correct for these, unlike `CommandLine`'s own doubly-nested one).
+fn build_broker_script(msb: &Path, argv: &[String], out_file: &Path, ec_file: &Path) -> String {
+    let out_q = powershell_quoted(&out_file.display().to_string());
+    let ec_q = powershell_quoted(&ec_file.display().to_string());
+
+    let inner_restore: String = std::iter::once(powershell_quoted(&msb.display().to_string()))
+        .chain(argv.iter().map(|a| powershell_quoted(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Only single quotes and plain punctuation so far — no `"`/`$`/`` ` `` of
+    // this step's OWN making, so wrapping it below needs no escaping of
+    // `inner_restore`'s own content, only of the two `"` this step adds.
+    let inner_command =
+        format!("& {inner_restore} *> {out_q}; $LASTEXITCODE | Set-Content -Path {ec_q}");
+    let command_line = format!("powershell -NoProfile -Command \"{inner_command}\"");
+    let command_line_dq = powershell_double_quote_escape(&command_line);
+
+    format!(
+        "$rzCmd = \"{command_line_dq}\"\n\
+         $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create \
+         -Arguments @{{ CommandLine = $rzCmd }}\n\
+         Write-Output \"CIM_RETURN:$($result.ReturnValue)\"\n\
+         Write-Output \"CIM_PID:$($result.ProcessId)\"\n\
+         $deadline = (Get-Date).AddSeconds(30)\n\
+         while (-not (Test-Path {ec_q})) {{\n\
+         \x20   if ((Get-Date) -ge $deadline) {{ break }}\n\
+         \x20   Start-Sleep -Milliseconds 300\n\
+         }}\n\
+         if (Test-Path {ec_q}) {{\n\
+         \x20   Write-Output \"EC:$(Get-Content -Path {ec_q} -Raw)\"\n\
+         }}\n\
+         Write-Output 'OUT_BEGIN'\n\
+         if (Test-Path {out_q}) {{ Get-Content -Path {out_q} -Raw }}\n\
+         Write-Output 'OUT_END'\n"
+    )
+}
+
+/// One [`build_broker_script`] run's own stdout, parsed back — [`ec`] is
+/// `$LASTEXITCODE` when the script's own `EC:` line appeared at all (i.e. the
+/// ecFile showed up within the script's own ~30s bound), `out` is the msb restore
+/// invocation's captured stdout+stderr from between the `OUT_BEGIN`/`OUT_END`
+/// markers (empty when absent, never `None` — an absent artifact is not the same
+/// question as an absent exit code).
+#[derive(Debug)]
+struct BrokerScriptReport {
+    ec: Option<i32>,
+    out: String,
+}
+
+/// Parses [`build_broker_script`]'s own stdout shape — the exact inverse of that
+/// function's `Write-Output` calls. Tolerant by construction, matching this
+/// module's usual posture toward msb's own free-text output: a missing `EC:` line
+/// just means `ec: None` (never a parse error), and missing/malformed
+/// `OUT_BEGIN`/`OUT_END` markers yield an empty `out` rather than panicking or
+/// erroring — the caller's own classification already treats "no output" as
+/// unremarkable.
+fn parse_broker_script_output(stdout: &str) -> BrokerScriptReport {
+    let ec = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("EC:"))
+        .and_then(|rest| rest.trim().parse::<i32>().ok());
+    let out = stdout
+        .split_once("OUT_BEGIN")
+        .and_then(|(_, rest)| rest.split_once("OUT_END"))
+        .map(|(body, _)| body.trim().to_string())
+        .unwrap_or_default();
+    BrokerScriptReport { ec, out }
+}
+
+/// Extracts the `--name <value>` argument [`commands::restore`] always includes —
+/// used only by [`classify_broker_report`]'s own missing-ecFile fallback, which
+/// needs the target name to ask `msb ls` about it. `None` only if `argv`'s own
+/// shape ever changes to drop `--name` (defensive; `commands::restore` always
+/// includes it today).
+fn extract_restore_name(argv: &[String]) -> Option<&str> {
+    argv.iter()
+        .position(|a| a == "--name")
+        .and_then(|i| argv.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Turns a completed broker script run into a [`RestoreLaunch`] — the broker's own
+/// counterpart to [`direct_restore_launcher`]'s plain `child.try_wait()` status,
+/// reusing the exact same downstream classification either way (POLICY v2's own
+/// requirement: brokered output is classified through the identical predicates —
+/// [`is_name_conflict`], [`is_restore_access_denied`], etc. — the direct path
+/// applies to `output`, never a broker-specific cascade).
+///
+/// `is_listed` answers "does `msb ls` report this name at all" for exactly one
+/// name — injected (rather than calling `msb ls` inline) so this classification
+/// logic is a pure function, unit-testable without a real `msb` invocation; the
+/// real broker (below) supplies it via `invoke_standalone`/[`ls_json::try_is_listed`].
+///
+/// Three outcomes, per POLICY v2 item 3/4:
+/// - The ecFile appeared (`report.ec` is `Some`): `Exited { success: ec == 0, .. }`
+///   — classified exactly like a direct exit code.
+/// - It never appeared, but `msb ls` reports the target name: "activation-gated,
+///   and the caller polls `ls` to `Running` afterward anyway" (POLICY v2's own
+///   words) — treated as launched, `Exited { success: true, .. }`, so
+///   `try_restore_and_await_running_with_launcher`'s own phase 2 takes over from
+///   here exactly as it would after any other successful launch.
+/// - Neither: genuinely unconfirmed — `TimedOut`, never silently treated as either
+///   outcome.
+fn classify_broker_report(
+    argv: &[String],
+    report: &BrokerScriptReport,
+    is_listed: impl Fn(&str) -> Option<bool>,
+) -> RestoreLaunch {
+    if let Some(ec) = report.ec {
+        return RestoreLaunch::Exited {
+            success: ec == 0,
+            code: Some(ec),
+            output: report.out.clone(),
+        };
+    }
+    if let Some(name) = extract_restore_name(argv) {
+        if is_listed(name) == Some(true) {
+            return RestoreLaunch::Exited {
+                success: true,
+                code: None,
+                output: report.out.clone(),
+            };
+        }
+    }
+    RestoreLaunch::TimedOut {
+        output: report.out.clone(),
+    }
+}
+
+/// Wraps `broker` so an infrastructure failure — the broker itself couldn't even
+/// launch (a missing `powershell.exe`, a script-write failure, ...) — falls back
+/// to `direct` for that SAME attempt, per POLICY v2 item 5: "never make the broker
+/// a new single point of failure." Only the LAUNCH step itself failing (an `Err`
+/// from `broker`) triggers the fallback; a completed brokered attempt — success or
+/// a classified msb failure, either arriving as `Ok(RestoreLaunch::..)` — is
+/// returned as-is, never re-run.
+///
+/// `direct` is a parameter (not hardcoded to [`direct_restore_launcher`]) purely so
+/// this composition is unit-testable with a fake in place of a real `msb`
+/// subprocess; [`MsbCliBackend::create_checkpoint`]'s own reboot closure always
+/// calls this with [`direct_restore_launcher`] in production. Generic (not the
+/// `Send + Sync`-bound [`RestoreLauncher`] trait object) purely so a test's fake
+/// closures don't have to be — this composition is only ever used synchronously,
+/// within the checkpoint reboot's own blocking closure, never stored or moved
+/// across a thread boundary itself.
+fn broker_with_direct_fallback<'a, B, D>(
+    broker: &'a B,
+    direct: &'a D,
+) -> impl Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + 'a
+where
+    B: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
+    D: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
+{
+    move |msb: &Path, argv: &[String]| match broker(msb, argv) {
+        Ok(launch) => Ok(launch),
+        Err(_broker_infra_failure) => direct(msb, argv),
+    }
+}
+
+/// The real [`RestoreLauncher`] POLICY v2 escalates to: writes
+/// [`build_broker_script`]'s own script to a fresh temp file
+/// ([`broker_temp_file`]), runs it via `powershell -NoProfile -File <script>`
+/// (`powershell.exe`, not `pwsh`, for maximum compatibility with every Windows
+/// runner this backend targets — it inherits this process's own job object, but
+/// the WMI-created `msb restore` process it launches does not, which is the whole
+/// point), waits for the OUTER script to exit (bounded by [`FIRST_RUN_TIMEOUT`],
+/// the same generous headroom every restore attempt gets — the script's OWN
+/// internal ecFile wait is a much shorter ~30s, per [`build_broker_script`]),
+/// parses its stdout ([`parse_broker_script_output`]), and classifies the result
+/// ([`classify_broker_report`]) using a real `msb ls` for the missing-ecFile
+/// fallback. Best-effort cleanup of the script/out/ec temp files runs regardless
+/// of outcome.
+///
+/// Only ever WIRED IN on Windows — see [`MsbCliBackend::new`]'s own
+/// `cfg!(windows)` gate on [`MsbCliBackend::restore_broker`], the actual
+/// Windows-gate POLICY v2 calls for ("cfg(windows) for the powershell
+/// specifics... at runtime"). This function's own body has no `#[cfg(windows)]`
+/// of its own, deliberately: `powershell`/WMI/CIM are meaningless off Windows,
+/// but spawning a nonexistent `powershell` binary there just fails with a plain
+/// `io::Error` — exactly the "broker infrastructure failure" shape
+/// [`broker_with_direct_fallback`] already has to handle regardless of cause —
+/// so a runtime gate plus one portable implementation is both simpler and, unlike
+/// a `#[cfg(windows)]`/`#[cfg(not(windows))]` split, never leaves
+/// [`build_broker_script`]/[`parse_broker_script_output`]/
+/// [`classify_broker_report`] looking unused to a non-Windows `cargo clippy`.
+fn real_broker_restore_launcher(msb: &Path, argv: &[String]) -> std::io::Result<RestoreLaunch> {
+    let script_file = broker_temp_file("script", "ps1");
+    let out_file = broker_temp_file("out", "log");
+    let ec_file = broker_temp_file("ec", "txt");
+    let script = build_broker_script(msb, argv, &out_file, &ec_file);
+    std::fs::write(&script_file, script)?;
+
+    let run = (|| -> std::io::Result<RestoreLaunch> {
+        let mut child = spawn_msb_command(|| {
+            let mut cmd = Command::new("powershell");
+            cmd.arg("-NoProfile")
+                .arg("-File")
+                .arg(&script_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        })?;
+        let stdout_pipe = child.stdout.take().expect("piped stdout");
+        let stderr_pipe = child.stderr.take().expect("piped stderr");
+        let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let t_out = spawn_tail_drain(stdout_pipe, tail.clone());
+        let t_err = spawn_tail_drain(stderr_pipe, tail.clone());
+
+        let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
+        loop {
+            if child.try_wait()?.is_some() {
+                let _ = t_out.join();
+                let _ = t_err.join();
+                let script_stdout = collect_tail(&tail);
+                let report = parse_broker_script_output(&script_stdout);
+                return Ok(classify_broker_report(argv, &report, |name| {
+                    invoke_standalone(msb, &commands::ls(), LOGS_TIMEOUT)
+                        .ok()
+                        .and_then(|r| ls_json::try_is_listed(&r.stdout, name))
+                }));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = t_out.join();
+                let _ = t_err.join();
+                return Ok(RestoreLaunch::TimedOut {
+                    output: collect_tail(&tail),
+                });
+            }
+            std::thread::sleep(READINESS_POLL);
+        }
+    })();
+
+    let _ = std::fs::remove_file(&script_file);
+    let _ = std::fs::remove_file(&out_file);
+    let _ = std::fs::remove_file(&ec_file);
+    run
 }
 
 /// Phase 3 of [`try_restore_and_await_running`]: the restored sandbox reached
@@ -2748,10 +3469,16 @@ fn msb_checkpoint_cycle_inner<T>(
 /// [`CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY`] (see
 /// [`msb_checkpoint_cycle`] above).
 ///
-/// Only [`RightsizeError::NameConflict`] is retried at all — any other error
-/// `reboot` returns (on the first attempt or a later one) surfaces
-/// immediately, the same as it always has; retrying a non-conflict failure on
-/// this budget would just delay reporting a real problem.
+/// [`RightsizeError::NameConflict`] is retried — and, since round 10 (POLICY
+/// v2), so is the classified Windows access-denied class, which
+/// [`spawn_and_await_reboot_restore`] surfaces as a [`RightsizeError::Backend`]
+/// carrying [`is_restore_access_denied`]-matchable text (see
+/// [`is_restore_access_denied_error`]) rather than retrying it in place under
+/// the same candidate — see [`MsbCliBackend::create_checkpoint`]'s own doc for
+/// why. Any OTHER error `reboot` returns (on the first attempt or a later one)
+/// surfaces immediately, the same as it always has; retrying a genuinely
+/// unclassified failure on this budget would just delay reporting a real
+/// problem.
 ///
 /// **This function itself still only ever retries the SAME call to `reboot`
 /// — it has no notion of "candidates" at all.** `MsbCliBackend::create_checkpoint`'s
@@ -2779,6 +3506,7 @@ fn reboot_with_already_exists_retry<T>(
     let mut last_message = match reboot(checkpoint_ref, captured_cmdline) {
         Ok(rebooted) => return Ok(rebooted),
         Err(RightsizeError::NameConflict { message, .. }) => message,
+        Err(RightsizeError::Backend(message)) if is_restore_access_denied(&message) => message,
         Err(e) => {
             return Err(RightsizeError::Backend(format!(
                 "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
@@ -2789,14 +3517,19 @@ fn reboot_with_already_exists_retry<T>(
     };
     loop {
         if Instant::now() >= deadline {
+            let refusal = if is_restore_access_denied(&last_message) {
+                "the Windows job-object access-denied transient"
+            } else {
+                "msb's \"already exists\" refusal"
+            };
             return Err(RightsizeError::Backend(format!(
-                "re-booting sandbox {name} from checkpoint {checkpoint_ref} kept hitting msb's \
-                 \"already exists\" refusal for {}s after `msb ls` had already confirmed the \
-                 name clear ({last_message}) — msb's own on-disk directory release can lag its \
-                 DB record's own release on a loaded Windows host well past a short wait, but a \
-                 refusal that never clears this long looks like a genuinely stuck sandbox \
-                 rather than a release race; the sandbox was removed but its state is preserved \
-                 in checkpoint {checkpoint_ref}, restorable via Container::from_checkpoint(...)",
+                "re-booting sandbox {name} from checkpoint {checkpoint_ref} kept hitting {refusal} \
+                 for {}s after `msb ls` had already confirmed the name clear ({last_message}) — \
+                 msb's own on-disk directory release can lag its DB record's own release on a \
+                 loaded Windows host well past a short wait, but a refusal that never clears \
+                 this long looks like a genuinely stuck sandbox rather than a release race; the \
+                 sandbox was removed but its state is preserved in checkpoint {checkpoint_ref}, \
+                 restorable via Container::from_checkpoint(...)",
                 retry_budget.as_secs(),
             )));
         }
@@ -2804,12 +3537,15 @@ fn reboot_with_already_exists_retry<T>(
         match reboot(checkpoint_ref, captured_cmdline) {
             Ok(rebooted) => return Ok(rebooted),
             Err(RightsizeError::NameConflict { message, .. }) => last_message = message,
+            Err(RightsizeError::Backend(message)) if is_restore_access_denied(&message) => {
+                last_message = message;
+            }
             Err(e) => {
                 return Err(RightsizeError::Backend(format!(
                     "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) \
-                     after previously hitting msb's \"already exists\" refusal ({last_message}) \
-                     — the sandbox was removed but its state is preserved in checkpoint \
-                     {checkpoint_ref}, restorable via Container::from_checkpoint(...)"
+                     after previously hitting a refusal ({last_message}) — the sandbox was \
+                     removed but its state is preserved in checkpoint {checkpoint_ref}, \
+                     restorable via Container::from_checkpoint(...)"
                 )));
             }
         }
@@ -4494,6 +5230,796 @@ mod tests {
         assert!(
             stop_rm_calls.contains(&format!("rm {}", candidates[1])),
             "the second refused candidate must be best-effort removed: {stop_rm_calls}"
+        );
+    }
+
+    // ---- round 10 / POLICY v2: access-denied advances immediately (never a
+    // same-name retry), then escalates to the job-free broker ----
+
+    /// Like [`write_fake_msb_for_checkpoint_reboot`], but `restore` refuses with
+    /// the Windows post-teardown access-denied transient's exact wording (see
+    /// [`is_restore_access_denied`]) for the first `access_denied_refusals`
+    /// invocations, REGARDLESS of candidate name, instead of msb's "already
+    /// exists" wording — the round-10 counterpart proving the candidate walk
+    /// advances on THIS classification too, with no inline same-name retry.
+    #[cfg(unix)]
+    fn write_fake_msb_for_checkpoint_reboot_access_denied(
+        dir: &Path,
+        access_denied_refusals: u32,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-checkpoint-reboot-access-denied.sh");
+        let snapshot_path = dir
+            .join("checkpoints")
+            .join("source-sandbox")
+            .join("snap_fake")
+            .display()
+            .to_string();
+        let body = format!(
+            "#!/bin/sh\n\
+             dir=\"$(dirname \"$0\")\"\n\
+             case \"$1\" in\n\
+             snapshot)\n\
+             echo 'Snapshot ID: deadbeefcafedeadbeefcafedeadbeef'\n\
+             echo '{snapshot_path}'\n\
+             exit 0\n\
+             ;;\n\
+             restore)\n\
+             echo \"$*\" >> \"$dir/restore-argv\"\n\
+             n=$(cat \"$dir/restore-calls\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$dir/restore-calls\"\n\
+             if [ \"$n\" -lt {access_denied_refusals} ]; then\n\
+             echo 'error: io error: Access is denied. (os error 5)' 1>&2\n\
+             exit 1\n\
+             fi\n\
+             echo \"$4\" > \"$dir/winning-name\"\n\
+             exit 0\n\
+             ;;\n\
+             ls)\n\
+             n=$(cat \"$dir/ls-calls\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$dir/ls-calls\"\n\
+             if [ \"$n\" -eq 0 ]; then\n\
+             echo '[]'\n\
+             else\n\
+             winner=$(cat \"$dir/winning-name\" 2>/dev/null || echo '')\n\
+             echo \"[{{\\\"name\\\":\\\"$winner\\\",\\\"status\\\":\\\"Running\\\"}}]\"\n\
+             fi\n\
+             exit 0\n\
+             ;;\n\
+             exec)\n\
+             shift\n\
+             echo \"$*\" >> \"$dir/exec-calls\"\n\
+             while [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
+             exit 0\n\
+             ;;\n\
+             stop|rm)\n\
+             echo \"$1 $2\" >> \"$dir/stop-rm-calls\"\n\
+             winner=$(cat \"$dir/winning-name\" 2>/dev/null || echo '')\n\
+             if [ -n \"$winner\" ] && [ \"$2\" = \"$winner\" ]; then touch \"$dir/stop-requested\"; fi\n\
+             exit 0\n\
+             ;;\n\
+             esac\n\
+             exit 0\n"
+        );
+        std::fs::write(&script, body)
+            .expect("write fake msb checkpoint-reboot-access-denied script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms)
+            .expect("chmod fake msb checkpoint-reboot-access-denied script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_checkpoint_reboot_an_access_denied_advances_immediately_never_retrying_the_same_candidate()
+     {
+        // Task (a)'s own red-proof: the OLD behavior retried an access-denied
+        // attempt under the SAME candidate name inside the spawn path, which —
+        // because the failed attempt's record already exists — converted the
+        // retry into msb's own "already exists" collision, burning the
+        // candidate anyway but only after a wasted extra `restore` call under
+        // the SAME name. The new behavior must call `restore` under candidate
+        // 0 exactly ONCE before moving to candidate 1 — never twice under the
+        // same name first.
+        let dir = unique_test_dir("checkpoint-reboot-access-denied-advance");
+        let old_name = "rz-checkpoint-ad-old";
+        let candidates = vec![
+            "rz-checkpoint-ad-cand-0".to_string(),
+            "rz-checkpoint-ad-cand-1".to_string(),
+        ];
+        let script = write_fake_msb_for_checkpoint_reboot_access_denied(&dir, 1);
+        let backend = MsbCliBackend::new(script);
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            ..ContainerSpec::new(old_name, "unused-image", "run-1")
+        };
+        let handle = backend.create(spec).await.expect("create must succeed");
+        let checkpoint_hint = dir
+            .join("checkpoints")
+            .join("rz-ckpt-test")
+            .display()
+            .to_string();
+
+        let (_checkpoint_ref, new_handle) = backend
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
+            .await
+            .expect(
+                "an access-denied on candidate 0 must advance to candidate 1 and succeed — on \
+                 this (non-Windows) host, candidate 1 stays on the direct path since no broker \
+                 was ever configured",
+            );
+        assert_eq!(new_handle.id(), candidates[1]);
+
+        let restore_argv = std::fs::read_to_string(dir.join("restore-argv")).unwrap();
+        let argv_lines: Vec<&str> = restore_argv.lines().collect();
+        assert_eq!(
+            argv_lines.len(),
+            2,
+            "exactly one restore attempt per candidate — never a wasted same-name retry \
+             after the access-denied hit: {restore_argv}"
+        );
+        assert!(
+            argv_lines[0].contains(&format!("--name {}", candidates[0])),
+            "{restore_argv}"
+        );
+        assert!(
+            argv_lines[1].contains(&format!("--name {}", candidates[1])),
+            "the second attempt must target a DIFFERENT candidate, never retry candidate 0: \
+             {restore_argv}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_checkpoint_reboot_escalates_to_the_injected_broker_after_an_access_denied_and_succeeds()
+     {
+        // Task (b)'s own red-proof: once an access-denied is seen, the REMAINING
+        // candidate attempts must launch through the broker seam instead of a
+        // direct spawn. A fake broker is injected via `with_restore_broker` (no
+        // real Windows/powershell/WMI needed) — it never shells out to the fake
+        // `msb` script at all; it just records its own argv and reports success,
+        // exactly the shape a real brokered `msb restore` success would report
+        // back through this same seam.
+        let dir = unique_test_dir("checkpoint-reboot-broker-escalation");
+        let old_name = "rz-checkpoint-broker-old";
+        let candidates = vec![
+            "rz-checkpoint-broker-cand-0".to_string(),
+            "rz-checkpoint-broker-cand-1".to_string(),
+        ];
+        let script = write_fake_msb_for_checkpoint_reboot_access_denied(&dir, 1);
+        let broker_calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let broker_calls_for_closure = broker_calls.clone();
+        let dir_for_closure = dir.clone();
+        let backend = MsbCliBackend::with_restore_broker(script, move |_msb, argv| {
+            broker_calls_for_closure.lock().unwrap().push(argv.to_vec());
+            // A real broker's success also activates the sandbox under `msb`
+            // itself — this fake stands in for that by writing `winning-name`
+            // directly, so the fake script's OWN `ls`/`exec`/`stop`/`rm` cases
+            // (still driven for real, through phases 2/3) see the right name.
+            let name = extract_restore_name(argv)
+                .expect("--name present")
+                .to_string();
+            std::fs::write(dir_for_closure.join("winning-name"), &name).unwrap();
+            Ok(RestoreLaunch::Exited {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        });
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            ..ContainerSpec::new(old_name, "unused-image", "run-1")
+        };
+        let handle = backend.create(spec).await.expect("create must succeed");
+        let checkpoint_hint = dir
+            .join("checkpoints")
+            .join("rz-ckpt-test")
+            .display()
+            .to_string();
+
+        let (_checkpoint_ref, new_handle) = backend
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
+            .await
+            .expect("the brokered candidate-1 attempt must succeed");
+        assert_eq!(new_handle.id(), candidates[1]);
+
+        // Candidate 0's direct attempt reached the fake script exactly once
+        // (the access-denied hit); candidate 1 never did — it was brokered.
+        let restore_calls: u32 = std::fs::read_to_string(dir.join("restore-calls"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            restore_calls, 1,
+            "the escalated candidate must never reach the direct restore path: {restore_calls}"
+        );
+
+        let calls = broker_calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the broker must be invoked exactly once, for the escalated candidate only: \
+             {calls:?}"
+        );
+        assert!(
+            calls[0].contains(&"--name".to_string()) && calls[0].contains(&candidates[1]),
+            "the broker's own argv must target candidate 1: {:?}",
+            calls[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_checkpoint_reboot_falls_back_to_direct_when_the_broker_itself_cannot_launch() {
+        // POLICY v2 item 5: a broker INFRASTRUCTURE failure (here: the injected
+        // broker always errors, standing in for a missing `powershell.exe`/CIM
+        // failure/script-write failure) must fall back to a direct attempt for
+        // that same candidate and keep walking — never become a new single
+        // point of failure. The fake script accepts candidate 1 directly (only
+        // ONE access-denied refusal is configured), so this proves the
+        // fallback actually reached the direct launcher rather than just
+        // failing outright.
+        let dir = unique_test_dir("checkpoint-reboot-broker-infra-failure");
+        let old_name = "rz-checkpoint-broker-infra-old";
+        let candidates = vec![
+            "rz-checkpoint-broker-infra-cand-0".to_string(),
+            "rz-checkpoint-broker-infra-cand-1".to_string(),
+        ];
+        let script = write_fake_msb_for_checkpoint_reboot_access_denied(&dir, 1);
+        let broker_calls = Arc::new(Mutex::new(0u32));
+        let broker_calls_for_closure = broker_calls.clone();
+        let backend = MsbCliBackend::with_restore_broker(script, move |_msb, _argv| {
+            *broker_calls_for_closure.lock().unwrap() += 1;
+            Err(std::io::Error::other("simulated: powershell.exe not found"))
+        });
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            ..ContainerSpec::new(old_name, "unused-image", "run-1")
+        };
+        let handle = backend.create(spec).await.expect("create must succeed");
+        let checkpoint_hint = dir
+            .join("checkpoints")
+            .join("rz-ckpt-test")
+            .display()
+            .to_string();
+
+        let (_checkpoint_ref, new_handle) = backend
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
+            .await
+            .expect(
+                "a broker infrastructure failure must fall back to direct, never sink the \
+                 whole reboot",
+            );
+        assert_eq!(new_handle.id(), candidates[1]);
+
+        assert_eq!(
+            *broker_calls.lock().unwrap(),
+            1,
+            "the broker must have been TRIED once (and failed to even launch)"
+        );
+        let restore_argv = std::fs::read_to_string(dir.join("restore-argv")).unwrap();
+        assert!(
+            restore_argv.contains(&format!("--name {}", candidates[1])),
+            "the direct fallback must have actually reached the fake msb script for \
+             candidate 1: {restore_argv}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_backend_only_carries_a_restore_broker_on_windows() {
+        // "Non-Windows never brokers," at the wiring level: `MsbCliBackend::new`
+        // populates `restore_broker` if and only if `cfg!(windows)` — the
+        // escalation check itself has no separate platform logic of its own
+        // (see `create_checkpoint`'s own doc), so this one assertion is what
+        // actually keeps production off the broker path everywhere but Windows.
+        let backend = MsbCliBackend::new(PathBuf::from("msb"));
+        assert_eq!(backend.restore_broker.is_some(), cfg!(windows));
+    }
+
+    // ---- round 10 / POLICY v2: pure-Rust unit tests (no subprocess, run on any
+    // host) for the access-denied-no-inline-retry policy and the broker seam ----
+
+    #[test]
+    fn spawn_and_await_reboot_restore_never_retries_an_access_denied_attempt_in_place() {
+        let calls = RefCell::new(0u32);
+        let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            *calls.borrow_mut() += 1;
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output: "error: io error: Access is denied. (os error 5)".to_string(),
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-reboot-restore-ad", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        spec.command = Some(vec!["true".to_string()]);
+
+        let err = spawn_and_await_reboot_restore(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("an access-denied attempt must surface as its own classified error");
+
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "the launcher must be called EXACTLY once — no inline same-attempt retry"
+        );
+        assert!(
+            is_restore_access_denied_error(&err),
+            "the surfaced error must still classify as the access-denied class: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_and_await_reboot_restore_still_retries_the_state_db_race_once() {
+        // Every OTHER classified transient keeps `spawn_and_await_running`'s own
+        // one-shot retry policy unchanged — only the access-denied path changed.
+        // The retry's own output is a SECOND, unrelated classified failure
+        // (never a success) purely so this returns fast: a `RestoreLaunch::
+        // Exited { success: true, .. }` would carry phase 1 on into phase 2's
+        // `msb ls` poll, which has no real `msb` binary to answer it here and
+        // would just spin for the full `FIRST_RUN_TIMEOUT` before giving up —
+        // `calls` alone already proves the one-shot retry ran, with no need to
+        // ever reach phase 2 at all.
+        let calls = RefCell::new(0u32);
+        let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            let n = {
+                let mut c = calls.borrow_mut();
+                *c += 1;
+                *c
+            };
+            let output = if n == 1 {
+                "error: database error: UNIQUE constraint failed".to_string()
+            } else {
+                "error: some unrelated, unclassified restore failure".to_string()
+            };
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output,
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-reboot-restore-statedb", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        spec.command = Some(vec!["true".to_string()]);
+
+        let err = spawn_and_await_reboot_restore(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("the second, unrelated failure must still surface as an error");
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "the state-database race must still be retried exactly once: {}",
+            *calls.borrow()
+        );
+        assert!(
+            err.to_string().contains("unrelated"),
+            "the retry's own (different) failure must be the one surfaced: {err}"
+        );
+    }
+
+    #[test]
+    fn reboot_with_already_exists_retry_also_retries_the_classified_access_denied_class() {
+        // Round 10's own extension of the round-9 "already exists" red-proof:
+        // the retry loop must advance past the access-denied class exactly the
+        // way it already does for `RightsizeError::NameConflict` — proving
+        // `MsbCliBackend::create_checkpoint`'s own `reboot` closure (which
+        // ALREADY advances its candidate on every call, access-denied included)
+        // actually gets called again rather than the whole cycle failing on the
+        // first access-denied hit.
+        let reboot_calls = RefCell::new(0u32);
+        let result = {
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                let mut n = reboot_calls.borrow_mut();
+                *n += 1;
+                if *n == 1 {
+                    return Err(RightsizeError::Backend(
+                        "msb restore for sandbox rz-abc-1 hit the Windows job-object \
+                         access-denied transient: error: io error: Access is denied. \
+                         (os error 5)"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            };
+            reboot_with_already_exists_retry(
+                &mut reboot,
+                "/fake/checkpoints/rz-ckpt-1",
+                None,
+                "rz-abc-1",
+                Duration::from_millis(200),
+                Duration::from_millis(1),
+            )
+        };
+        result.expect(
+            "an access-denied refusal must be retried (i.e. the candidate walk \
+                        advances), not surfaced immediately",
+        );
+        assert_eq!(*reboot_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn reboot_with_already_exists_retry_a_persistent_access_denied_class_still_fails_clearly() {
+        let reboot_calls = RefCell::new(0u32);
+        let budget = Duration::from_millis(150);
+        let delay = Duration::from_millis(1);
+        let result = {
+            let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+                *reboot_calls.borrow_mut() += 1;
+                Err(RightsizeError::Backend(
+                    "hit the Windows job-object access-denied transient: error: io error: \
+                     Access is denied. (os error 5)"
+                        .to_string(),
+                ))
+            };
+            reboot_with_already_exists_retry(
+                &mut reboot,
+                "/fake/checkpoints/rz-ckpt-1",
+                None,
+                "rz-abc-1",
+                budget,
+                delay,
+            )
+        };
+        let err = result
+            .expect_err("a persistent access-denied refusal must not retry forever, nor succeed");
+        let msg = err.to_string();
+        assert!(msg.contains("access-denied"), "{msg}");
+        assert!(msg.contains("Container::from_checkpoint"), "{msg}");
+        assert!(*reboot_calls.borrow() > 2, "{}", *reboot_calls.borrow());
+    }
+
+    #[test]
+    fn is_restore_access_denied_error_matches_a_backend_error_carrying_the_windows_wording() {
+        assert!(is_restore_access_denied_error(&RightsizeError::Backend(
+            "prefix: error: io error: Access is denied. (os error 5)".to_string()
+        )));
+    }
+
+    #[test]
+    fn is_restore_access_denied_error_ignores_other_error_shapes() {
+        assert!(!is_restore_access_denied_error(&RightsizeError::Backend(
+            "some other failure".to_string()
+        )));
+        assert!(!is_restore_access_denied_error(
+            &RightsizeError::NameConflict {
+                message: "error: io error: Access is denied. (os error 5)".to_string(),
+                source: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn build_broker_script_single_quotes_every_interpolated_path_and_arg() {
+        let script = build_broker_script(
+            Path::new("/opt/msb/msb"),
+            &[
+                "restore".to_string(),
+                "/snap/path".to_string(),
+                "--name".to_string(),
+                "rz-abc-1".to_string(),
+            ],
+            Path::new("/tmp/out.log"),
+            Path::new("/tmp/ec.txt"),
+        );
+        assert!(script.contains("'/opt/msb/msb'"), "{script}");
+        assert!(script.contains("'restore'"), "{script}");
+        assert!(script.contains("'/snap/path'"), "{script}");
+        assert!(script.contains("'--name'"), "{script}");
+        assert!(script.contains("'rz-abc-1'"), "{script}");
+        assert!(script.contains("'/tmp/out.log'"), "{script}");
+        assert!(script.contains("'/tmp/ec.txt'"), "{script}");
+        assert!(script.contains("Invoke-CimMethod"), "{script}");
+        assert!(script.contains("Win32_Process"), "{script}");
+        assert!(script.contains("LASTEXITCODE"), "{script}");
+        assert!(script.contains("OUT_BEGIN"), "{script}");
+        assert!(script.contains("OUT_END"), "{script}");
+    }
+
+    #[test]
+    fn build_broker_script_doubles_embedded_single_quotes_in_every_interpolated_value() {
+        let script = build_broker_script(
+            Path::new("/opt/it's/msb"),
+            &[
+                "restore".to_string(),
+                "/snap/it's/here".to_string(),
+                "--name".to_string(),
+                "rz-abc-1".to_string(),
+            ],
+            Path::new("/tmp/it's/out.log"),
+            Path::new("/tmp/ec.txt"),
+        );
+        assert!(
+            script.contains("/opt/it''s/msb"),
+            "an embedded single quote in the msb path must be doubled: {script}"
+        );
+        assert!(
+            script.contains("/snap/it''s/here"),
+            "an embedded single quote in an argv element must be doubled: {script}"
+        );
+        assert!(
+            script.contains("/tmp/it''s/out.log"),
+            "an embedded single quote in the out-file path must be doubled: {script}"
+        );
+        // No UNESCAPED single quote may follow directly after these values, which
+        // would prematurely close a PowerShell string literal.
+        assert!(!script.contains("it's"), "{script}");
+    }
+
+    #[test]
+    fn powershell_single_quote_escape_doubles_single_quotes_and_leaves_everything_else_alone() {
+        assert_eq!(powershell_single_quote_escape("plain"), "plain");
+        assert_eq!(powershell_single_quote_escape("it's"), "it''s");
+        assert_eq!(powershell_single_quote_escape("''"), "''''");
+        assert_eq!(powershell_quoted("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn broker_temp_file_produces_distinct_paths_across_calls() {
+        let a = broker_temp_file("script", "ps1");
+        let b = broker_temp_file("script", "ps1");
+        assert_ne!(a, b, "two calls in the same process must never collide");
+        assert!(a.to_string_lossy().contains("script"));
+        assert!(a.extension().and_then(|e| e.to_str()) == Some("ps1"));
+    }
+
+    #[test]
+    fn extract_restore_name_finds_the_value_right_after_the_name_flag() {
+        let argv = vec![
+            "restore".to_string(),
+            "/snap".to_string(),
+            "--name".to_string(),
+            "rz-abc-1".to_string(),
+            "-m".to_string(),
+            "512M".to_string(),
+        ];
+        assert_eq!(extract_restore_name(&argv), Some("rz-abc-1"));
+    }
+
+    #[test]
+    fn extract_restore_name_is_none_when_name_flag_is_absent() {
+        assert_eq!(extract_restore_name(&["restore".to_string()]), None);
+        assert_eq!(
+            extract_restore_name(&["restore".to_string(), "--name".to_string()]),
+            None,
+            "a trailing --name with no value must not panic or return a bogus name"
+        );
+    }
+
+    #[test]
+    fn parse_broker_script_output_reads_the_last_ec_line_and_the_out_markers() {
+        let stdout =
+            "CIM_RETURN:0\nCIM_PID:1234\nEC_FOUND:True\nEC:0\nOUT_BEGIN\nhello\nworld\nOUT_END\n";
+        let report = parse_broker_script_output(stdout);
+        assert_eq!(report.ec, Some(0));
+        assert_eq!(report.out, "hello\nworld");
+    }
+
+    #[test]
+    fn parse_broker_script_output_ec_is_none_when_the_ecfile_never_appeared() {
+        let stdout = "CIM_RETURN:0\nCIM_PID:1234\nEC_FOUND:False\nOUT_BEGIN\nOUT_END\n";
+        let report = parse_broker_script_output(stdout);
+        assert_eq!(report.ec, None);
+        assert_eq!(report.out, "");
+    }
+
+    #[test]
+    fn parse_broker_script_output_tolerates_malformed_or_missing_markers() {
+        let report = parse_broker_script_output("garbage, not a script report at all");
+        assert_eq!(report.ec, None);
+        assert_eq!(report.out, "");
+    }
+
+    #[test]
+    fn classify_broker_report_a_present_ecfile_zero_is_success() {
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let report = BrokerScriptReport {
+            ec: Some(0),
+            out: "restored fine".to_string(),
+        };
+        let launch = classify_broker_report(&argv, &report, |_| panic!("must not consult ls"));
+        match launch {
+            RestoreLaunch::Exited {
+                success,
+                code,
+                output,
+            } => {
+                assert!(success);
+                assert_eq!(code, Some(0));
+                assert_eq!(output, "restored fine");
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_broker_report_a_present_ecfile_nonzero_is_failure_classified_like_direct_output() {
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let report = BrokerScriptReport {
+            ec: Some(1),
+            out: "error: sandbox already exists".to_string(),
+        };
+        let launch = classify_broker_report(&argv, &report, |_| panic!("must not consult ls"));
+        match launch {
+            RestoreLaunch::Exited {
+                success, output, ..
+            } => {
+                assert!(!success);
+                assert!(is_name_conflict(&output), "{output}");
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_broker_report_a_present_ecfile_can_report_access_denied_again() {
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let report = BrokerScriptReport {
+            ec: Some(1),
+            out: "error: io error: Access is denied. (os error 5)".to_string(),
+        };
+        let launch = classify_broker_report(&argv, &report, |_| panic!("must not consult ls"));
+        match launch {
+            RestoreLaunch::Exited {
+                success, output, ..
+            } => {
+                assert!(!success);
+                assert!(is_restore_access_denied(&output), "{output}");
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_broker_report_missing_ecfile_but_ls_shows_the_name_is_treated_as_launched() {
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let report = BrokerScriptReport {
+            ec: None,
+            out: String::new(),
+        };
+        let launch = classify_broker_report(&argv, &report, |name| {
+            assert_eq!(name, "rz-1");
+            Some(true)
+        });
+        match launch {
+            RestoreLaunch::Exited { success, .. } => assert!(success),
+            other => panic!("expected Exited{{success:true}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_broker_report_missing_ecfile_and_ls_silent_is_genuinely_unconfirmed() {
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let report = BrokerScriptReport {
+            ec: None,
+            out: String::new(),
+        };
+        let launch = classify_broker_report(&argv, &report, |_| Some(false));
+        assert!(
+            matches!(launch, RestoreLaunch::TimedOut { .. }),
+            "neither an ecFile nor an `ls` hit must never be silently treated as success"
+        );
+    }
+
+    #[test]
+    fn broker_with_direct_fallback_uses_the_broker_when_it_launches_successfully() {
+        let direct_calls = RefCell::new(0u32);
+        let broker = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            Ok(RestoreLaunch::Exited {
+                success: true,
+                code: Some(0),
+                output: "brokered".to_string(),
+            })
+        };
+        let direct = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            *direct_calls.borrow_mut() += 1;
+            Ok(RestoreLaunch::Exited {
+                success: true,
+                code: Some(0),
+                output: "direct".to_string(),
+            })
+        };
+        let composed = broker_with_direct_fallback(&broker, &direct);
+        let launch = composed(Path::new("/msb"), &[]).expect("must succeed");
+        match launch {
+            RestoreLaunch::Exited { output, .. } => assert_eq!(output, "brokered"),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+        assert_eq!(
+            *direct_calls.borrow(),
+            0,
+            "a broker that launches successfully must never fall back to direct"
+        );
+    }
+
+    #[test]
+    fn broker_with_direct_fallback_falls_back_to_direct_when_the_broker_cannot_even_launch() {
+        let broker_calls = RefCell::new(0u32);
+        let broker = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            *broker_calls.borrow_mut() += 1;
+            Err(std::io::Error::other("simulated: powershell.exe not found"))
+        };
+        let direct = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            Ok(RestoreLaunch::Exited {
+                success: true,
+                code: Some(0),
+                output: "direct".to_string(),
+            })
+        };
+        let composed = broker_with_direct_fallback(&broker, &direct);
+        let launch = composed(Path::new("/msb"), &[])
+            .expect("a broker infra failure must fall back to direct, not propagate");
+        match launch {
+            RestoreLaunch::Exited { output, .. } => assert_eq!(output, "direct"),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+        assert_eq!(*broker_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn try_restore_and_await_running_with_launcher_classifies_brokered_output_through_the_same_predicates_the_direct_path_uses()
+     {
+        // POLICY v2's own requirement: brokered output is classified through the
+        // IDENTICAL cascade the direct path uses — no broker-specific
+        // classification logic exists at all. This proves it end to end: a fake
+        // launcher stands in for a fully brokered attempt (as
+        // `classify_broker_report` would build it) and the SAME
+        // `is_restore_access_denied` signature is what `PreRunningFailure`
+        // reports back out.
+        let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output: "error: io error: Access is denied. (os error 5)".to_string(),
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-brokered-classification", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        let err = try_restore_and_await_running_with_launcher(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("a brokered access-denied output must classify the same as a direct one");
+        assert!(
+            matches!(err, PreRunningFailure::RestoreAccessDenied { .. }),
+            "{err:?}"
         );
     }
 

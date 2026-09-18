@@ -270,6 +270,47 @@ reaches its first tagged release.
   `rightsize-msb` lib test target outright (E0433 on the unix-only module
   path, E0599 on the resulting method). The helper is now gated the same way
   its callers already are.
+- **A checkpoint reboot's access-denied class no longer burns a candidate on a
+  retry that could never work, and now escalates to a job-free broker instead
+  of just walking the batch faster.** A live diagnostic campaign against a real
+  Windows runner traced the root cause: `msb restore` is detached by design, so
+  msb spawns a second `msb.exe` as the sandbox's own supervisor, passing
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`.
+  Gradle test workers and `cargo test` binaries both run inside a Windows job
+  object that does not grant breakaway (confirmed live: `inJob=True,
+  limitFlags=0x0`), so that spawn is refused outright with the same "Access is
+  denied. (os error 5)" this backend already classified — but by then msb's
+  own `persist_start` stage has ALREADY inserted the candidate's DB record.
+  The previous release's fix (see the "advances to a brand-new candidate name"
+  entry above) described this as resolving into an "already exists" refusal;
+  in practice, that resolution happened via a same-name retry INSIDE the spawn
+  path, which is itself the problem — retrying the identical candidate just
+  turns the access-denied into that "already exists" collision on its own
+  retry, spending a whole candidate per occurrence for a failure that, being
+  structural to the job object rather than a name-availability race, was never
+  going to clear by waiting. The checkpoint reboot's candidate walk now
+  surfaces the access-denied class as its own outcome with NO inline retry
+  under the same name, advancing straight to the next fresh candidate exactly
+  the way it already does for msb's own "already exists" — one classified
+  refusal, one candidate spent, not two. Once a reboot has seen this class
+  once, every REMAINING attempt of that SAME reboot launches through a
+  Windows-only job-free broker instead of a direct spawn: `msb restore` runs
+  via `Invoke-CimMethod -ClassName Win32_Process -MethodName Create`, whose
+  child process runs under the WMI provider service, outside this process's
+  own job hierarchy entirely — live-verified in the exact environment where a
+  direct spawn is denied: the identical restore launched this way returns
+  `ReturnValue=0` and the sandbox reaches `Running`. The first attempt of
+  every reboot is still always a direct spawn, so a healthy environment sees
+  no change at all; brokered output is classified through the exact same
+  predicates a direct attempt's output is (msb's own wording is identical
+  either way); and if the broker itself can't even launch (no `powershell.exe`,
+  a CIM failure, a temp-file write failure), that one attempt falls back to a
+  direct spawn and the walk keeps going rather than turning the broker into a
+  new single point of failure. Non-Windows platforms never broker at all — the
+  signature this whole class is keyed on simply never occurs there. This has
+  also been reported to the microsandbox project upstream. Internal-only:
+  the microsandbox backend gained an injectable restore-launcher seam so this
+  is fully unit-tested without a real Windows host; no public API changed.
 
 ## [0.7.9] - 2026-09-10
 
