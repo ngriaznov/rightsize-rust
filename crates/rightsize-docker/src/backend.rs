@@ -756,15 +756,16 @@ impl SandboxBackend for DockerBackend {
     /// it into the `repo`/`tag` pair the endpoint wants (the same split
     /// `split_repo_tag` already does for image pulls), and returns the ref.
     ///
-    /// An image commit never touches the running container at all — `fresh_name`
-    /// (the microsandbox-only reboot identity; see the trait method's own doc) is
-    /// simply ignored, and the returned handle carries `handle`'s own id/spec
-    /// completely unchanged, since there is nothing here for a caller to adopt.
+    /// An image commit never touches the running container at all —
+    /// `_fresh_names` (the microsandbox-only reboot identity batch; see the
+    /// trait method's own doc) is simply ignored, and the returned handle
+    /// carries `handle`'s own id/spec completely unchanged, since there is
+    /// nothing here for a caller to adopt.
     async fn create_checkpoint(
         &self,
         handle: &dyn SandboxHandle,
         nonce: &str,
-        _fresh_name: &str,
+        _fresh_names: &[String],
     ) -> Result<(String, Box<dyn SandboxHandle>)> {
         let checkpoint_ref = format!("rightsize/checkpoint:{nonce}");
         let (repo, tag) = split_repo_tag(&checkpoint_ref);
@@ -1837,7 +1838,11 @@ mod tests {
         };
 
         let (checkpoint_ref, new_handle) = backend
-            .create_checkpoint(&handle, "abc123def456", "rz-unused-fresh-name")
+            .create_checkpoint(
+                &handle,
+                "abc123def456",
+                &["rz-unused-fresh-name".to_string()],
+            )
             .await
             .expect("commit must succeed on a 201");
         assert_eq!(checkpoint_ref, "rightsize/checkpoint:abc123def456");
@@ -1880,7 +1885,11 @@ mod tests {
         // trait object bound `expect_err` requires on the whole `Result` but
         // `Option::expect` does not).
         let err = backend
-            .create_checkpoint(&handle, "abc123def456", "rz-unused-fresh-name")
+            .create_checkpoint(
+                &handle,
+                "abc123def456",
+                &["rz-unused-fresh-name".to_string()],
+            )
             .await
             .err()
             .expect("a 404 must surface as an error");

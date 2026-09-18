@@ -1081,31 +1081,45 @@ impl SandboxBackend for MsbCliBackend {
 
     /// Disk-snapshot checkpointing: `msb stop <name>` → `msb snapshot create
     /// --from-sandbox <name> rz-ckpt-<nonce> --dest-dir <cache>/checkpoints` → `msb
-    /// rm <name>` → a fresh ATTACHED `msb restore <ref> --name <fresh_name>`
-    /// re-boot under a FRESH sandbox name (never `name`/`id` — see `fresh_name`'s
-    /// own doc on the trait method for why: msb does not release a removed
-    /// sandbox's on-disk directory promptly on Windows, so a same-name restore
-    /// can refuse "sandbox already exists" well past the point its DB record is
-    /// confirmed gone) with the same ports/memory/env (msb 0.7.1 replaced `run
-    /// --from-snapshot` with this dedicated `restore` command, and no longer
-    /// takes `--disk-only` for a disk-scope snapshot — see `commands::restore`'s
-    /// own doc for what changed and why) — see `msb_checkpoint_cycle` for the
-    /// orchestration and its own unit tests for the failure paths. Runs on a
-    /// blocking thread, like every other multi-step msb invocation in this
-    /// backend. The re-boot reuses [`spawn_and_await_running`], this backend's
-    /// own normal boot path (already the shape `Container::from_checkpoint`'s
-    /// restores use — those have always minted a fresh name of their own, never
-    /// hitting this Windows directory-retention issue in the first place) — see
-    /// the module docs for why an msb `start` resume is not used here, and for
-    /// why that re-boot (an `msb restore`, same as any other checkpoint restore)
-    /// never yields a live child: the handle's held attached child is swapped to
+    /// rm <name>` → a fresh ATTACHED `msb restore <ref> --name <candidate>`
+    /// re-boot under a FRESH sandbox name (never `name`/`id` — see
+    /// `fresh_names`'s own doc on the trait method for why: msb does not
+    /// release a removed sandbox's on-disk directory promptly on Windows, so a
+    /// same-name restore can refuse "sandbox already exists" well past the
+    /// point its DB record is confirmed gone). **Never a candidate a PRIOR
+    /// attempt at this SAME checkpoint already touched, either:** a restore
+    /// that fails AFTER msb's own artifact-integrity check (e.g. the Windows
+    /// post-teardown access-denied transient) can leave that candidate behind
+    /// as a stopped sandbox record, so `fresh_names` is a BATCH this method
+    /// walks in order — on a classified refusal (msb's "already exists," which
+    /// is also where a same-candidate access-denied retry inside
+    /// [`spawn_and_await_running`] ends up once msb's own record exists — see
+    /// that function's own doc for the access-denied retry itself) it
+    /// best-effort `msb rm`s the failed candidate and advances to the next one,
+    /// never re-trying the one that just collided. Same ports/memory/env as
+    /// before either way (msb 0.7.1 replaced `run --from-snapshot` with this
+    /// dedicated `restore` command, and no longer takes `--disk-only` for a
+    /// disk-scope snapshot — see `commands::restore`'s own doc for what
+    /// changed and why) — see `msb_checkpoint_cycle`/
+    /// [`reboot_with_already_exists_retry`] for the orchestration this
+    /// method's own `reboot` closure walks candidates underneath, and their
+    /// unit tests for the failure paths. Runs on a blocking thread, like every
+    /// other multi-step msb invocation in this backend. The re-boot reuses
+    /// [`spawn_and_await_running`], this backend's own normal boot path
+    /// (already the shape `Container::from_checkpoint`'s restores use — those
+    /// have always minted a fresh name of their own, never hitting this
+    /// Windows directory-retention issue in the first place) — see the module
+    /// docs for why an msb `start` resume is not used here, and for why that
+    /// re-boot (an `msb restore`, same as any other checkpoint restore) never
+    /// yields a live child: the handle's held attached child is swapped to
     /// whatever the re-boot returns on success — `None` in practice, since this
     /// path always restores — clearing out the pre-checkpoint `msb run` child it
     /// held before, if any. This handle's identity DOES change: the returned
-    /// handle carries `fresh_name`, and this backend's own per-container state
-    /// (`self.handles`, and `self.started_names` when this handle isn't
-    /// `keep_alive`) moves from `id`'s key to `fresh_name`'s — see the trait
-    /// method's own doc for why the caller must adopt it.
+    /// handle carries whichever `fresh_names` candidate actually won, and this
+    /// backend's own per-container state (`self.handles`, and
+    /// `self.started_names` when this handle isn't `keep_alive`) moves from
+    /// `id`'s key to that winner's — see the trait method's own doc for why
+    /// the caller must adopt it.
     ///
     /// **The returned ref is NOT `<dest_dir>/<name>`.** msb 0.7.1's dest-dir disk
     /// snapshot store nests the artifact one level deeper than the name it was
@@ -1144,11 +1158,15 @@ impl SandboxBackend for MsbCliBackend {
         &self,
         handle: &dyn SandboxHandle,
         checkpoint_ref: &str,
-        fresh_name: &str,
+        fresh_names: &[String],
     ) -> Result<(String, Box<dyn SandboxHandle>)> {
         if handle.spec().tmpfs_root_mb.is_some() {
             return Err(RightsizeError::TmpfsRootCheckpoint);
         }
+        assert!(
+            !fresh_names.is_empty(),
+            "rightsize::ContainerGuard::checkpoint_core always mints at least one candidate"
+        );
 
         let id = handle.id().to_string();
         // Just the HINT this snapshot create call is built from — the dest-dir
@@ -1167,35 +1185,17 @@ impl SandboxBackend for MsbCliBackend {
             .to_string_lossy()
             .into_owned();
         let msb = self.msb.clone();
-        let mut reboot_spec = handle.spec().clone();
-        // Reboot under a FRESH sandbox name, never `id` (the original) — msb does
-        // not release a removed sandbox's on-disk directory promptly on Windows
-        // (its own existence check is DB-record OR directory, and only the DB
-        // record clears on `rm`), so a same-name restore can refuse "sandbox
-        // already exists" for up to `CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET`
-        // even after `wait_for_checkpoint_name_release` already confirmed the DB
-        // record gone. `fresh_name` is minted by the caller
-        // (`rightsize::ContainerGuard::checkpoint_core`) from the SAME
-        // `rz-<run-id>-<seq>` generator every ordinary create uses, and already
-        // has its own reaping-ledger entry by the time this runs — see the trait
-        // method's own doc. The name-release wait and this reboot's own
-        // already-exists retry budget stay exactly as they were: they simply
-        // will not trigger against a name msb never saw before.
-        reboot_spec.name = fresh_name.to_string();
-        // Snapshot the post-rename spec now, before it's moved into the blocking
-        // closure below (which further mutates its `checkpoint_ref`/
-        // `checkpoint_captured_cmdline` per reboot attempt) — this is what gets
-        // handed back to the caller as this handle's new identity.
-        let live_spec = reboot_spec.clone();
+        let reboot_spec_template = handle.spec().clone();
         // Mirrors `start()`'s own `keep_alive` read — needed below to keep
         // `started_names` in the same keep_alive-excluded shape `start()` gives it.
-        let keep_alive = live_spec.keep_alive;
+        let keep_alive = reboot_spec_template.keep_alive;
         // Only a spec with no explicit command needs the guest's actual cmdline
         // captured at all — an explicit command already tells a later restore
         // everything it needs (see `msb_checkpoint_cycle`'s own doc for where
         // this gates the capture step, before the sandbox is ever stopped).
-        let attempt_cmdline_capture = reboot_spec.command.is_none();
+        let attempt_cmdline_capture = reboot_spec_template.command.is_none();
         let name_for_thread = id.clone();
+        let candidates = fresh_names.to_vec();
         // Taken now (not inside the blocking closure) so a panic there can't leave
         // this handle's `HandleState` holding a stale reference to a child this
         // method is already about to replace.
@@ -1206,62 +1206,133 @@ impl SandboxBackend for MsbCliBackend {
             .get_mut(&id)
             .and_then(|state| state.attached.take());
 
-        let (snapshot_ref, new_child, captured_cmdline) = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&checkpoint_dir).map_err(|e| {
-                RightsizeError::Backend(format!(
-                    "could not create checkpoint directory {}: {e}",
-                    checkpoint_dir.display()
-                ))
-            })?;
-            let mut invoke =
-                |args: &[String]| invoke_standalone(&msb, args, CHECKPOINT_STEP_TIMEOUT);
-            // The real ref is only known once `snapshot create` has actually run
-            // (see `msb_checkpoint_cycle`) — set it on `reboot_spec` right before
-            // rebooting from it, never up front like the pre-0.7.1 dest-dir hint
-            // could be. The captured cmdline (if any) rides along the same way,
-            // so this SAME reboot's own `try_restore_and_await_running` phase 3
-            // has it immediately — no registry round trip needed for the
-            // in-process case. `reboot_spec.name` is already the FRESH name set
-            // above — every attempt (including an already-exists retry) restores
-            // under it, never `name_for_thread` (the original, now-removed
-            // sandbox `msb_checkpoint_cycle`'s own stop/snapshot/rm steps target).
-            let mut reboot = |real_ref: &str, captured: Option<&[String]>| {
-                reboot_spec.checkpoint_ref = Some(real_ref.to_string());
-                reboot_spec.checkpoint_captured_cmdline = captured.map(<[String]>::to_vec);
-                spawn_and_await_running(&msb, &reboot_spec)
-            };
-            let result = msb_checkpoint_cycle(
-                &mut invoke,
-                &mut reboot,
-                &name_for_thread,
-                &basename,
-                &checkpoint_dir,
-                attempt_cmdline_capture,
-            );
-            // The cycle's own `stop` step already halted the sandbox by the time
-            // this returns — reap the previously-attached child (this handle's
-            // old foreground `msb run` process) the same way `stop()` does,
-            // regardless of the cycle's outcome.
-            if let Some(mut child) = previous_attached {
-                reap_attached_child(&mut child);
-            }
-            result
-        })
-        .await
-        .map_err(|e| RightsizeError::Backend(format!("checkpoint task panicked: {e}")))??;
+        let (snapshot_ref, new_child, captured_cmdline, fresh_name) =
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&checkpoint_dir).map_err(|e| {
+                    RightsizeError::Backend(format!(
+                        "could not create checkpoint directory {}: {e}",
+                        checkpoint_dir.display()
+                    ))
+                })?;
+                let mut invoke =
+                    |args: &[String]| invoke_standalone(&msb, args, CHECKPOINT_STEP_TIMEOUT);
+                let mut reboot_spec = reboot_spec_template;
+                // How many candidates this closure has actually tried so far —
+                // `reboot` (below) is only ever called again by
+                // `reboot_with_already_exists_retry` after msb's OWN "already
+                // exists" refusal on the previous one (see that function's own
+                // doc: it only retries `RightsizeError::NameConflict`), so
+                // `attempted > 0` here means exactly "the previous candidate,
+                // `candidates[attempted - 1]`, just collided" — never anything
+                // else. Reboot under a FRESH sandbox name each time, never `id`
+                // (the original) and never a candidate a prior attempt already
+                // touched — msb does not release a removed sandbox's on-disk
+                // directory promptly on Windows (its own existence check is
+                // DB-record OR directory, and only the DB record clears on
+                // `rm`), so even a confirmed-absent-from-`msb ls` name can
+                // still refuse a same-name restore; worse, a restore that
+                // fails AFTER msb's own artifact-integrity check (the Windows
+                // post-teardown access-denied transient) can leave THAT name
+                // behind as a stopped sandbox record, dooming any retry under
+                // it specifically — see `rightsize::backend::SandboxBackend::
+                // create_checkpoint`'s own doc for the live-verified evidence.
+                // `candidates` is minted by the caller
+                // (`rightsize::ContainerGuard::checkpoint_core`) from the SAME
+                // `rz-<run-id>-<seq>` generator every ordinary create uses, and
+                // every one of them already has its own reaping-ledger entry
+                // by the time this runs.
+                let mut attempted = 0usize;
+                let mut reboot = |real_ref: &str, captured: Option<&[String]>| {
+                    if attempted > 0 {
+                        // Best-effort: never lets a failed candidate's leftover
+                        // sandbox record block some LATER, unrelated attempt
+                        // from ever reusing this name space again. The result
+                        // (found or not, succeeded or not) is deliberately
+                        // ignored — `wait_for_checkpoint_name_release`/
+                        // `reboot_with_already_exists_retry`'s own retry is
+                        // what actually gates the NEXT attempt, not this rm.
+                        // Goes straight to `invoke_standalone` rather than the
+                        // `invoke` closure `msb_checkpoint_cycle` was also
+                        // handed above — this closure already borrows `msb`
+                        // for `spawn_and_await_running` below, and borrowing
+                        // `invoke` too (itself a closure over the same `msb`)
+                        // while `msb_checkpoint_cycle` holds `&mut invoke` and
+                        // `&mut reboot` at once does not borrow-check.
+                        let _ = invoke_standalone(
+                            &msb,
+                            &commands::rm(&candidates[attempted - 1]),
+                            CHECKPOINT_STEP_TIMEOUT,
+                        );
+                    }
+                    let Some(candidate) = candidates.get(attempted) else {
+                        // Every candidate has already been tried and refused —
+                        // a non-`NameConflict` error here ends
+                        // `reboot_with_already_exists_retry`'s retry loop
+                        // immediately (rather than waiting out the rest of its
+                        // time budget re-trying a name that can't possibly
+                        // work), surfacing exactly what the trait doc promises:
+                        // the last real failure, not a bare timeout.
+                        return Err(RightsizeError::Backend(format!(
+                            "every candidate sandbox name was tried and refused by msb's \
+                             \"already exists\" check ({} candidates)",
+                            candidates.len(),
+                        )));
+                    };
+                    attempted += 1;
+                    reboot_spec.name = candidate.clone();
+                    // The real ref is only known once `snapshot create` has
+                    // actually run (see `msb_checkpoint_cycle`) — set it on
+                    // `reboot_spec` right before rebooting from it, never up
+                    // front like the pre-0.7.1 dest-dir hint could be. The
+                    // captured cmdline (if any) rides along the same way, so
+                    // this SAME reboot's own `try_restore_and_await_running`
+                    // phase 3 has it immediately — no registry round trip
+                    // needed for the in-process case.
+                    reboot_spec.checkpoint_ref = Some(real_ref.to_string());
+                    reboot_spec.checkpoint_captured_cmdline = captured.map(<[String]>::to_vec);
+                    spawn_and_await_running(&msb, &reboot_spec)
+                };
+                let result = msb_checkpoint_cycle(
+                    &mut invoke,
+                    &mut reboot,
+                    &name_for_thread,
+                    &basename,
+                    &checkpoint_dir,
+                    attempt_cmdline_capture,
+                );
+                // The cycle's own `stop` step already halted the sandbox by the time
+                // this returns — reap the previously-attached child (this handle's
+                // old foreground `msb run` process) the same way `stop()` does,
+                // regardless of the cycle's outcome.
+                if let Some(mut child) = previous_attached {
+                    reap_attached_child(&mut child);
+                }
+                result.map(|(checkpoint_ref, rebooted, captured_cmdline)| {
+                    // `reboot`'s LAST call is the one that actually succeeded
+                    // (or this whole closure would already have returned an
+                    // `Err` via `?` in `spawn_and_await_running`'s own caller
+                    // above) — `reboot_spec.name` is exactly the candidate that
+                    // attempt used, i.e. the winner. The closure's mutable
+                    // borrow of `reboot_spec` ends here (its last use), so
+                    // reading it back out is fine.
+                    (checkpoint_ref, rebooted, captured_cmdline, reboot_spec.name)
+                })
+            })
+            .await
+            .map_err(|e| RightsizeError::Backend(format!("checkpoint task panicked: {e}")))??;
 
-        // The reboot succeeded under `fresh_name`, not `id` — this handle's
-        // per-container runtime state (the attached child, any exec-tunnel
-        // resources, the captured cmdline) moves to the fresh key. `id`'s own
-        // entry is dropped outright rather than left behind: the sandbox it
-        // named is gone (removed mid-cycle), and the reaping ledger one layer up
-        // already leaves that name's OWN entry to its existing not-found-tolerant
-        // sweep — there is nothing for this backend's in-memory map to keep it
-        // for.
+        // The reboot succeeded under `fresh_name` (whichever candidate won),
+        // not `id` — this handle's per-container runtime state (the attached
+        // child, any exec-tunnel resources, the captured cmdline) moves to the
+        // fresh key. `id`'s own entry is dropped outright rather than left
+        // behind: the sandbox it named is gone (removed mid-cycle), and the
+        // reaping ledger one layer up already leaves that name's OWN entry to
+        // its existing not-found-tolerant sweep — there is nothing for this
+        // backend's in-memory map to keep it for.
         let mut handles = self.handles.lock().expect("handles mutex poisoned");
         handles.remove(&id);
         handles.insert(
-            fresh_name.to_string(),
+            fresh_name.clone(),
             HandleState {
                 // Already `Option<Child>` — see `start()`'s own assignment for why.
                 attached: new_child,
@@ -1286,9 +1357,17 @@ impl SandboxBackend for MsbCliBackend {
             .expect("started_names mutex poisoned");
         started_names.remove(&id);
         if !keep_alive {
-            started_names.insert(fresh_name.to_string());
+            started_names.insert(fresh_name.clone());
         }
         drop(started_names);
+
+        // The returned handle's spec carries only the WINNING name changed —
+        // never the just-used `checkpoint_ref`/`checkpoint_captured_cmdline`
+        // `reboot` set on its own working copy per attempt, which is why this
+        // is built from `handle.spec()` fresh rather than from the closure's
+        // (now-consumed) `reboot_spec`.
+        let mut live_spec = handle.spec().clone();
+        live_spec.name = fresh_name;
 
         Ok((snapshot_ref, Box::new(Handle { spec: live_spec })))
     }
@@ -2673,6 +2752,21 @@ fn msb_checkpoint_cycle_inner<T>(
 /// `reboot` returns (on the first attempt or a later one) surfaces
 /// immediately, the same as it always has; retrying a non-conflict failure on
 /// this budget would just delay reporting a real problem.
+///
+/// **This function itself still only ever retries the SAME call to `reboot`
+/// — it has no notion of "candidates" at all.** `MsbCliBackend::create_checkpoint`'s
+/// own `reboot` closure is what actually walks its `fresh_names` batch: each
+/// retry this loop drives calls that closure again, and the closure is the
+/// one that best-effort `rm`s the candidate that just collided and advances
+/// to the next one before attempting the restore — see that method's own
+/// doc. Once every candidate has been tried, the closure stops returning
+/// [`RightsizeError::NameConflict`] and returns a plain, non-retried `Err`
+/// instead, which is what ends this loop early (rather than waiting out the
+/// rest of `retry_budget` retrying a name that can no longer possibly work) —
+/// "exhausting candidates surfaces the last error," from the caller's own
+/// contract. `retry_budget` stays the single outer wall-clock bound across
+/// every candidate this walks, exactly as it always bounded every retry of a
+/// single name.
 fn reboot_with_already_exists_retry<T>(
     reboot: &mut RebootFn<'_, T>,
     checkpoint_ref: &str,
@@ -4046,7 +4140,7 @@ mod tests {
         // trait object bound `expect_err` requires on the whole `Result` but
         // `Option::expect` does not).
         let err = backend
-            .create_checkpoint(&handle, "deadbeefcafe", "rz-abc-2")
+            .create_checkpoint(&handle, "deadbeefcafe", &["rz-abc-2".to_string()])
             .await
             .err()
             .expect("a tmpfs-root container must never reach msb");
@@ -4062,21 +4156,33 @@ mod tests {
     /// to check that), `snapshot create` (prints a fake absolute artifact path,
     /// matching [`fake_snapshot_create_stdout`]'s shape), `ls --format json`
     /// (reports the name absent on its first call — confirming the post-`rm`
-    /// release wait — then `fresh_name` as `Running` from then on), `restore`
-    /// (records every invocation's full argv to `restore-argv`, one line per
-    /// call — the red-proof's own evidence of which name each attempt actually
-    /// targeted — and refuses with msb's own "already exists" wording
-    /// `already_exists_refusals` times before succeeding), and `exec` (the
-    /// phase-3 workload-revival child: hangs until a `stop`/`rm` call named
-    /// EXACTLY `fresh_name` touches the sentinel it polls for — gated on the
-    /// name, unlike [`write_fake_msb_for_restore`]'s version, so the cycle's
-    /// OWN mid-cycle `rm <old_name>` can't prematurely release it before
-    /// `restore` has even run).
-    fn write_fake_msb_for_checkpoint_reboot(
-        dir: &Path,
-        fresh_name: &str,
-        already_exists_refusals: u32,
-    ) -> PathBuf {
+    /// release wait — then whichever candidate actually won as `Running` from
+    /// then on), `restore` (records every invocation's full argv to
+    /// `restore-argv`, one line per call — the red-proof's own evidence of
+    /// which CANDIDATE each attempt actually targeted, proving the backend
+    /// advances to a new one rather than retrying the one that just refused —
+    /// and refuses with msb's own "already exists" wording
+    /// `already_exists_refusals` times, REGARDLESS of which candidate name is
+    /// given, before succeeding on whichever one it is handed next), and
+    /// `exec` (the phase-3 workload-revival child: hangs until a `stop`/`rm`
+    /// call named EXACTLY the WINNING candidate touches the sentinel it polls
+    /// for — gated on the name, unlike [`write_fake_msb_for_restore`]'s
+    /// version, so the cycle's OWN mid-cycle `rm <old_name>` (and any
+    /// best-effort `rm` of a FAILED candidate — see
+    /// `MsbCliBackend::create_checkpoint`'s own `reboot` closure) can't
+    /// prematurely release it before the winning `restore` has even run).
+    ///
+    /// **Deliberately does not take a `fresh_name` parameter at all.** The
+    /// candidate batch's actual names are minted by the CALLER now (a real
+    /// `rightsize::ContainerGuard::checkpoint_core`'s `next_container_name`
+    /// generator in production, or a test's own hand-picked `Vec<String>`
+    /// here), never by this script — so `ls`/`stop`/`rm`'s own idea of "the
+    /// live sandbox" is read back from `<dir>/winning-name`, a file this
+    /// script itself writes the moment a `restore` call actually succeeds
+    /// (the first one NOT refused), rather than baked in at script-generation
+    /// time.
+    #[cfg(unix)]
+    fn write_fake_msb_for_checkpoint_reboot(dir: &Path, already_exists_refusals: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let script = dir.join("fake-msb-checkpoint-reboot.sh");
         let snapshot_path = dir
@@ -4102,6 +4208,7 @@ mod tests {
              echo 'error: sandbox already exists' 1>&2\n\
              exit 1\n\
              fi\n\
+             echo \"$4\" > \"$dir/winning-name\"\n\
              exit 0\n\
              ;;\n\
              ls)\n\
@@ -4110,7 +4217,8 @@ mod tests {
              if [ \"$n\" -eq 0 ]; then\n\
              echo '[]'\n\
              else\n\
-             echo '[{{\"name\":\"{fresh_name}\",\"status\":\"Running\"}}]'\n\
+             winner=$(cat \"$dir/winning-name\" 2>/dev/null || echo '')\n\
+             echo \"[{{\\\"name\\\":\\\"$winner\\\",\\\"status\\\":\\\"Running\\\"}}]\"\n\
              fi\n\
              exit 0\n\
              ;;\n\
@@ -4122,7 +4230,8 @@ mod tests {
              ;;\n\
              stop|rm)\n\
              echo \"$1 $2\" >> \"$dir/stop-rm-calls\"\n\
-             if [ \"$2\" = \"{fresh_name}\" ]; then touch \"$dir/stop-requested\"; fi\n\
+             winner=$(cat \"$dir/winning-name\" 2>/dev/null || echo '')\n\
+             if [ -n \"$winner\" ] && [ \"$2\" = \"$winner\" ]; then touch \"$dir/stop-requested\"; fi\n\
              exit 0\n\
              ;;\n\
              esac\n\
@@ -4138,13 +4247,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn create_checkpoint_reboots_under_a_fresh_name_never_the_original() {
-        // Red-proof (a): the restore argv names `fresh_name`, never `old_name` —
-        // read straight back off the fake `msb`'s own recorded invocation, not
-        // inferred from the returned handle alone.
+        // Red-proof (a): the restore argv names the (first, only-needed here)
+        // candidate, never `old_name` — read straight back off the fake
+        // `msb`'s own recorded invocation, not inferred from the returned
+        // handle alone.
         let dir = unique_test_dir("checkpoint-reboot-fresh-name");
         let old_name = "rz-checkpoint-reboot-old";
-        let fresh_name = "rz-checkpoint-reboot-fresh";
-        let script = write_fake_msb_for_checkpoint_reboot(&dir, fresh_name, 0);
+        let candidates = vec!["rz-checkpoint-reboot-fresh".to_string()];
+        let script = write_fake_msb_for_checkpoint_reboot(&dir, 0);
         let backend = MsbCliBackend::new(script);
         let spec = ContainerSpec {
             command: Some(vec!["redis-server".to_string()]),
@@ -4158,13 +4268,13 @@ mod tests {
             .to_string();
 
         let (checkpoint_ref, new_handle) = backend
-            .create_checkpoint(handle.as_ref(), &checkpoint_hint, fresh_name)
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
             .await
             .expect("checkpoint must succeed");
         assert!(checkpoint_ref.ends_with("snap_fake"), "{checkpoint_ref}");
         assert_eq!(
             new_handle.id(),
-            fresh_name,
+            candidates[0],
             "the handle create_checkpoint returns must carry the FRESH identity"
         );
 
@@ -4175,7 +4285,7 @@ mod tests {
             "exactly one restore attempt: {restore_argv}"
         );
         assert!(
-            restore_argv.contains(&format!("--name {fresh_name}")),
+            restore_argv.contains(&format!("--name {}", candidates[0])),
             "the restore argv must target the fresh name: {restore_argv}"
         );
         assert!(
@@ -4204,7 +4314,7 @@ mod tests {
             .expect("stop on the adopted handle must succeed");
         let stop_rm_calls = std::fs::read_to_string(dir.join("stop-rm-calls")).unwrap();
         assert!(
-            stop_rm_calls.contains(&format!("stop {fresh_name}")),
+            stop_rm_calls.contains(&format!("stop {}", candidates[0])),
             "a stop() issued against the returned handle must target the FRESH \
              name: {stop_rm_calls}"
         );
@@ -4215,14 +4325,14 @@ mod tests {
     async fn create_checkpoint_rekeys_started_names_so_close_covers_the_fresh_sandbox() {
         // Regression proof: `started_names` is exactly what `close()` sweeps on
         // this run's own-process shutdown (see `start()`'s own comment). A
-        // checkpoint reboot must re-key it from the original name to
-        // `fresh_name` the same way it already re-keys `self.handles`, or
+        // checkpoint reboot must re-key it from the original name to the
+        // WINNING candidate the same way it already re-keys `self.handles`, or
         // `close()` after a checkpoint wastes a stop/rm on the already-removed
         // original name and never touches the sandbox that is actually live.
         let dir = unique_test_dir("checkpoint-started-names-rekey");
         let old_name = "rz-checkpoint-started-names-old";
-        let fresh_name = "rz-checkpoint-started-names-fresh";
-        let script = write_fake_msb_for_checkpoint_reboot(&dir, fresh_name, 0);
+        let candidates = vec!["rz-checkpoint-started-names-fresh".to_string()];
+        let script = write_fake_msb_for_checkpoint_reboot(&dir, 0);
         let backend = MsbCliBackend::new(script);
         let spec = ContainerSpec {
             command: Some(vec!["redis-server".to_string()]),
@@ -4245,10 +4355,10 @@ mod tests {
             .display()
             .to_string();
         let (_checkpoint_ref, new_handle) = backend
-            .create_checkpoint(handle.as_ref(), &checkpoint_hint, fresh_name)
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
             .await
             .expect("checkpoint must succeed");
-        assert_eq!(new_handle.id(), fresh_name);
+        assert_eq!(new_handle.id(), candidates[0]);
 
         {
             let started = backend.started_names.lock().unwrap();
@@ -4258,7 +4368,7 @@ mod tests {
                  started_names after a checkpoint reboot: {started:?}"
             );
             assert!(
-                started.contains(fresh_name),
+                started.contains(&candidates[0]),
                 "the fresh, actually-running sandbox must be tracked in \
                  started_names so close() covers it: {started:?}"
             );
@@ -4270,27 +4380,38 @@ mod tests {
         backend.close().await.expect("close must succeed");
         let stop_rm_calls = std::fs::read_to_string(dir.join("stop-rm-calls")).unwrap();
         assert!(
-            stop_rm_calls.contains(&format!("stop {fresh_name}")),
+            stop_rm_calls.contains(&format!("stop {}", candidates[0])),
             "close() must stop the fresh (live) sandbox: {stop_rm_calls}"
         );
         assert!(
-            stop_rm_calls.contains(&format!("rm {fresh_name}")),
+            stop_rm_calls.contains(&format!("rm {}", candidates[0])),
             "close() must rm the fresh (live) sandbox: {stop_rm_calls}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn create_checkpoint_reboot_retries_an_already_exists_refusal_on_the_fresh_name() {
-        // Red-proof (c): an already-exists refusal on the FRESH name (forced
-        // once) is retried per the existing budget — the retry machinery stays
-        // live even though the collision it used to guard against (msb's own
-        // Windows directory-retention lag on a SAME-name restore) can no
-        // longer occur against a name msb has never seen before.
+    async fn create_checkpoint_reboot_advances_to_a_new_candidate_on_each_already_exists_refusal() {
+        // Red-proof (c), rewritten for the candidate-batch policy: an
+        // already-exists refusal must NEVER be retried under the SAME name —
+        // the live-verified reason the old same-name retry was replaced (a
+        // restore that fails after msb's own artifact-integrity check can
+        // leave that name behind as a stopped sandbox record, dooming any
+        // retry under it specifically to this exact refusal, for the whole
+        // budget — rightsize-kotlin run 35292480264's CI failure). So this
+        // forces TWO refusals in a row and proves the backend walked THREE
+        // distinct candidates (never retrying #0 or #1), best-effort `rm`ing
+        // each failed one before moving on, and never falling back to the
+        // original name.
         let dir = unique_test_dir("checkpoint-reboot-already-exists-retry");
         let old_name = "rz-checkpoint-retry-old";
-        let fresh_name = "rz-checkpoint-retry-fresh";
-        let script = write_fake_msb_for_checkpoint_reboot(&dir, fresh_name, 1);
+        let candidates = vec![
+            "rz-checkpoint-retry-cand-0".to_string(),
+            "rz-checkpoint-retry-cand-1".to_string(),
+            "rz-checkpoint-retry-cand-2".to_string(),
+        ];
+        let already_exists_refusals = 2;
+        let script = write_fake_msb_for_checkpoint_reboot(&dir, already_exists_refusals);
         let backend = MsbCliBackend::new(script);
         let spec = ContainerSpec {
             command: Some(vec!["redis-server".to_string()]),
@@ -4304,13 +4425,18 @@ mod tests {
             .to_string();
 
         let (_checkpoint_ref, new_handle) = backend
-            .create_checkpoint(handle.as_ref(), &checkpoint_hint, fresh_name)
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
             .await
             .expect(
-                "one already-exists refusal on the fresh name must still be retried \
-                 past — the retry budget is 30s/2s, comfortably past one retry",
+                "two already-exists refusals must still be walked past by advancing \
+                 candidates — the retry budget is 30s/2s, comfortably past two",
             );
-        assert_eq!(new_handle.id(), fresh_name);
+        assert_eq!(
+            new_handle.id(),
+            candidates[2],
+            "the THIRD candidate is the one that actually won, since the first two \
+             were refused"
+        );
 
         let restore_calls: u32 = std::fs::read_to_string(dir.join("restore-calls"))
             .unwrap()
@@ -4318,14 +4444,56 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(
-            restore_calls, 2,
-            "exactly one refused attempt plus one that succeeds"
+            restore_calls, 3,
+            "two refused attempts plus one that succeeds"
         );
+
         let restore_argv = std::fs::read_to_string(dir.join("restore-argv")).unwrap();
+        let argv_lines: Vec<&str> = restore_argv.lines().collect();
+        assert_eq!(
+            argv_lines.len(),
+            3,
+            "one line per restore attempt: {restore_argv}"
+        );
+        for (line, candidate) in argv_lines.iter().zip(candidates.iter()) {
+            assert!(
+                line.contains(&format!("--name {candidate}")),
+                "attempt order must match candidate order exactly — never a repeat, \
+                 never a fallback to an earlier one: {restore_argv}"
+            );
+        }
         assert!(
-            restore_argv.lines().all(|line| line.contains(fresh_name)),
-            "every retried attempt must still target the fresh name, never fall \
-             back to the original: {restore_argv}"
+            !restore_argv.contains(old_name),
+            "no restore attempt may ever mention the original (now-removed) \
+             name: {restore_argv}"
+        );
+
+        // The proof that matters most: every restore attempt's own --name
+        // value must be DISTINCT — this is what actually distinguishes the
+        // new candidate-advance policy from the old same-name retry it
+        // replaced (which this red-proof used to check the opposite of).
+        let distinct_names: std::collections::HashSet<&str> = argv_lines
+            .iter()
+            .map(|line| line.split_whitespace().nth(3).expect("--name value"))
+            .collect();
+        assert_eq!(
+            distinct_names.len(),
+            3,
+            "every attempt must target a DIFFERENT candidate name, never retry the \
+             one that just refused: {restore_argv}"
+        );
+
+        // Best-effort cleanup: each of the two FAILED candidates must have
+        // been `rm`-ed before the next attempt — never the winner, which is
+        // still live.
+        let stop_rm_calls = std::fs::read_to_string(dir.join("stop-rm-calls")).unwrap();
+        assert!(
+            stop_rm_calls.contains(&format!("rm {}", candidates[0])),
+            "the first refused candidate must be best-effort removed: {stop_rm_calls}"
+        );
+        assert!(
+            stop_rm_calls.contains(&format!("rm {}", candidates[1])),
+            "the second refused candidate must be best-effort removed: {stop_rm_calls}"
         );
     }
 

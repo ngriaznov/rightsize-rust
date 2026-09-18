@@ -224,6 +224,52 @@ reaches its first tagged release.
   on its own. **Both of these now run against the fresh reboot name described
   above, not the original — see that entry for why they are dormant in
   practice but kept as defense-in-depth.**
+- **A checkpoint reboot's "already exists" retry now advances to a brand-new
+  candidate name instead of retrying the same fresh one.** Live-verified
+  against real msb 0.7.1: `msb restore <artifact> --name X` validates the
+  artifact first (an integrity failure leaves no sandbox record at all), but a
+  failure AFTER that check — the Windows post-teardown access-denied transient
+  above, in particular — can still leave `X` behind as a STOPPED sandbox
+  record. Any subsequent `restore --name X`, no matter how long it waits,
+  then refuses with msb's own "already exists" wording for the rest of the
+  retry budget — exactly the failure the previous release's fresh-name reboot
+  was meant to rule out, and exactly what sank five checkpoint tests on
+  rightsize-kotlin's Windows CI lane (run 35292480264), each colliding on its
+  own freshly-minted reboot name. The fix: `ContainerGuard::checkpoint`/
+  `checkpoint_named` now mint a BATCH of six candidate names up front (the
+  same `rz-<run-id>-<seq>` generator as before) and append every one of them
+  to the reaping ledger before the backend is ever called — not just
+  whichever one ends up winning — so a crash mid-attempt still leaves every
+  name that might have reached msb findable by the ledger's own
+  not-found-tolerant sweep; a candidate the backend never gets around to
+  trying is left in the ledger too, harmless noise for that same sweep. The
+  microsandbox backend walks the batch in order: an "already exists" refusal
+  (including the access-denied class once it resolves to that refusal, as
+  above) best-effort `msb rm`s the candidate that just collided — never
+  waiting on the result — and advances to the next one, never retrying the
+  name that just failed. The existing ~30-second/2-second retry budget still
+  bounds the whole walk, not each candidate individually; exhausting every
+  candidate surfaces the last real failure rather than a bare timeout. On
+  success, this handle's identity (the returned handle, `self.handles`/
+  `self.started_names`, the reaping ledger, the diagnostics registry) is
+  re-keyed to whichever candidate actually won, not necessarily the batch's
+  first entry. Docker's checkpoint mechanism never reboots the sandbox at
+  all, so it keeps ignoring the batch entirely (mechanically taking its first
+  entry, matching its previous single-name behavior exactly). This is an
+  internal backend SPI change (`SandboxBackend::create_checkpoint`'s third
+  parameter widened from a single `&str` to `&[String]`) — the public
+  `Checkpoint`/`ContainerGuard` API is unchanged, and so is the previous
+  release's caller-visible consequence that `ContainerGuard::name()` can
+  return a different value after a checkpoint than before it.
+- **The Windows CI lane's test build compiles again.** A test-only helper
+  added by the fresh-reboot-name work above (`write_fake_msb_for_checkpoint_
+  reboot`, a fake `msb` script for the checkpoint-reboot integration tests)
+  used `std::os::unix::fs::PermissionsExt` without a `#[cfg(unix)]` gate, even
+  though every test that calls it already carries one — `cargo check
+  --workspace --all-targets` on the Windows lane failed to compile the
+  `rightsize-msb` lib test target outright (E0433 on the unix-only module
+  path, E0599 on the resulting method). The helper is now gated the same way
+  its callers already are.
 
 ## [0.7.9] - 2026-09-10
 

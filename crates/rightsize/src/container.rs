@@ -44,13 +44,25 @@ static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// the SAME generator [`create_started_container`] uses for every ordinary
 /// create (this function is that logic, factored out so a second call site
 /// can share it rather than inventing a parallel naming scheme). Used there,
-/// and by [`ContainerGuard::checkpoint_core`] to mint the identity a
+/// and by [`ContainerGuard::checkpoint_core`] to mint the identity BATCH a
 /// microsandbox checkpoint reboot restores under instead of the sandbox's own
 /// name — see that method's own doc for why.
 fn next_container_name() -> String {
     let seq = NAME_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("rz-{}-{seq}", RunId::value())
 }
+
+/// How many candidate names [`ContainerGuard::checkpoint_core`] mints (and
+/// pre-tracks in the reaping ledger) for a single checkpoint reboot, on a
+/// backend whose checkpoint mechanism restarts the workload. Sized well past
+/// what CI has actually observed a Windows runner need — the worst case seen
+/// so far (rightsize-kotlin run 35292480264) was every attempt colliding for
+/// an entire 30s retry budget under the OLD same-name-retry policy; a fresh,
+/// never-before-seen name per attempt instead means each one either succeeds
+/// outright or fails for a real (non-naming) reason, so this many spare names
+/// is generous headroom, not a tuned-to-the-wire budget. See
+/// [`ContainerGuard::checkpoint_core`]'s own doc for the full policy.
+const CHECKPOINT_REBOOT_NAME_CANDIDATES: usize = 6;
 
 /// A per-process free-port allocator, shared by every `Container` in this process.
 static FREE_PORTS: std::sync::OnceLock<FreePorts> = std::sync::OnceLock::new();
@@ -1955,33 +1967,51 @@ impl ContainerGuard {
     /// checkpoint time.
     ///
     /// **On a backend whose checkpoint mechanism restarts the workload, the
-    /// reboot happens under a FRESH sandbox name, never `handle`'s own.**
-    /// Microsandbox's checkpoint cycle stops the sandbox, snapshots it, and
-    /// removes it before rebooting — and msb does not reliably release a
-    /// removed sandbox's on-disk directory on Windows (its own existence
-    /// check is DB-record OR directory; only the DB record clears on `rm`),
-    /// so a same-name restore can refuse "sandbox already exists" well past
-    /// the point the DB record is confirmed gone. This mirrors
+    /// reboot happens under a FRESH sandbox name, never `handle`'s own — and
+    /// never a name a PRIOR failed attempt at THIS SAME checkpoint already
+    /// tried.** Microsandbox's checkpoint cycle stops the sandbox, snapshots
+    /// it, and removes it before rebooting — and msb does not reliably
+    /// release a removed sandbox's on-disk directory on Windows (its own
+    /// existence check is DB-record OR directory; only the DB record clears
+    /// on `rm`), so a same-name restore can refuse "sandbox already exists"
+    /// well past the point the DB record is confirmed gone. This mirrors
     /// `Container::from_checkpoint`, whose ordinary restore has always minted
     /// a fresh name (via [`create_started_container`]'s own generator) and
     /// has never hit this — the sandbox name was never a stable identifier
     /// across a checkpoint, only an implementation detail.
     ///
-    /// The fresh name is minted from the SAME `rz-<run-id>-<seq>` generator
-    /// every ordinary create uses ([`next_container_name`]) and appended to
+    /// **A single fresh name is not enough, though.** Live-verified: an `msb
+    /// restore --name X` that fails AFTER its own artifact-integrity check
+    /// (e.g. the Windows post-teardown access-denied transient) can still
+    /// leave `X` behind as a STOPPED SANDBOX RECORD — so a RETRY under that
+    /// same `X` is doomed to msb's own "already exists" refusal for as long
+    /// as the retry budget runs, exactly the CI failure this policy exists to
+    /// prevent (rightsize-kotlin run 35292480264: five checkpoint tests
+    /// failed with that exact collision wording, on their own freshly-minted
+    /// reboot names). So this mints a BATCH of [`CHECKPOINT_REBOOT_NAME_CANDIDATES`]
+    /// names from the SAME `rz-<run-id>-<seq>` generator every ordinary
+    /// create uses ([`next_container_name`]) and appends EVERY one of them to
     /// the reaping ledger BEFORE the backend call — [`crate::reaper::before_create`],
     /// exactly like an ordinary create's own append-before-create discipline
     /// (see that function's doc, and `create_started_container`'s own call
     /// site) — so a crash between this line and the backend's own reboot
-    /// still leaves a (harmlessly not-found-tolerant) name in the ledger
-    /// rather than a live sandbox with no record at all. `handle`'s OWN name
-    /// is left untouched in the ledger: it goes through the backend's normal
-    /// `rm` during the cycle, exactly as any other stop does, and its ledger
-    /// entry is left for the ledger's own not-found-tolerant sweep — no
-    /// explicit `after_stop` call for it here (see `crate::reaper`'s module
-    /// doc for why a sweep tolerates a name it can no longer find). A backend
-    /// call that fails un-appends the fresh name the same way
-    /// `create_started_container` un-appends a failed create's.
+    /// still leaves (harmlessly not-found-tolerant) names in the ledger
+    /// rather than a live sandbox with no record at all. A backend whose
+    /// checkpoint mechanism actually walks this batch (see the trait method's
+    /// own doc) never retries a candidate a classified failure already
+    /// touched; whichever candidates it never gets to trying are simply left
+    /// in the ledger — harmless noise for its own not-found-tolerant sweep,
+    /// since a name never given to msb at all trivially resolves as "not
+    /// found" there too. `handle`'s OWN (pre-checkpoint) name is left
+    /// untouched in the ledger: it goes through the backend's normal `rm`
+    /// during the cycle, exactly as any other stop does, and its ledger entry
+    /// is left for the ledger's own not-found-tolerant sweep — no explicit
+    /// `after_stop` call for it here (see `crate::reaper`'s module doc for
+    /// why a sweep tolerates a name it can no longer find). A backend call
+    /// that fails outright (every candidate exhausted) un-appends every
+    /// minted candidate the same way `create_started_container` un-appends a
+    /// failed create's — the same reason none of them can be a live sandbox
+    /// at that point.
     ///
     /// Once the backend call succeeds, this guard's live identity (`handle`,
     /// `name()`/the reaping ledger, the diagnostics registry) is updated to
@@ -1989,10 +2019,11 @@ impl ContainerGuard {
     /// is re-fetched right after, so the network-relink and wait-strategy
     /// re-run below (and every operation any later caller makes on this
     /// guard: `exec`, `logs`, `stop`, a second `checkpoint`, ...) all target
-    /// the sandbox's CURRENT name. A backend whose checkpoint mechanism never
-    /// reboots (docker) hands back a handle equal in effect to the one it was
-    /// given, so this adoption is a no-op there — no backend-specific branch
-    /// needed for it.
+    /// the sandbox's CURRENT name, read from the returned handle's own id —
+    /// whichever candidate actually won, not necessarily the batch's first
+    /// entry. A backend whose checkpoint mechanism never reboots (docker)
+    /// hands back a handle equal in effect to the one it was given, so this
+    /// adoption is a no-op there — no backend-specific branch needed for it.
     async fn checkpoint_core(
         &self,
         handle: &dyn SandboxHandle,
@@ -2005,37 +2036,44 @@ impl ContainerGuard {
         // be re-pointed at the fresh identity below, exactly like `stop_inner`/
         // `Drop` already deregister by whatever `Self::name()` currently is.
         let name_before = self.name().to_string();
-        let fresh_name = if restarts_workload {
-            next_container_name()
+        let fresh_names: Vec<String> = if restarts_workload {
+            (0..CHECKPOINT_REBOOT_NAME_CANDIDATES)
+                .map(|_| next_container_name())
+                .collect()
         } else {
             // Never actually used for anything (the docker backend ignores
             // this parameter entirely — see its own `create_checkpoint` doc)
-            // — kept as `handle.id()` rather than minting a name nothing will
-            // ever adopt, so the reaping ledger is never asked to track a
-            // name that will never correspond to a real sandbox.
-            handle.id().to_string()
+            // — kept as a single `handle.id()` entry rather than minting a
+            // batch nothing will ever adopt, so the reaping ledger is never
+            // asked to track names that will never correspond to a real
+            // sandbox.
+            vec![handle.id().to_string()]
         };
         if restarts_workload {
-            crate::reaper::before_create(
-                &self.backend,
-                &fresh_name,
-                self.keep_alive,
-                self.reaper_cache_dir_override.as_deref(),
-            );
+            for candidate in &fresh_names {
+                crate::reaper::before_create(
+                    &self.backend,
+                    candidate,
+                    self.keep_alive,
+                    self.reaper_cache_dir_override.as_deref(),
+                );
+            }
         }
         let create_result = self
             .backend
-            .create_checkpoint(handle, &backend_ref, &fresh_name)
+            .create_checkpoint(handle, &backend_ref, &fresh_names)
             .await;
         let (checkpoint_ref, new_handle) = match create_result {
             Ok(pair) => pair,
             Err(e) => {
                 if restarts_workload {
-                    crate::reaper::after_stop(
-                        &fresh_name,
-                        self.keep_alive,
-                        self.reaper_cache_dir_override.as_deref(),
-                    );
+                    for candidate in &fresh_names {
+                        crate::reaper::after_stop(
+                            candidate,
+                            self.keep_alive,
+                            self.reaper_cache_dir_override.as_deref(),
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -2044,11 +2082,15 @@ impl ContainerGuard {
         // doc for why every subsequent read (including the re-fetch just
         // below) must see it, not the identity this call started with.
         *self.handle.lock().expect("handle mutex poisoned") = Some(new_handle);
+        // Re-fetched BEFORE the ledger update below (rather than after, as a
+        // single-name `fresh_name` variable used to make possible) — this
+        // guard's ledger identity has to be whichever candidate the backend
+        // actually won on, which only the just-adopted handle's own id knows.
+        let handle = self.require_handle()?;
         if restarts_workload {
             *self.ledger_name.lock().expect("ledger_name mutex poisoned") =
-                Box::leak(fresh_name.clone().into_boxed_str());
+                Box::leak(handle.id.clone().into_boxed_str());
         }
-        let handle = self.require_handle()?;
         let mut spec = handle.spec().clone();
         if restarts_workload {
             // The diagnostics registry captured its OWN copy of the id/spec at
@@ -3227,7 +3269,7 @@ mod tests {
             &self,
             handle: &dyn SandboxHandle,
             nonce: &str,
-            fresh_name: &str,
+            fresh_names: &[String],
         ) -> Result<(String, Box<dyn SandboxHandle>)> {
             if self.fail_create_checkpoint {
                 return Err(RightsizeError::Backend(
@@ -3242,14 +3284,19 @@ mod tests {
                 .push((handle.id().to_string(), checkpoint_ref.clone()));
             // Mirrors the real backends' split: a fake configured with
             // `checkpoint_restarts_workload` (the microsandbox shape) reboots
-            // under `fresh_name`, just like `MsbCliBackend::create_checkpoint`
-            // does — everything else (the docker shape) hands back the same
-            // identity it was given, since nothing was ever touched.
+            // under the batch's FIRST candidate, just like a real walk that
+            // never has to advance past it because nothing here ever fails —
+            // everything else (the docker shape) hands back the same identity
+            // it was given, since nothing was ever touched.
             let new_handle: Box<dyn SandboxHandle> = if self.checkpoint_restarts_workload {
+                let fresh_name = fresh_names
+                    .first()
+                    .expect("checkpoint_core always mints at least one candidate")
+                    .clone();
                 let mut spec = handle.spec().clone();
-                spec.name = fresh_name.to_string();
+                spec.name = fresh_name.clone();
                 Box::new(FakeHandle {
-                    id: fresh_name.to_string(),
+                    id: fresh_name,
                     spec,
                 })
             } else {
@@ -3627,6 +3674,53 @@ mod tests {
              reboot — the same append-before-create discipline an ordinary \
              create uses, so a crash mid-reboot still leaves a (harmlessly \
              not-found-tolerant) record rather than an untracked live sandbox"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Crash-safety, continued: EVERY candidate this call mints — not just
+    // whichever one ends up winning — must already be in the ledger before
+    // the backend is ever called, so a crash mid-attempt (on candidate 3 of
+    // 6, say) still leaves a findable, not-found-tolerant record for every
+    // name that might have been handed to msb by then. The candidates the
+    // backend never got to trying stay in the ledger too, deliberately —
+    // `checkpoint_core`'s own doc calls that out as harmless noise for the
+    // ledger's own not-found-tolerant sweep, cheaper than tracking precisely
+    // which ones were actually attempted.
+    #[tokio::test]
+    async fn checkpoint_pre_tracks_every_minted_candidate_not_just_the_winner() {
+        let cache_dir = temp_cache_dir("checkpoint-candidate-batch-ledger");
+        let backend = FakeBackend::checkpoint_capable_restarts_workload();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_reaper_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+        let name_before = guard.name().to_string();
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+        let winner = guard.name().to_string();
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        let names = ledger.sandbox_names();
+        assert!(
+            names.contains(&winner),
+            "the winning candidate must be tracked: {names:?}"
+        );
+        assert!(
+            names.contains(&name_before),
+            "the pre-checkpoint name is left untouched in the ledger, per \
+             `checkpoint_core`'s own doc: {names:?}"
+        );
+        // `name_before` plus every minted candidate (the winner among them) —
+        // none of the unused ones were ever un-appended, since this call
+        // succeeded.
+        assert_eq!(
+            names.len(),
+            1 + CHECKPOINT_REBOOT_NAME_CANDIDATES,
+            "every minted candidate must still be in the ledger after a \
+             successful checkpoint, alongside the untouched pre-checkpoint \
+             name: {names:?}"
         );
 
         guard.stop().await.unwrap();

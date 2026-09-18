@@ -222,19 +222,39 @@ pub trait SandboxBackend: Send + Sync {
     /// snapshotted at that path, and started back up — see
     /// [`Capabilities::checkpoint_restarts_workload`].
     ///
-    /// `fresh_name` is a sandbox name the caller has ALREADY minted (from the
-    /// same `rz-<run-id>-<seq>` generator every ordinary create uses) and
-    /// already appended to the reaping ledger, for a backend whose checkpoint
-    /// mechanism reboots the sandbox to restore under INSTEAD of `handle`'s own
-    /// name — see the microsandbox backend's own `create_checkpoint` doc for why
-    /// (msb's own directory-retention behavior on Windows makes a same-name
-    /// restore unreliable there). A backend that never reboots the sandbox
-    /// (docker: the container is never touched at all) ignores it. Either way,
-    /// the returned handle reflects this backend's identity for `handle`'s
-    /// sandbox AFTER this call — equal in effect to `handle` itself when nothing
-    /// changed, or reflecting `fresh_name` when it rebooted under it — and the
-    /// caller MUST adopt it in place of the one it passed in for every
-    /// subsequent operation.
+    /// `fresh_names` is a BATCH of candidate sandbox names the caller has
+    /// ALREADY minted (from the same `rz-<run-id>-<seq>` generator every
+    /// ordinary create uses) and already appended to the reaping ledger — every
+    /// one of them, not just whichever ends up winning — for a backend whose
+    /// checkpoint mechanism reboots the sandbox to restore under INSTEAD of
+    /// `handle`'s own name — see the microsandbox backend's own
+    /// `create_checkpoint` doc for why (msb's own directory-retention behavior
+    /// on Windows makes a same-name restore unreliable there, and — the reason
+    /// this is a BATCH rather than a single name — a restore attempt that fails
+    /// AFTER msb has already created that name's sandbox record can leave it
+    /// behind, so any retry under that SAME name is doomed to msb's own
+    /// "already exists" refusal; see that doc for the live-verified evidence).
+    /// A backend whose checkpoint mechanism actually walks this batch tries
+    /// `fresh_names` in order, best-effort removing a candidate that a
+    /// classified failure (msb's Windows post-teardown access-denied transient,
+    /// or its "already exists" refusal) leaves behind before moving to the
+    /// next one — never retrying a failed attempt's own name. A backend that
+    /// never reboots the sandbox (docker: the container is never touched at
+    /// all) ignores the batch entirely (using `fresh_names[0]`, if it needs
+    /// anything at all, keeps its behavior identical to a single-name
+    /// parameter). Every candidate beyond whichever one wins (or beyond
+    /// whichever were actually attempted, on an outright failure) is simply
+    /// left in the reaping ledger — harmless noise for its own
+    /// not-found-tolerant sweep, since a name that was pre-tracked but never
+    /// given to msb at all trivially resolves as "not found."
+    ///
+    /// Either way, the returned handle reflects this backend's identity for
+    /// `handle`'s sandbox AFTER this call — equal in effect to `handle` itself
+    /// when nothing changed, or carrying whichever `fresh_names` candidate it
+    /// actually rebooted under — and the caller MUST adopt it in place of the
+    /// one it passed in for every subsequent operation, including re-keying its
+    /// own bookkeeping (the reaping ledger, any diagnostics registration) to
+    /// that WINNING name rather than the batch's first entry.
     ///
     /// Gated by [`Capabilities::checkpoint`] at the CALLER (`ContainerGuard::checkpoint`
     /// checks `capabilities().checkpoint` before ever reaching this method) — this
@@ -247,7 +267,7 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         _handle: &dyn SandboxHandle,
         _nonce: &str,
-        _fresh_name: &str,
+        _fresh_names: &[String],
     ) -> Result<(String, Box<dyn SandboxHandle>)> {
         Err(crate::error::RightsizeError::CheckpointUnsupported {
             backend: self.name().to_string(),
