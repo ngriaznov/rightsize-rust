@@ -40,6 +40,18 @@ const PORT_BIND_ATTEMPTS: usize = 5;
 /// process, which is all a name needs to be.
 static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Mints a fresh sandbox name in this process's `rz-<run-id>-<seq>` scheme —
+/// the SAME generator [`create_started_container`] uses for every ordinary
+/// create (this function is that logic, factored out so a second call site
+/// can share it rather than inventing a parallel naming scheme). Used there,
+/// and by [`ContainerGuard::checkpoint_core`] to mint the identity a
+/// microsandbox checkpoint reboot restores under instead of the sandbox's own
+/// name — see that method's own doc for why.
+fn next_container_name() -> String {
+    let seq = NAME_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("rz-{}-{seq}", RunId::value())
+}
+
 /// A per-process free-port allocator, shared by every `Container` in this process.
 static FREE_PORTS: std::sync::OnceLock<FreePorts> = std::sync::OnceLock::new();
 
@@ -631,14 +643,14 @@ impl Container {
         let diagnostics_spec = handle.spec().clone();
         let diagnostics_ports = mapped_ports.clone();
         let mut guard = ContainerGuard {
-            handle: Some(handle),
+            handle: Mutex::new(Some(handle)),
             backend: backend.clone(),
             mapped_ports: Mutex::new(mapped_ports),
             network: self.network.clone(),
             image: self.image.clone(),
             exposed_ports: self.exposed_ports.clone(),
             name,
-            ledger_name,
+            ledger_name: Mutex::new(Box::leak(ledger_name.into_boxed_str())),
             keep_alive,
             reaper_cache_dir_override: self.reaper_cache_dir_override.clone(),
             checkpoint_cache_dir_override: self.checkpoint_cache_dir_override.clone(),
@@ -672,7 +684,7 @@ impl Container {
         // never appear in the report, so a mid-wait `diagnostics()` call cannot list
         // it, and the wait-failure branch above has nothing to deregister.
         crate::diagnostics::register(
-            &guard.ledger_name,
+            guard.name(),
             &guard.image,
             guard.host(),
             diagnostics_ports,
@@ -716,8 +728,7 @@ async fn create_started_container(
 
     for _ in 0..PORT_BIND_ATTEMPTS {
         let mapped_ports = allocate_ports(exposed_ports)?;
-        let seq = NAME_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let name = format!("rz-{}-{seq}", RunId::value());
+        let name = next_container_name();
 
         let mut spec = ContainerSpec {
             name: name.clone(),
@@ -982,7 +993,7 @@ async fn link_register_and_wait(
     let links = if let Some(net) = network {
         let links = net.links_for_new_member();
         backend
-            .install_network_links(guard.handle_ref(), &links)
+            .install_network_links(&guard.handle_ref(), &links)
             .await?;
         links
     } else {
@@ -1249,14 +1260,14 @@ async fn try_adopt(
     let diagnostics_spec = handle.spec().clone();
     let diagnostics_ports = mapped_ports.clone();
     let guard = ContainerGuard {
-        handle: Some(handle),
+        handle: Mutex::new(Some(handle)),
         backend: backend.clone(),
         mapped_ports: Mutex::new(mapped_ports),
         network: None,
         image: container.image.clone(),
         exposed_ports: container.exposed_ports.clone(),
         name: identity.name.clone(),
-        ledger_name: identity.name.clone(),
+        ledger_name: Mutex::new(Box::leak(identity.name.clone().into_boxed_str())),
         keep_alive: true,
         reaper_cache_dir_override: container.reaper_cache_dir_override.clone(),
         checkpoint_cache_dir_override: container.checkpoint_cache_dir_override.clone(),
@@ -1264,7 +1275,7 @@ async fn try_adopt(
         network_links: Vec::new(),
     };
     crate::diagnostics::register(
-        &guard.ledger_name,
+        guard.name(),
         &guard.image,
         guard.host(),
         diagnostics_ports,
@@ -1435,14 +1446,14 @@ async fn create_fresh_reuse(
     let diagnostics_spec = handle.spec().clone();
     let diagnostics_ports = mapped_ports.clone();
     let guard = ContainerGuard {
-        handle: Some(handle),
+        handle: Mutex::new(Some(handle)),
         backend: backend.clone(),
         mapped_ports: Mutex::new(mapped_ports),
         network: None,
         image: container.image.clone(),
         exposed_ports: container.exposed_ports.clone(),
         name: identity.name.clone(),
-        ledger_name: identity.name.clone(),
+        ledger_name: Mutex::new(Box::leak(identity.name.clone().into_boxed_str())),
         keep_alive: true,
         reaper_cache_dir_override: container.reaper_cache_dir_override.clone(),
         checkpoint_cache_dir_override: container.checkpoint_cache_dir_override.clone(),
@@ -1450,7 +1461,7 @@ async fn create_fresh_reuse(
         network_links: Vec::new(),
     };
     crate::diagnostics::register(
-        &guard.ledger_name,
+        guard.name(),
         &guard.image,
         guard.host(),
         diagnostics_ports,
@@ -1462,8 +1473,8 @@ async fn create_fresh_reuse(
     if let Some(post_start) = &container.post_start {
         if let Err(e) = post_start(&guard).await {
             let handle_ref = guard.handle_ref();
-            let _ = backend.stop(handle_ref).await;
-            let _ = backend.remove(handle_ref).await;
+            let _ = backend.stop(&handle_ref).await;
+            let _ = backend.remove(&handle_ref).await;
             registry.delete();
             for &(_, host_port) in guard
                 .mapped_ports
@@ -1484,7 +1495,15 @@ async fn create_fresh_reuse(
 /// [`ContainerGuard::stop`] still tears the container down — see the module docs for
 /// the two-tier cleanup story.
 pub struct ContainerGuard {
-    handle: Option<Box<dyn SandboxHandle>>,
+    /// `Mutex`-guarded so a checkpoint reboot that mints a fresh sandbox name
+    /// (see [`Self::checkpoint_core`] — currently microsandbox only) can swap
+    /// this guard's live identity in place through `&self`: [`Self::checkpoint`]/
+    /// [`Self::checkpoint_named`] have always taken `&self`, so there is no
+    /// `&mut self` moment to do this the plain-field way. Every reader goes
+    /// through [`Self::require_handle`]/[`Self::handle_ref`], which lock this
+    /// briefly (never across an `.await`) and hand back an owned snapshot —
+    /// see that method's own doc.
+    handle: Mutex<Option<Box<dyn SandboxHandle>>>,
     backend: Arc<dyn SandboxBackend>,
     mapped_ports: Mutex<Vec<(u16, u16)>>,
     network: Option<Arc<Network>>,
@@ -1495,12 +1514,29 @@ pub struct ContainerGuard {
     /// for internal error text ([`Self::describe`]); the public [`Self::name`]
     /// accessor and the diagnostics report both use `ledger_name` instead, since
     /// that's the name a caller can actually act on (e.g. `docker logs <name>`).
+    /// Deliberately NOT updated by a checkpoint reboot — see `ledger_name`'s own
+    /// doc for the field that tracks the CURRENT identity instead.
     name: String,
     /// The reaping ledger's own name for this sandbox (`ContainerSpec::name`,
     /// e.g. `rz-<run-id>-<seq>`) — see [`Container::start`]'s doc at the capture
     /// site for why this differs from `name` (the raw `SandboxHandle::id()`) on
     /// the docker backend.
-    ledger_name: String,
+    ///
+    /// `Mutex<&'static str>` rather than a plain `String`: a checkpoint reboot
+    /// on a backend whose mechanism restarts the workload (microsandbox) mints
+    /// a FRESH sandbox name for the restore (see [`Self::checkpoint_core`] —
+    /// msb's own on-disk directory retention on Windows makes a same-name
+    /// restore unreliable) and this field is updated in place to match, so
+    /// [`Self::name`], the reaping ledger, and the diagnostics registry all
+    /// keep tracking the sandbox's CURRENT identity rather than the one it
+    /// originally booted under. `&'static str` (rather than `String`) is what
+    /// lets [`Self::name`] keep returning a plain `&str` tied to `&self` even
+    /// though the value can change: each update leaks its `Box<str>` once via
+    /// `Box::leak` — checkpointing is a deliberate, infrequent operation
+    /// (never a hot-loop call), so the handful of short strings this leaks
+    /// over a guard's lifetime is a bounded, one-time cost per checkpoint, not
+    /// an unbounded leak.
+    ledger_name: Mutex<&'static str>,
     /// Mirrors `ContainerSpec::keep_alive` — a reuse sandbox is kept out of every
     /// own-process automatic cleanup path (see [`Drop`]'s impl below).
     keep_alive: bool,
@@ -1529,10 +1565,32 @@ pub struct ContainerGuard {
     network_links: Vec<crate::backend::NetworkLink>,
 }
 
+/// An owned id/spec pair standing in for a borrowed `&dyn SandboxHandle` —
+/// see [`ContainerGuard::require_handle`]'s own doc for why every backend call
+/// a guard makes after `start()` goes through one of these instead of a plain
+/// reference into `ContainerGuard::handle`.
+struct HandleSnapshot {
+    id: String,
+    spec: ContainerSpec,
+}
+
+impl SandboxHandle for HandleSnapshot {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn spec(&self) -> &ContainerSpec {
+        &self.spec
+    }
+}
+
 impl ContainerGuard {
-    fn handle_ref(&self) -> &dyn SandboxHandle {
-        self.handle
-            .as_deref()
+    /// Panicking counterpart to [`Self::require_handle`] for the two call sites
+    /// (both at construction time, before a fallible `start()`/reuse-adopt has
+    /// returned a guard to any caller) that already know a handle must be
+    /// present — see that method's own doc for why this returns an owned
+    /// [`HandleSnapshot`] rather than a borrowed `&dyn SandboxHandle`.
+    fn handle_ref(&self) -> HandleSnapshot {
+        self.require_handle()
             .expect("ContainerGuard invariant: handle is only None after being consumed by stop()")
     }
 
@@ -1563,13 +1621,21 @@ impl ContainerGuard {
     /// is always the human-readable ledger/reaping name, on every backend — never
     /// the docker daemon's opaque container id — matching what the diagnostics
     /// report and the reaping ledger both name this sandbox.
+    ///
+    /// **On microsandbox, this value can change after [`Self::checkpoint`]/
+    /// [`Self::checkpoint_named`]**: that backend's checkpoint mechanism reboots
+    /// the sandbox under a freshly minted name rather than this one (see
+    /// [`Self::checkpoint_core`]'s own doc) — the sandbox name was never a
+    /// stable identifier across a checkpoint on that backend, only an
+    /// implementation detail, so this getter's return value tracking that is
+    /// documented behavior, not a signature change.
     // Deliberately returns `ledger_name`, not the field literally called `name`
     // (which holds the raw `SandboxHandle::id()` — see that field's own doc):
     // the ledger/human name is the one a caller can act on, and is what this
     // accessor has always been documented to return.
     #[allow(clippy::misnamed_getters)]
     pub fn name(&self) -> &str {
-        &self.ledger_name
+        *self.ledger_name.lock().expect("ledger_name mutex poisoned")
     }
 
     /// The host port `guest_port` is published on.
@@ -1602,14 +1668,14 @@ impl ContainerGuard {
 
     /// The full logs captured so far. Requires the container to be running.
     pub async fn logs(&self) -> Result<String> {
-        self.backend.logs(self.require_handle()?).await
+        self.backend.logs(&self.require_handle()?).await
     }
 
     /// Runs `cmd` inside the running container and returns its exit code and captured
     /// output.
     pub async fn exec(&self, cmd: &[&str]) -> Result<ExecResult> {
         let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-        self.backend.exec(self.require_handle()?, &cmd).await
+        self.backend.exec(&self.require_handle()?, &cmd).await
     }
 
     /// Copies `host_path` (a file or directory) into this RUNNING container at
@@ -1637,10 +1703,10 @@ impl ContainerGuard {
         require_absolute_container_path(container_path)?;
         if let Some(parent) = container_parent_dir(container_path) {
             let mkdir = vec!["mkdir".to_string(), "-p".to_string(), parent.to_string()];
-            self.backend.exec(handle, &mkdir).await?;
+            self.backend.exec(&handle, &mkdir).await?;
         }
         self.backend
-            .copy_to_container(handle, host_path.as_ref(), container_path)
+            .copy_to_container(&handle, host_path.as_ref(), container_path)
             .await
     }
 
@@ -1679,7 +1745,7 @@ impl ContainerGuard {
             }
         }
         self.backend
-            .copy_from_container(handle, container_path, host_path)
+            .copy_from_container(&handle, container_path, host_path)
             .await
     }
 
@@ -1708,9 +1774,9 @@ impl ContainerGuard {
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
         self.ensure_checkpoint_capable()?;
         let handle = self.require_handle()?;
-        self.ensure_checkpoint_target_survives_a_stop(handle)?;
+        self.ensure_checkpoint_target_survives_a_stop(&handle)?;
         let nonce = checkpoint::generate_ref_nonce();
-        let (checkpoint_ref, spec) = self.checkpoint_core(handle, &nonce).await?;
+        let (checkpoint_ref, spec) = self.checkpoint_core(&handle, &nonce).await?;
         Ok(Checkpoint {
             checkpoint_ref,
             backend: self.backend.name().to_string(),
@@ -1762,7 +1828,7 @@ impl ContainerGuard {
         checkpoint::validate_name(name)?;
         self.ensure_checkpoint_capable()?;
         let handle = self.require_handle()?;
-        self.ensure_checkpoint_target_survives_a_stop(handle)?;
+        self.ensure_checkpoint_target_survives_a_stop(&handle)?;
 
         let cache_dir = self
             .checkpoint_cache_dir_override
@@ -1778,7 +1844,7 @@ impl ContainerGuard {
             }
         }
 
-        let (checkpoint_ref, spec) = self.checkpoint_core(handle, name).await?;
+        let (checkpoint_ref, spec) = self.checkpoint_core(&handle, name).await?;
 
         let entry = checkpoint::NamedRegistryEntry {
             name: name.to_string(),
@@ -1887,15 +1953,124 @@ impl ContainerGuard {
     /// container undisturbed, so neither re-installation nor re-wait runs
     /// there. Returns the resulting ref and this container's full spec at
     /// checkpoint time.
+    ///
+    /// **On a backend whose checkpoint mechanism restarts the workload, the
+    /// reboot happens under a FRESH sandbox name, never `handle`'s own.**
+    /// Microsandbox's checkpoint cycle stops the sandbox, snapshots it, and
+    /// removes it before rebooting — and msb does not reliably release a
+    /// removed sandbox's on-disk directory on Windows (its own existence
+    /// check is DB-record OR directory; only the DB record clears on `rm`),
+    /// so a same-name restore can refuse "sandbox already exists" well past
+    /// the point the DB record is confirmed gone. This mirrors
+    /// `Container::from_checkpoint`, whose ordinary restore has always minted
+    /// a fresh name (via [`create_started_container`]'s own generator) and
+    /// has never hit this — the sandbox name was never a stable identifier
+    /// across a checkpoint, only an implementation detail.
+    ///
+    /// The fresh name is minted from the SAME `rz-<run-id>-<seq>` generator
+    /// every ordinary create uses ([`next_container_name`]) and appended to
+    /// the reaping ledger BEFORE the backend call — [`crate::reaper::before_create`],
+    /// exactly like an ordinary create's own append-before-create discipline
+    /// (see that function's doc, and `create_started_container`'s own call
+    /// site) — so a crash between this line and the backend's own reboot
+    /// still leaves a (harmlessly not-found-tolerant) name in the ledger
+    /// rather than a live sandbox with no record at all. `handle`'s OWN name
+    /// is left untouched in the ledger: it goes through the backend's normal
+    /// `rm` during the cycle, exactly as any other stop does, and its ledger
+    /// entry is left for the ledger's own not-found-tolerant sweep — no
+    /// explicit `after_stop` call for it here (see `crate::reaper`'s module
+    /// doc for why a sweep tolerates a name it can no longer find). A backend
+    /// call that fails un-appends the fresh name the same way
+    /// `create_started_container` un-appends a failed create's.
+    ///
+    /// Once the backend call succeeds, this guard's live identity (`handle`,
+    /// `name()`/the reaping ledger, the diagnostics registry) is updated to
+    /// match BEFORE anything else in this call reads it — `Self::require_handle`
+    /// is re-fetched right after, so the network-relink and wait-strategy
+    /// re-run below (and every operation any later caller makes on this
+    /// guard: `exec`, `logs`, `stop`, a second `checkpoint`, ...) all target
+    /// the sandbox's CURRENT name. A backend whose checkpoint mechanism never
+    /// reboots (docker) hands back a handle equal in effect to the one it was
+    /// given, so this adoption is a no-op there — no backend-specific branch
+    /// needed for it.
     async fn checkpoint_core(
         &self,
         handle: &dyn SandboxHandle,
         nonce_or_name: &str,
     ) -> Result<(String, ContainerSpec)> {
         let backend_ref = self.microsandbox_checkpoint_ref(nonce_or_name)?;
-        let checkpoint_ref = self.backend.create_checkpoint(handle, &backend_ref).await?;
+        let restarts_workload = self.backend.capabilities().checkpoint_restarts_workload;
+        // Captured before any rename, so the diagnostics registry (keyed by
+        // name — see `crate::diagnostics::Registry::deregister`'s own doc) can
+        // be re-pointed at the fresh identity below, exactly like `stop_inner`/
+        // `Drop` already deregister by whatever `Self::name()` currently is.
+        let name_before = self.name().to_string();
+        let fresh_name = if restarts_workload {
+            next_container_name()
+        } else {
+            // Never actually used for anything (the docker backend ignores
+            // this parameter entirely — see its own `create_checkpoint` doc)
+            // — kept as `handle.id()` rather than minting a name nothing will
+            // ever adopt, so the reaping ledger is never asked to track a
+            // name that will never correspond to a real sandbox.
+            handle.id().to_string()
+        };
+        if restarts_workload {
+            crate::reaper::before_create(
+                &self.backend,
+                &fresh_name,
+                self.keep_alive,
+                self.reaper_cache_dir_override.as_deref(),
+            );
+        }
+        let create_result = self
+            .backend
+            .create_checkpoint(handle, &backend_ref, &fresh_name)
+            .await;
+        let (checkpoint_ref, new_handle) = match create_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                if restarts_workload {
+                    crate::reaper::after_stop(
+                        &fresh_name,
+                        self.keep_alive,
+                        self.reaper_cache_dir_override.as_deref(),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        // Adopt the backend's post-checkpoint identity — see this method's own
+        // doc for why every subsequent read (including the re-fetch just
+        // below) must see it, not the identity this call started with.
+        *self.handle.lock().expect("handle mutex poisoned") = Some(new_handle);
+        if restarts_workload {
+            *self.ledger_name.lock().expect("ledger_name mutex poisoned") =
+                Box::leak(fresh_name.clone().into_boxed_str());
+        }
+        let handle = self.require_handle()?;
         let mut spec = handle.spec().clone();
-        if self.backend.capabilities().checkpoint_restarts_workload {
+        if restarts_workload {
+            // The diagnostics registry captured its OWN copy of the id/spec at
+            // `Container::start()` time (see `crate::diagnostics`'s module doc
+            // for why it's independent of this guard) — that copy is now stale
+            // (it names a sandbox the reboot already removed), so it's
+            // re-pointed at the fresh identity the same way `stop_inner`/
+            // `Drop` already re-derive `Self::name()` fresh rather than
+            // trusting a value captured before the checkpoint.
+            crate::diagnostics::deregister(&name_before);
+            crate::diagnostics::register(
+                self.name(),
+                &self.image,
+                self.host(),
+                self.mapped_ports
+                    .lock()
+                    .expect("mapped_ports mutex poisoned")
+                    .clone(),
+                self.backend.clone(),
+                handle.id(),
+                spec.clone(),
+            );
             // Only a backend that actually restarts the workload ever captures a
             // guest cmdline in the first place — see
             // `SandboxBackend::last_checkpoint_captured_cmdline`'s own doc. Folded
@@ -1906,10 +2081,10 @@ impl ContainerGuard {
             // forward so a LATER restore from this same `Checkpoint`/registry
             // entry knows what to run too).
             spec.checkpoint_captured_cmdline =
-                self.backend.last_checkpoint_captured_cmdline(handle);
+                self.backend.last_checkpoint_captured_cmdline(&handle);
             if !self.network_links.is_empty() {
                 self.backend
-                    .install_network_links(handle, &self.network_links)
+                    .install_network_links(&handle, &self.network_links)
                     .await?;
             }
             let target = GuardWaitTarget { guard: self };
@@ -1926,22 +2101,38 @@ impl ContainerGuard {
         consumer: impl Fn(String) + Send + Sync + 'static,
     ) -> Result<crate::backend::FollowHandle> {
         self.backend
-            .follow_logs(self.require_handle()?, Box::new(consumer))
+            .follow_logs(&self.require_handle()?, Box::new(consumer))
             .await
     }
 
     /// True from a successful `start()` until `stop()`; false before the first `start()`
     /// and after.
     pub fn is_running(&self) -> bool {
-        self.handle.is_some()
+        self.handle.lock().expect("handle mutex poisoned").is_some()
     }
 
-    fn require_handle(&self) -> Result<&dyn SandboxHandle> {
-        self.handle.as_deref().ok_or_else(|| {
+    /// An owned snapshot of this guard's CURRENT handle's id/spec — never a
+    /// borrowed `&dyn SandboxHandle`, because `handle` is `Mutex`-guarded (see
+    /// that field's own doc) and a `MutexGuard`'s borrow cannot be returned
+    /// with `&self`'s lifetime. Locks briefly, clones the id/spec, and drops
+    /// the lock before returning — every caller already only needs the result
+    /// for the length of a single backend call, most of them `.await`ing one
+    /// immediately after, so nothing here is ever held across an `.await`.
+    /// Always reflects whatever [`Self::checkpoint_core`] most recently put in
+    /// `handle` — a checkpoint reboot that swapped in a fresh identity is
+    /// picked up automatically, with no separate "current name" bookkeeping
+    /// needed here.
+    fn require_handle(&self) -> Result<HandleSnapshot> {
+        let guard = self.handle.lock().expect("handle mutex poisoned");
+        let handle = guard.as_deref().ok_or_else(|| {
             RightsizeError::Backend(format!(
                 "{} is not running — call start() first",
                 self.describe()
             ))
+        })?;
+        Ok(HandleSnapshot {
+            id: handle.id().to_string(),
+            spec: handle.spec().clone(),
         })
     }
 
@@ -1965,7 +2156,12 @@ impl ContainerGuard {
     /// contract — `Drop` cannot call this directly (it's async), but it follows the
     /// same shape with blocking primitives instead.
     async fn stop_inner(&mut self) {
-        let Some(handle) = self.handle.take() else {
+        // `&mut self` gives exclusive access, so `get_mut` bypasses the `Mutex`
+        // entirely — no lock needed to take ownership when nothing else can be
+        // holding it concurrently. Picks up whatever `Self::checkpoint_core`
+        // most recently swapped in, so a checkpoint-rebooted sandbox is stopped
+        // under its CURRENT (fresh) name, never the one this guard started under.
+        let Some(handle) = self.handle.get_mut().expect("handle mutex poisoned").take() else {
             return; // already stopped (or never started): no-op, no backend call.
         };
         // The diagnostics registry's own "no longer live" moment — mirrors
@@ -1973,7 +2169,7 @@ impl ContainerGuard {
         // or not): a reuse sandbox stays alive on the backend, but this guard no
         // longer holds a live handle for it, so it drops out of "what THIS process
         // can currently report on" either way.
-        crate::diagnostics::deregister(&self.ledger_name);
+        crate::diagnostics::deregister(self.name());
         if self.keep_alive {
             // Reuse containers: stop() is the feature's own contract — the sandbox
             // is LEFT RUNNING, and only in-process bookkeeping is cleared. No
@@ -1995,7 +2191,7 @@ impl ContainerGuard {
         let _ = self.backend.stop(handle.as_ref()).await;
         let _ = self.backend.remove(handle.as_ref()).await;
         crate::reaper::after_stop(
-            &self.ledger_name,
+            self.name(),
             self.keep_alive,
             self.reaper_cache_dir_override.as_deref(),
         );
@@ -2025,8 +2221,10 @@ impl NetworkMember for GuardMemberSnapshot {
 impl Drop for ContainerGuard {
     fn drop(&mut self) {
         // Best-effort SYNCHRONOUS fallback (decision 1). MUST NOT panic; MUST work with
-        // no Tokio runtime in context.
-        let Some(handle) = self.handle.take() else {
+        // no Tokio runtime in context. `&mut self` gives exclusive access, so
+        // `get_mut` bypasses `handle`'s `Mutex` entirely — see `stop_inner`'s
+        // identical use of it for why.
+        let Some(handle) = self.handle.get_mut().expect("handle mutex poisoned").take() else {
             return; // already stopped via stop(self): nothing to do.
         };
         // Synchronous, unlike the ledger update below — the diagnostics registry is
@@ -2034,7 +2232,7 @@ impl Drop for ContainerGuard {
         // this to the cleanup thread the way `crate::reaper::after_stop` is: this
         // guard is done being "live" the moment Drop starts, regardless of whether
         // the async backend teardown below has run yet.
-        crate::diagnostics::deregister(&self.ledger_name);
+        crate::diagnostics::deregister(self.name());
         if self.keep_alive {
             // A reuse sandbox must survive this guard's own automatic teardown
             // entirely — no port release (the container keeps running bound to
@@ -2062,7 +2260,7 @@ impl Drop for ContainerGuard {
         // listed in `.sandboxes` for the rest of THIS process's life — reachable only
         // by a future sweep/watchdog, never by this run's own clean-shutdown deletion
         // trigger — even though it's already gone.
-        let ledger_name = self.ledger_name.clone();
+        let ledger_name = self.name().to_string();
         let reaper_cache_dir_override = self.reaper_cache_dir_override.clone();
         cleanup::enqueue(CleanupJob {
             backend: self.backend.clone(),
@@ -3029,7 +3227,8 @@ mod tests {
             &self,
             handle: &dyn SandboxHandle,
             nonce: &str,
-        ) -> Result<String> {
+            fresh_name: &str,
+        ) -> Result<(String, Box<dyn SandboxHandle>)> {
             if self.fail_create_checkpoint {
                 return Err(RightsizeError::Backend(
                     "create_checkpoint failed".to_string(),
@@ -3041,7 +3240,25 @@ mod tests {
                 .unwrap()
                 .committed
                 .push((handle.id().to_string(), checkpoint_ref.clone()));
-            Ok(checkpoint_ref)
+            // Mirrors the real backends' split: a fake configured with
+            // `checkpoint_restarts_workload` (the microsandbox shape) reboots
+            // under `fresh_name`, just like `MsbCliBackend::create_checkpoint`
+            // does — everything else (the docker shape) hands back the same
+            // identity it was given, since nothing was ever touched.
+            let new_handle: Box<dyn SandboxHandle> = if self.checkpoint_restarts_workload {
+                let mut spec = handle.spec().clone();
+                spec.name = fresh_name.to_string();
+                Box::new(FakeHandle {
+                    id: fresh_name.to_string(),
+                    spec,
+                })
+            } else {
+                Box::new(FakeHandle {
+                    id: handle.id().to_string(),
+                    spec: handle.spec().clone(),
+                })
+            };
+            Ok((checkpoint_ref, new_handle))
         }
         async fn remove_checkpoint(&self, checkpoint_ref: &str) -> Result<()> {
             self.state
@@ -3308,6 +3525,109 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].0, guard.name());
         assert_eq!(committed[0].1, cp.checkpoint_ref);
+
+        guard.stop().await.unwrap();
+    }
+
+    // Red-proof (a): on a backend whose checkpoint mechanism restarts the
+    // workload (the microsandbox shape — see `FakeBackend::create_checkpoint`'s
+    // own doc for how the fake mirrors `MsbCliBackend`'s real reboot-under-a-
+    // fresh-name split), `checkpoint()` reboots under a DIFFERENT sandbox name
+    // than the one it started under, and every subsequent operation — proven
+    // here with `stop()` — targets that fresh name, never the original. A
+    // same-name reboot (the pre-fix behavior) would fail this by construction:
+    // `committed[0].0` (the name `create_checkpoint` was called with) would
+    // equal `guard.name()` after the call, and `stopped[0]` would equal the
+    // pre-checkpoint name instead of the post-checkpoint one.
+    #[tokio::test]
+    async fn checkpoint_reboots_under_a_fresh_name_and_stop_targets_it() {
+        let backend = FakeBackend::checkpoint_capable_restarts_workload();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+        let name_before = guard.name().to_string();
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+        let name_after = guard.name().to_string();
+
+        assert_ne!(
+            name_after, name_before,
+            "a workload-restarting checkpoint must reboot under a FRESH sandbox \
+             name, never the original — msb does not reliably release a removed \
+             sandbox's on-disk directory on Windows, so restoring under the same \
+             name is unreliable"
+        );
+        let committed = backend.state.lock().unwrap().committed.clone();
+        assert_eq!(
+            committed[0].0, name_before,
+            "the backend's create_checkpoint call is still made against the \
+             ORIGINAL (pre-reboot) handle — it is the reboot inside that call \
+             that targets the fresh name, not this call itself"
+        );
+
+        guard.stop().await.expect("stop must succeed");
+        let stopped = backend.state.lock().unwrap().stopped.clone();
+        assert_eq!(
+            stopped,
+            vec![name_after.clone()],
+            "stop() after a checkpoint must target the CURRENT (fresh) name, \
+             never the pre-checkpoint one — the pre-checkpoint sandbox is \
+             already gone by the time stop() runs"
+        );
+    }
+
+    // Red-proof (a), negative case: a backend whose checkpoint mechanism leaves
+    // the container undisturbed (docker's image commit) must NOT change this
+    // guard's identity — `name()` is stable across `checkpoint()` there, exactly
+    // as `checkpoint_returns_the_ref_backend_and_the_full_source_spec` already
+    // proves via `committed[0].0 == guard.name()`. This test makes the
+    // before/after comparison explicit instead of inferring it.
+    #[tokio::test]
+    async fn checkpoint_does_not_rename_the_sandbox_when_the_backend_leaves_it_undisturbed() {
+        let backend = FakeBackend::checkpoint_capable(); // checkpoint_restarts_workload == false
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+        let name_before = guard.name().to_string();
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+
+        assert_eq!(
+            guard.name(),
+            name_before,
+            "a backend that never reboots the sandbox must never change its name"
+        );
+        guard.stop().await.unwrap();
+    }
+
+    // Red-proof (b): the reaping ledger records the FRESH name before the
+    // reboot — `crate::reaper::before_create`'s own "append before create"
+    // discipline, applied identically here (see `checkpoint_core`'s own doc).
+    // The pre-checkpoint name's entry is deliberately left alone (not removed
+    // here): it goes through the ordinary `stop`/`rm` a checkpoint cycle
+    // already does, and the ledger's own not-found-tolerant sweep is what
+    // reconciles it later, exactly like `create_started_container`'s own
+    // failed-attempt names.
+    #[tokio::test]
+    async fn checkpoint_appends_the_fresh_name_to_the_reaping_ledger_before_the_reboot() {
+        let cache_dir = temp_cache_dir("checkpoint-fresh-name-ledger");
+        let backend = FakeBackend::checkpoint_capable_restarts_workload();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_reaper_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+        let name_before = guard.name().to_string();
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+        let name_after = guard.name().to_string();
+        assert_ne!(name_after, name_before);
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        assert!(
+            ledger.sandbox_names().contains(&name_after),
+            "the fresh name must be appended to the reaping ledger before the \
+             reboot — the same append-before-create discipline an ordinary \
+             create uses, so a crash mid-reboot still leaves a (harmlessly \
+             not-found-tolerant) record rather than an untracked live sandbox"
+        );
 
         guard.stop().await.unwrap();
     }
@@ -5161,6 +5481,38 @@ mod tests {
             !report_after_stop.contains(&header),
             "stop() must deregister this container from the diagnostics report"
         );
+    }
+
+    // Diagnostics re-registration: on a backend whose checkpoint mechanism
+    // restarts the workload, the report must follow the fresh name — the entry
+    // captured at `start()` time names a sandbox the reboot has already removed,
+    // so it must be re-pointed, not left stale.
+    #[tokio::test]
+    async fn checkpoint_re_registers_the_diagnostics_entry_under_the_fresh_name() {
+        let backend = FakeBackend::checkpoint_capable_restarts_workload();
+        let c = container_on(&backend).with_exposed_ports(&[6379]);
+        let guard = c.start().await.unwrap();
+        let name_before = guard.name().to_string();
+        let header_before = format!("-- {name_before} (");
+        assert!(crate::diagnostics().await.contains(&header_before));
+
+        guard.checkpoint().await.expect("checkpoint must succeed");
+        let name_after = guard.name().to_string();
+        assert_ne!(name_after, name_before);
+        let header_after = format!("-- {name_after} (");
+
+        let report = crate::diagnostics().await;
+        assert!(
+            !report.contains(&header_before),
+            "the pre-checkpoint name must no longer be in the report: {report}"
+        );
+        assert!(
+            report.contains(&header_after),
+            "the fresh name must be in the report: {report}"
+        );
+
+        guard.stop().await.unwrap();
+        assert!(!crate::diagnostics().await.contains(&header_after));
     }
 
     /// A wait strategy that captures a `diagnostics()` snapshot from mid-wait (before

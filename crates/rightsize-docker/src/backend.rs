@@ -755,7 +755,17 @@ impl SandboxBackend for DockerBackend {
     /// into this backend's own ref shape, `rightsize/checkpoint:<nonce>`, splitting
     /// it into the `repo`/`tag` pair the endpoint wants (the same split
     /// `split_repo_tag` already does for image pulls), and returns the ref.
-    async fn create_checkpoint(&self, handle: &dyn SandboxHandle, nonce: &str) -> Result<String> {
+    ///
+    /// An image commit never touches the running container at all — `fresh_name`
+    /// (the microsandbox-only reboot identity; see the trait method's own doc) is
+    /// simply ignored, and the returned handle carries `handle`'s own id/spec
+    /// completely unchanged, since there is nothing here for a caller to adopt.
+    async fn create_checkpoint(
+        &self,
+        handle: &dyn SandboxHandle,
+        nonce: &str,
+        _fresh_name: &str,
+    ) -> Result<(String, Box<dyn SandboxHandle>)> {
         let checkpoint_ref = format!("rightsize/checkpoint:{nonce}");
         let (repo, tag) = split_repo_tag(&checkpoint_ref);
         let path = format!(
@@ -773,7 +783,11 @@ impl SandboxBackend for DockerBackend {
                 String::from_utf8_lossy(&resp.body)
             )));
         }
-        Ok(checkpoint_ref)
+        let unchanged_handle: Box<dyn SandboxHandle> = Box::new(Handle {
+            id: handle.id().to_string(),
+            spec: handle.spec().clone(),
+        });
+        Ok((checkpoint_ref, unchanged_handle))
     }
 
     /// `DELETE /images/{ref}?force=true` — best-effort; a 404 (already gone) is
@@ -1822,11 +1836,17 @@ mod tests {
             spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
         };
 
-        let checkpoint_ref = backend
-            .create_checkpoint(&handle, "abc123def456")
+        let (checkpoint_ref, new_handle) = backend
+            .create_checkpoint(&handle, "abc123def456", "rz-unused-fresh-name")
             .await
             .expect("commit must succeed on a 201");
         assert_eq!(checkpoint_ref, "rightsize/checkpoint:abc123def456");
+        assert_eq!(
+            new_handle.id(),
+            "daemon-c-checkpoint",
+            "an image commit never reboots the container — the returned handle's \
+             id must be unchanged"
+        );
 
         let requests = received.lock().unwrap().clone();
         assert_eq!(requests.len(), 1, "{requests:?}");
@@ -1855,10 +1875,15 @@ mod tests {
             spec: ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef"),
         };
 
+        // `.err().expect(...)`, not `.expect_err(...)`: the `Ok` side now
+        // carries a `Box<dyn SandboxHandle>`, which has no `Debug` impl (a
+        // trait object bound `expect_err` requires on the whole `Result` but
+        // `Option::expect` does not).
         let err = backend
-            .create_checkpoint(&handle, "abc123def456")
+            .create_checkpoint(&handle, "abc123def456", "rz-unused-fresh-name")
             .await
-            .expect_err("a 404 must surface as an error");
+            .err()
+            .expect("a 404 must surface as an error");
         assert!(
             matches!(err, rightsize::error::RightsizeError::Backend(_)),
             "{err}"

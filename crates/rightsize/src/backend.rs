@@ -207,8 +207,9 @@ pub trait SandboxBackend: Send + Sync {
     /// Captures `handle`'s current filesystem state as a checkpoint, formatting
     /// `nonce` (a random 12-lowercase-hex string freshly generated per call by
     /// `crate::checkpoint::generate_ref_nonce`) into this backend's own ref shape
-    /// and returning the resulting ref — the checkpoint feature's own backend
-    /// primitive (`ContainerGuard::checkpoint`, `crate::checkpoint`). `handle` must
+    /// and returning the resulting ref plus this handle's identity AFTER the call
+    /// — the checkpoint feature's own backend primitive
+    /// (`ContainerGuard::checkpoint`, `crate::checkpoint`). `handle` must
     /// currently be running.
     ///
     /// Each backend picks its own ref shape: docker tags an image
@@ -221,6 +222,20 @@ pub trait SandboxBackend: Send + Sync {
     /// snapshotted at that path, and started back up — see
     /// [`Capabilities::checkpoint_restarts_workload`].
     ///
+    /// `fresh_name` is a sandbox name the caller has ALREADY minted (from the
+    /// same `rz-<run-id>-<seq>` generator every ordinary create uses) and
+    /// already appended to the reaping ledger, for a backend whose checkpoint
+    /// mechanism reboots the sandbox to restore under INSTEAD of `handle`'s own
+    /// name — see the microsandbox backend's own `create_checkpoint` doc for why
+    /// (msb's own directory-retention behavior on Windows makes a same-name
+    /// restore unreliable there). A backend that never reboots the sandbox
+    /// (docker: the container is never touched at all) ignores it. Either way,
+    /// the returned handle reflects this backend's identity for `handle`'s
+    /// sandbox AFTER this call — equal in effect to `handle` itself when nothing
+    /// changed, or reflecting `fresh_name` when it rebooted under it — and the
+    /// caller MUST adopt it in place of the one it passed in for every
+    /// subsequent operation.
+    ///
     /// Gated by [`Capabilities::checkpoint`] at the CALLER (`ContainerGuard::checkpoint`
     /// checks `capabilities().checkpoint` before ever reaching this method) — this
     /// default implementation is the defensive fallback for a backend that hasn't
@@ -228,7 +243,12 @@ pub trait SandboxBackend: Send + Sync {
     /// [`crate::error::RightsizeError::CheckpointUnsupported`], never called in
     /// practice because of the caller-side gate, but correct on its own if it ever
     /// were.
-    async fn create_checkpoint(&self, _handle: &dyn SandboxHandle, _nonce: &str) -> Result<String> {
+    async fn create_checkpoint(
+        &self,
+        _handle: &dyn SandboxHandle,
+        _nonce: &str,
+        _fresh_name: &str,
+    ) -> Result<(String, Box<dyn SandboxHandle>)> {
         Err(crate::error::RightsizeError::CheckpointUnsupported {
             backend: self.name().to_string(),
         })

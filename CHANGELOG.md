@@ -172,20 +172,58 @@ reaches its first tagged release.
   delay, mirroring this backend's existing one-shot transient-retry policy
   (the same shape already applied to msb's state-database migration race).
   The signature is checked unconditionally in code but never occurs on unix.
-- **The checkpoint cycle now waits out msb's asynchronous sandbox-name
-  release on Windows before rebooting from the snapshot**, polling `msb ls`
-  (bounded, briefly) after `rm` so the reboot no longer races a lingering
-  DB-record entry into msb's own "already exists" refusal. That `msb ls`
-  wait is only a cheap first gate, though — msb 0.7.1's own restore-time
-  collision check also blocks on the sandbox's on-disk directory, a second,
-  independent release `msb ls` says nothing about and which can lag well
-  behind the DB record on a loaded Windows host. So the reboot itself now
-  retries any "already exists" refusal on a real ~30-second budget (2-second
-  intervals, the same shape this backend already polls msb's install-operation
-  lock with), not the single 300ms one-shot retry this used to be — that
-  one-shot retry was sized for the gap between the wait passing and the retry
-  running, not for a directory-release lag CI has observed exceeding 3.5s
-  under load on its own.
+- **A checkpoint reboot now restores under a FRESH sandbox name, never the
+  original.** CI has now observed msb's on-disk sandbox directory staying
+  held for 30+ seconds after `msb rm` on Windows — not a transient lag to
+  wait out at all: msb's own existence check is "a DB record OR a directory,"
+  and only the DB record clears promptly on `rm`. A same-name restore was
+  therefore never reliable there, no matter how long the reboot waited or
+  retried first. The fix is structural instead of a longer wait: the
+  checkpoint feature's own re-boot now mints a fresh name from the SAME
+  `rz-<run-id>-<seq>` generator every ordinary create uses (never a new
+  naming scheme) and restores under it, then updates the live handle's
+  identity in place so every later call (`exec`/`logs`/`stop`/`rm`, a second
+  checkpoint, ...) targets the new sandbox. The backend's own-process
+  shutdown safety net (the `started_names` set `close()` sweeps on exit)
+  follows the same re-key, so a container that has been checkpointed stays
+  covered by that safety net under its fresh name, rather than silently
+  dropping out of it. Same ports, env, memory, and captured state — the
+  sandbox name across a checkpoint was always an
+  implementation detail, not a contract, and `Container::from_checkpoint`'s
+  own ordinary restores have minted a fresh name this same way from the
+  start (and have never hit this issue). The reaping ledger tracks the fresh
+  name the same way it tracks any other create (appended before the reboot);
+  the original name's entry is left to the ledger's own not-found-tolerant
+  sweep, exactly like a discarded create attempt's would be. On a backend
+  whose checkpoint mechanism doesn't reboot the sandbox at all (docker's
+  image commit), nothing here changes.
+  **The previous release's msb-`ls` name-release wait and the reboot's own
+  "already exists" retry budget (described below) are UNCHANGED and stay in
+  the code as dormant defense** — they simply have nothing left to trigger
+  against, since the reboot never asks msb for a name it has already seen.
+  They are not removed in case a future change ever reintroduces a same-name
+  path.
+  **Caller-visible consequence:** on the microsandbox backend,
+  `ContainerGuard::name()` (and the reaping/diagnostics record) can return a
+  DIFFERENT value after `checkpoint()`/`checkpoint_named()` than before it.
+  This is a documented behavior change, not a signature change — no public
+  method's parameters or return types changed.
+- **The checkpoint cycle waits out msb's asynchronous sandbox-name release on
+  Windows before rebooting from the snapshot**, polling `msb ls` (bounded,
+  briefly) after `rm` so the reboot no longer races a lingering DB-record
+  entry into msb's own "already exists" refusal. That `msb ls` wait is only a
+  cheap first gate, though — msb 0.7.1's own restore-time collision check
+  also blocks on the sandbox's on-disk directory, a second, independent
+  release `msb ls` says nothing about and which can lag well behind the DB
+  record on a loaded Windows host. So the reboot itself also retries any
+  "already exists" refusal on a real ~30-second budget (2-second intervals,
+  the same shape this backend already polls msb's install-operation lock
+  with), not the single 300ms one-shot retry this used to be — that one-shot
+  retry was sized for the gap between the wait passing and the retry running,
+  not for a directory-release lag CI has observed exceeding 3.5s under load
+  on its own. **Both of these now run against the fresh reboot name described
+  above, not the original — see that entry for why they are dormant in
+  practice but kept as defense-in-depth.**
 
 ## [0.7.9] - 2026-09-10
 

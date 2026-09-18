@@ -104,10 +104,16 @@ impl Drop for SnapshotCleanup {
 }
 
 /// Boot alpine + sleep, exec-write a marker file, `checkpoint()` it — assert the
-/// SAME sandbox still works afterward (exec succeeds, proving the internal
-/// stop/snapshot/start cycle plus the post-checkpoint wait re-run), assert the
-/// reaper ledger is untouched by that cycle, then `Container::from_checkpoint(...)`
-/// a restored sandbox and confirm the marker file survived on its disk snapshot.
+/// SAME guard still works afterward, now under a FRESH sandbox name (exec
+/// succeeds against that new name, proving the internal stop/snapshot/reboot
+/// cycle plus the post-checkpoint wait re-run — msb does not reliably release a
+/// removed sandbox's on-disk directory on Windows, so the reboot no longer
+/// reuses the original name; see `MsbCliBackend::create_checkpoint`'s own doc),
+/// assert the reaper ledger picks up that fresh name (append-before-create,
+/// same discipline an ordinary create uses) while the original name's entry is
+/// left alone for the ledger's own not-found-tolerant sweep, then
+/// `Container::from_checkpoint(...)` a restored sandbox and confirm the marker
+/// file survived on its disk snapshot.
 #[tokio::test]
 async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() {
     require_msb!();
@@ -129,8 +135,8 @@ async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() 
         .expect("exec must run");
     assert_eq!(write.exit_code, 0, "{}", write.stderr);
 
-    // The ledger contract: same sandbox name, still owned by this run, before and
-    // after the stop/snapshot/start cycle — read the raw on-disk `.sandboxes` file
+    // The ledger contract: the ORIGINAL name is owned by this run before the
+    // stop/snapshot/reboot cycle — read the raw on-disk `.sandboxes` file
     // directly (the same cross-process contract `reaper_it.rs` reads), since this
     // external test crate has no access to `rightsize`'s own private ledger API.
     let sandboxes_path = rightsize::cache_dir::dir()
@@ -173,24 +179,45 @@ async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() 
         snapshot_ref: cp.checkpoint_ref.clone(),
     };
 
+    let fresh_name = original_guard.name().to_string();
+    assert_ne!(
+        fresh_name, original_name,
+        "checkpoint() on microsandbox reboots under a FRESH sandbox name — the \
+         name was never a stable identifier across a checkpoint, only an \
+         implementation detail (see MsbCliBackend::create_checkpoint's own doc \
+         for why: msb's Windows directory-retention lag makes a same-name \
+         restore unreliable)"
+    );
     let ledger_after =
         std::fs::read_to_string(&sandboxes_path).expect("this run's ledger file must exist");
-    assert_eq!(
-        ledger_before, ledger_after,
-        "the stop/snapshot/start cycle must not touch the reaper ledger — same sandbox name, \
-         still owned by this run"
+    assert!(
+        ledger_after.contains(&fresh_name),
+        "the fresh name must be appended to the reaper ledger before the reboot \
+         — the same append-before-create discipline an ordinary create uses: \
+         {ledger_after}"
+    );
+    assert!(
+        ledger_after.contains(&original_name),
+        "the ORIGINAL name's entry is deliberately left alone by the checkpoint \
+         cycle — it is left for the ledger's own not-found-tolerant sweep, \
+         exactly like a discarded create attempt's name would be: {ledger_after}"
     );
 
-    // The SAME sandbox: still exec-able under its original name — proves the
-    // internal rm + attached re-boot from the snapshot brought it back up under
-    // the same name, and `checkpoint()`'s own post-restart wait re-run already
-    // confirmed it reached ready again before returning (checkpoint() would have
-    // errored otherwise).
-    assert_eq!(original_guard.name(), original_name);
+    // The SAME guard, same ports/env/workload — now exec-able under the FRESH
+    // name instead of the original: proves the internal rm + attached re-boot
+    // from the snapshot brought it back up (under the fresh name), and
+    // `checkpoint()`'s own post-restart wait re-run already confirmed it
+    // reached ready again before returning (checkpoint() would have errored
+    // otherwise). `exec()` routing to the fresh name automatically (rather
+    // than the caller having to track it) is exactly what
+    // `ContainerGuard::require_handle`'s own post-checkpoint identity adoption
+    // is for.
     let still_alive = original_guard
         .exec(&["cat", "/srv/rz-msb-checkpoint-marker.txt"])
         .await
-        .expect("exec must run against the SAME sandbox after checkpointing");
+        .expect(
+            "exec must run against the SAME guard, now under its fresh name, after checkpointing",
+        );
     assert_eq!(still_alive.exit_code, 0, "{}", still_alive.stderr);
     assert!(
         still_alive.stdout.contains("msb-checkpoint-marker"),
@@ -208,6 +235,12 @@ async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() 
         restored_guard.name(),
         original_name,
         "a restored container gets a fresh name, like any other start()"
+    );
+    assert_ne!(
+        restored_guard.name(),
+        fresh_name,
+        "a from_checkpoint() restore and the source's own in-place checkpoint \
+         reboot each mint their own independent fresh name — never the same one"
     );
 
     let read = restored_guard
