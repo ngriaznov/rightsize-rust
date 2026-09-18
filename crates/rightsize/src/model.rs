@@ -160,6 +160,31 @@ pub struct ContainerSpec {
     /// Internal plumbing, in the same spirit as `checkpoint_ref` above — no
     /// public builder sets this directly. Defaults to `None`.
     pub checkpoint_captured_cmdline: Option<Vec<String>>,
+    /// A BATCH of candidate sandbox names — always including `name` itself as
+    /// its first entry — a backend whose ordinary restore boot can hit a
+    /// Windows-only access-denied transient should walk instead of retrying
+    /// `name` in place. Minted by `rightsize::container::create_started_container`
+    /// (the same `rz-<run-id>-<seq>` generator every ordinary create uses,
+    /// already appended to the reaping ledger — every candidate, not just
+    /// `name` — before `SandboxBackend::create`/`start` ever run) ONLY for a
+    /// [`crate::Container::from_checkpoint`] spec (`checkpoint_ref.is_some()`);
+    /// `None` for every ordinarily-built container, and for a checkpoint
+    /// restore spec that reaches a backend's `start()` directly rather than
+    /// through `Container::from_checkpoint(...).start()`.
+    ///
+    /// Mirrors `create_checkpoint`'s own `fresh_names` parameter (see that
+    /// trait method's own doc for the live-verified Windows evidence this
+    /// exists to work around) — a backend whose ordinary restore never hits
+    /// that transient (docker: the checkpoint mechanism never even reboots)
+    /// ignores this field entirely, exactly like `create_checkpoint`'s own
+    /// `fresh_names[1..]`. Every candidate beyond whichever one a walking
+    /// backend actually attempts is simply left in the reaping ledger —
+    /// harmless noise for its own not-found-tolerant sweep, since a name
+    /// that was pre-tracked but never handed to the backend at all trivially
+    /// resolves as "not found." Internal plumbing, in the same spirit as
+    /// `checkpoint_ref` above — no public builder sets this directly.
+    /// Defaults to `None`.
+    pub restore_name_candidates: Option<Vec<String>>,
 }
 
 impl ContainerSpec {
@@ -187,6 +212,7 @@ impl ContainerSpec {
             tmpfs_root_mb: None,
             network_disabled: false,
             checkpoint_captured_cmdline: None,
+            restore_name_candidates: None,
         }
     }
 }
@@ -214,6 +240,7 @@ mod tests {
         assert_eq!(spec.tmpfs_root_mb, None);
         assert!(!spec.network_disabled);
         assert!(spec.checkpoint_captured_cmdline.is_none());
+        assert!(spec.restore_name_candidates.is_none());
     }
 
     #[test]

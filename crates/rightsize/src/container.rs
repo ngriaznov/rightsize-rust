@@ -62,6 +62,15 @@ fn next_container_name() -> String {
 /// outright or fails for a real (non-naming) reason, so this many spare names
 /// is generous headroom, not a tuned-to-the-wire budget. See
 /// [`ContainerGuard::checkpoint_core`]'s own doc for the full policy.
+///
+/// **Round 11 reuses this SAME constant for [`create_started_container`]'s own
+/// candidate batch**, minted for every [`Container::from_checkpoint`] spec
+/// (`checkpoint_ref.is_some()`) into [`ContainerSpec::restore_name_candidates`]
+/// — the ordinary restore path's Windows access-denied transient is the exact
+/// same one this reboot batch exists to work around (see
+/// `SandboxBackend::create_checkpoint`'s own doc for the live-verified
+/// evidence), so one shared "how many spare names is generous" answer serves
+/// both candidate walks; there was never a reason for the two to disagree.
 const CHECKPOINT_REBOOT_NAME_CANDIDATES: usize = 6;
 
 /// A per-process free-port allocator, shared by every `Container` in this process.
@@ -740,7 +749,26 @@ async fn create_started_container(
 
     for _ in 0..PORT_BIND_ATTEMPTS {
         let mapped_ports = allocate_ports(exposed_ports)?;
-        let name = next_container_name();
+        // POLICY v3 (round 11): a `Container::from_checkpoint` spec
+        // (`checkpoint_ref.is_some()`) mints a BATCH of candidate names from
+        // this same generator, not just one — a backend whose ordinary
+        // restore boot can hit the Windows job-object access-denied
+        // transient (see `SandboxBackend::create_checkpoint`'s own doc for
+        // the live-verified evidence, and `ContainerSpec::restore_name_
+        // candidates`'s own doc) must never retry a failed attempt under the
+        // same name, so it needs somewhere to advance to — this crate is the
+        // only place that can mint one, since it owns both the name
+        // generator and the reaping ledger a backend cannot reach directly.
+        // An ordinary (non-restore) create mints exactly one name, unchanged
+        // from before this policy existed.
+        let restore_names: Vec<String> = if checkpoint_ref.is_some() {
+            (0..CHECKPOINT_REBOOT_NAME_CANDIDATES)
+                .map(|_| next_container_name())
+                .collect()
+        } else {
+            vec![next_container_name()]
+        };
+        let name = restore_names[0].clone();
 
         let mut spec = ContainerSpec {
             name: name.clone(),
@@ -765,6 +793,7 @@ async fn create_started_container(
             tmpfs_root_mb,
             network_disabled,
             checkpoint_captured_cmdline: checkpoint_captured_cmdline.map(<[String]>::to_vec),
+            restore_name_candidates: checkpoint_ref.is_some().then(|| restore_names.clone()),
         };
 
         if let Some(customizer) = spec_customizer {
@@ -796,18 +825,30 @@ async fn create_started_container(
             spec.network_id.as_deref(),
         )?;
 
-        // The reaping ledger's own append-before-create discipline: the name must be
-        // recorded as a superset BEFORE the backend actually creates it, so a crash
-        // between this line and `backend.create` still leaves a (harmlessly
-        // not-found-on-remove) name in the ledger rather than a live sandbox with no
-        // record at all. See `crate::reaper`'s module doc.
-        crate::reaper::before_create(
-            backend,
-            &spec.name,
-            spec.keep_alive,
-            reaper_cache_dir_override,
-        );
-        let attempt_name = spec.name.clone();
+        // The reaping ledger's own append-before-create discipline: every
+        // candidate this attempt might restore under must be recorded as a
+        // superset BEFORE the backend ever runs, so a crash at any point
+        // during `backend.create`/`start` — including mid-walk, past
+        // `spec.name` itself — still leaves nothing but (harmlessly
+        // not-found-on-remove) names in the ledger, never a live sandbox with
+        // no record at all. Read back from the FINISHED `spec` (never the
+        // `restore_names` local above it was built from) for the same reason
+        // `validate_spec_conflicts` just re-checked it: a customizer had a
+        // chance to touch the spec in between. See `crate::reaper`'s module
+        // doc, and `ContainerGuard::checkpoint_core`'s own identical
+        // pre-tracking loop for its own candidate batch.
+        let restore_candidates: Vec<String> = spec
+            .restore_name_candidates
+            .clone()
+            .unwrap_or_else(|| vec![spec.name.clone()]);
+        for candidate in &restore_candidates {
+            crate::reaper::before_create(
+                backend,
+                candidate,
+                spec.keep_alive,
+                reaper_cache_dir_override,
+            );
+        }
         let attempt_keep_alive = spec.keep_alive;
 
         let handle = match backend.create(spec).await {
@@ -817,27 +858,46 @@ async fn create_started_container(
                 // the pool (the reuse path's create branch already does; without this
                 // they stay issued for the life of the process) and undo the ledger
                 // append above so a discarded name doesn't sit in `.sandboxes` forever.
+                // Every pre-tracked candidate un-appends together: `create` itself
+                // never even ran, so none of them can be a live sandbox — same
+                // rationale as `checkpoint_core`'s own error branch.
                 release_ports(&mapped_ports);
-                crate::reaper::after_stop(
-                    &attempt_name,
-                    attempt_keep_alive,
-                    reaper_cache_dir_override,
-                );
+                for candidate in &restore_candidates {
+                    crate::reaper::after_stop(
+                        candidate,
+                        attempt_keep_alive,
+                        reaper_cache_dir_override,
+                    );
+                }
                 return Err(e);
             }
         };
         match backend.start(handle.as_ref()).await {
-            Ok(()) => return Ok((handle, mapped_ports)),
+            Ok(()) => {
+                // POLICY v3: adopt whichever candidate actually won — a no-op
+                // for an ordinary boot, or a restore whose very first attempt
+                // succeeded (the overwhelming common case); see
+                // `SandboxBackend::winning_start_handle`'s own doc for why
+                // this is a separate read-back rather than `start`'s own
+                // return value carrying it.
+                let handle = backend
+                    .winning_start_handle(handle.as_ref())
+                    .unwrap_or(handle);
+                return Ok((handle, mapped_ports));
+            }
             Err(e) => {
                 let _ = backend.stop(handle.as_ref()).await;
                 let _ = backend.remove(handle.as_ref()).await;
-                // Same rationale as the `create` failure branch above: this attempt's
-                // container was just torn down, so its ledger line must go too.
-                crate::reaper::after_stop(
-                    &attempt_name,
-                    attempt_keep_alive,
-                    reaper_cache_dir_override,
-                );
+                // Same rationale as the `create` failure branch above: every
+                // pre-tracked candidate's ledger line must go too, not just
+                // whichever one `handle` still names.
+                for candidate in &restore_candidates {
+                    crate::reaper::after_stop(
+                        candidate,
+                        attempt_keep_alive,
+                        reaper_cache_dir_override,
+                    );
+                }
                 if is_port_bind_conflict(&e) {
                     // Quarantined, not released: see `ConflictQuarantine`.
                     quarantine.0.extend(mapped_ports.iter().copied());
@@ -1244,6 +1304,9 @@ async fn try_adopt(
         network_disabled: container.network_disabled,
         // Same rationale as `checkpoint_ref` above.
         checkpoint_captured_cmdline: None,
+        // Same rationale as `checkpoint_ref` above — a reuse sandbox never
+        // restores from a checkpoint, so it never has a candidate batch.
+        restore_name_candidates: None,
     };
 
     let Ok(Some(handle)) = backend.find_running(&adopted_spec).await else {
@@ -1343,6 +1406,9 @@ async fn create_and_start_reuse_sandbox(
             tmpfs_root_mb: container.tmpfs_root_mb,
             network_disabled: container.network_disabled,
             checkpoint_captured_cmdline: None,
+            // A reuse sandbox is never a checkpoint restore (see
+            // `Container::start()`'s own `ReuseCheckpointConflict` check).
+            restore_name_candidates: None,
         };
         if let Some(customizer) = &container.spec_customizer {
             let lookup: std::collections::HashMap<u16, u16> =
@@ -2736,6 +2802,10 @@ fn checkpoint_from_reduced(
             // restore of a no-explicit-command checkpoint still knows what to
             // run.
             checkpoint_captured_cmdline: spec.captured_cmdline,
+            // Placeholder, like `mounts`/`network_id` above — a candidate
+            // batch is minted fresh by `create_started_container` at restore
+            // time, never carried by the checkpoint record itself.
+            restore_name_candidates: None,
         },
     }
 }
@@ -5548,6 +5618,204 @@ mod tests {
         );
 
         restored_guard.stop().await.unwrap();
+    }
+
+    // POLICY v3 (round 11): a fake backend whose `start()` "wins" under the
+    // batch's THIRD candidate (index 2) whenever the spec it's handed carries
+    // a restore-name-candidate batch — standing in for `MsbCliBackend`'s own
+    // real candidate walk (`spawn_and_await_restore_candidates`) without a
+    // real `msb` binary. Its `winning_start_handle` override mirrors
+    // `MsbCliBackend`'s own read-once contract exactly (a `None` id key means
+    // nothing to report). Proves `create_started_container`'s own adoption of
+    // `winning_start_handle` propagates all the way through: the guard's own
+    // `name()`, the reaping ledger, and every later backend call
+    // (`stop`/`remove`) all target the WINNING name, never the batch's first
+    // entry `handle` was created under.
+    struct RestoreRekeyBackend {
+        created: StdMutex<Vec<ContainerSpec>>,
+        started: StdMutex<Vec<String>>,
+        stopped: StdMutex<Vec<String>>,
+        removed: StdMutex<Vec<String>>,
+        /// `(start()-time id, winning candidate)`, cleared by
+        /// `winning_start_handle` the first time it's read — mirrors
+        /// `MsbCliBackend::restore_rekey`'s own "empty unless there's a
+        /// pending re-key" shape.
+        rekeyed: StdMutex<Option<(String, String)>>,
+    }
+    impl RestoreRekeyBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                created: StdMutex::new(Vec::new()),
+                started: StdMutex::new(Vec::new()),
+                stopped: StdMutex::new(Vec::new()),
+                removed: StdMutex::new(Vec::new()),
+                rekeyed: StdMutex::new(None),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl SandboxBackend for RestoreRekeyBackend {
+        fn name(&self) -> &str {
+            // Must match the source checkpoint's own backend name (`FakeBackend`'s
+            // default, "fake") — `Container::start()` refuses on a mismatch before
+            // any backend work, exactly like the real msb/docker pair.
+            "fake"
+        }
+        fn supports_native_networks(&self) -> bool {
+            false
+        }
+        fn capabilities(&self) -> crate::backend::Capabilities {
+            crate::backend::Capabilities {
+                hardware_isolated: false,
+                checkpoint: true,
+                checkpoint_restarts_workload: true,
+            }
+        }
+        async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>> {
+            self.created.lock().unwrap().push(spec.clone());
+            Ok(Box::new(FakeHandle {
+                id: spec.name.clone(),
+                spec,
+            }))
+        }
+        async fn start(&self, handle: &dyn SandboxHandle) -> Result<()> {
+            let id = handle.id().to_string();
+            self.started.lock().unwrap().push(id.clone());
+            if let Some(winner) = handle
+                .spec()
+                .restore_name_candidates
+                .as_ref()
+                .and_then(|candidates| candidates.get(2))
+            {
+                *self.rekeyed.lock().unwrap() = Some((id, winner.clone()));
+            }
+            Ok(())
+        }
+        async fn stop(&self, handle: &dyn SandboxHandle) -> Result<()> {
+            self.stopped.lock().unwrap().push(handle.id().to_string());
+            Ok(())
+        }
+        async fn remove(&self, handle: &dyn SandboxHandle) -> Result<()> {
+            self.removed.lock().unwrap().push(handle.id().to_string());
+            Ok(())
+        }
+        async fn exec(&self, _handle: &dyn SandboxHandle, _cmd: &[String]) -> Result<ExecResult> {
+            Ok(ExecResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        async fn logs(&self, _handle: &dyn SandboxHandle) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn follow_logs(
+            &self,
+            _handle: &dyn SandboxHandle,
+            _consumer: Box<dyn Fn(String) + Send + Sync>,
+        ) -> Result<crate::backend::FollowHandle> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn ensure_network(&self, _network_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_network(&self, _network_id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn cleanup_sync(&self, _container_id: &str) {}
+        fn remove_by_name(&self, _name: &str) {}
+        fn watchdog_kill_command(&self) -> Vec<String> {
+            vec!["true".to_string()]
+        }
+        fn winning_start_handle(
+            &self,
+            handle: &dyn SandboxHandle,
+        ) -> Option<Box<dyn SandboxHandle>> {
+            let mut rekeyed = self.rekeyed.lock().unwrap();
+            let (pending_id, winner) = rekeyed.as_ref()?;
+            if pending_id != handle.id() {
+                return None;
+            }
+            let mut spec = handle.spec().clone();
+            spec.name = winner.clone();
+            let winner_id = winner.clone();
+            *rekeyed = None;
+            Some(Box::new(FakeHandle {
+                id: winner_id,
+                spec,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn from_checkpoint_container_whose_start_wins_under_a_later_candidate_rekeys_everything()
+    {
+        // POLICY v3's own container-layer red-proof: when the backend's
+        // `start()` reports (via `winning_start_handle`) that it booted under
+        // the candidate batch's THIRD entry rather than the first, EVERY
+        // subsequent read of this container's identity — the guard's own
+        // `name()`, the reaping ledger, and later `stop()`/`remove()` calls —
+        // must target that winning name, never the one `create()` minted.
+        let cache_dir = temp_cache_dir("restore-rekey");
+
+        let source_backend = FakeBackend::checkpoint_capable();
+        let source = container_on(&source_backend)
+            .with_exposed_ports(&[6379])
+            .with_reaper_cache_dir_override(cache_dir.clone());
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        let restore_backend = RestoreRekeyBackend::new();
+        let restored = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .with_reaper_cache_dir_override(cache_dir.clone())
+            .waiting_for(ReadyImmediately);
+        let guard = restored
+            .start()
+            .await
+            .expect("restore must start under the winning candidate");
+
+        let minted_spec = restore_backend.created.lock().unwrap()[0].clone();
+        let candidates = minted_spec.restore_name_candidates.clone().expect(
+            "create_started_container must mint a restore-name-candidate batch for a \
+             from_checkpoint spec",
+        );
+        assert!(
+            candidates.len() >= 3,
+            "the batch must be large enough to have a third entry: {candidates:?}"
+        );
+        let winner = candidates[2].clone();
+        assert_ne!(
+            winner, minted_spec.name,
+            "the winning candidate must be a LATER one, not the first-minted name — otherwise \
+             this test proves nothing about re-keying"
+        );
+
+        assert_eq!(
+            guard.name(),
+            winner,
+            "the guard's own identity must be the WINNING candidate, not the batch's first entry"
+        );
+
+        let ledger = crate::reaper::Ledger::new(&cache_dir, crate::RunId::value());
+        assert!(
+            ledger.sandbox_names().contains(&winner),
+            "the reaping ledger must have pre-tracked the winning candidate (it mints the whole \
+             batch up front, before the backend ever runs)"
+        );
+
+        guard.stop().await.unwrap();
+        assert_eq!(
+            restore_backend.stopped.lock().unwrap().last(),
+            Some(&winner),
+            "stop() must target the winning candidate's name, never the first-minted one"
+        );
+        assert_eq!(
+            restore_backend.removed.lock().unwrap().last(),
+            Some(&winner),
+            "remove() must target the winning candidate's name, never the first-minted one"
+        );
     }
 
     // Diagnostics registration: a running container is reachable through the report

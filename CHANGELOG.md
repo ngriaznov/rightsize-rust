@@ -317,6 +317,51 @@ reaches its first tagged release.
   reported to the microsandbox project upstream. Internal-only: the
   microsandbox backend gained an injectable restore-launcher seam so this is
   fully unit-tested without a real Windows host; no public API changed.
+- **An ORDINARY `Container::from_checkpoint(...).start()` restore now gets the
+  same fresh-name-advancement-plus-broker policy the checkpoint reboot above
+  does, instead of a one-shot same-name retry.** The previous release
+  deliberately left this path alone: `spawn_and_await_running`'s existing
+  one-shot retry of the Windows post-teardown access-denied transient covers
+  it, and every ordinary restore already boots under a freshly-minted name of
+  its own, so it never hit the checkpoint reboot's directory-retention
+  collision. Live CI proved that reasoning incomplete: the SAME job-object
+  access-denied transient the reboot's own campaign traced (msb's detached
+  `restore` spawn always passes `CREATE_BREAKAWAY_FROM_JOB`, refused inside a
+  Gradle/cargo-test job object, AFTER msb's own `persist_start` stage has
+  already inserted the sandbox's DB record) hits an ordinary restore just as
+  often — and this path's inline same-name retry converts it into msb's own
+  "already exists" refusal on the SAME name, a collision this library's own
+  code caused rather than a real availability race. Five rightsize-kotlin
+  Windows CI tests failed exactly this way, all past a brokered checkpoint
+  reboot and into `SandboxNameCollisionException` on the ordinary restore
+  right after it; rightsize-rust's own `checkpoint_archive_it` panicked
+  identically restoring an imported archive. The fix mirrors the checkpoint
+  reboot's own POLICY v2 rather than duplicating it: `Container::from_checkpoint`'s
+  own `create_started_container` now mints a BATCH of candidate names up
+  front for a restore boot (the same generator, the same six-name batch size,
+  appended to the reaping ledger before the backend is ever called — never
+  just the one this call started under), and the microsandbox backend's
+  `start()` walks that batch on a classified access-denied or "already
+  exists," best-effort `msb rm`-ing the candidate that just failed and never
+  retrying it, escalating every REMAINING attempt to the same job-free broker
+  once the access-denied class has been seen once. The very first attempt of
+  every restore is still always direct. On success, this backend's own
+  per-container state, and every layer above it — the reaping ledger, the
+  diagnostics registry, and the `ContainerGuard`'s own identity — is re-keyed
+  to whichever candidate actually won, exactly like a checkpoint reboot's own
+  re-key; a caller sees only that `ContainerGuard::name()` can, in the rare
+  case this policy exists for, differ from the name the container was
+  originally minted under. Docker's restore never touches the batch at all
+  (its checkpoint mechanism never reboots anything). This is an internal-only
+  change: a new `ContainerSpec::restore_name_candidates` field, populated only
+  for a `from_checkpoint` spec, and a new `SandboxBackend::winning_start_handle`
+  SPI method (mirroring `create_checkpoint`'s own re-key contract, but a
+  separate read-back rather than widening `start()`'s own return type, since
+  every other `SandboxBackend` implementor — docker included — has nothing to
+  report and needed no changes at all); no public API changed, and a
+  checkpoint-ref spec that reaches a backend's `start()` directly, without a
+  candidate batch (bypassing the container layer entirely), keeps the old
+  one-shot same-name retry as a defensive fallback.
 
 ## [0.7.9] - 2026-09-10
 

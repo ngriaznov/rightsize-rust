@@ -92,7 +92,46 @@ pub trait SandboxBackend: Send + Sync {
     /// chosen — this call binds them, it never allocates.
     async fn create(&self, spec: ContainerSpec) -> Result<Box<dyn SandboxHandle>>;
     /// Starts a container previously returned by [`SandboxBackend::create`].
+    ///
+    /// **A [`ContainerSpec::checkpoint_ref`] spec whose
+    /// [`ContainerSpec::restore_name_candidates`] is populated may boot under a
+    /// DIFFERENT name than `handle` was created with.** A backend whose restore
+    /// mechanism can hit a transient that a same-name retry can never recover
+    /// from (microsandbox's Windows job-object access-denied transient — see
+    /// [`Self::create_checkpoint`]'s own doc for the live-verified evidence,
+    /// which applies identically here) walks that candidate batch instead,
+    /// never retrying a failed attempt's own name — see
+    /// [`Self::winning_start_handle`] for how the caller learns which
+    /// candidate actually won. A backend that never hits that transient
+    /// (docker; microsandbox off Windows) ignores the field and always
+    /// succeeds (or fails) under `handle`'s own name, exactly as this method
+    /// has always behaved.
     async fn start(&self, handle: &dyn SandboxHandle) -> Result<()>;
+    /// The post-[`Self::start`] identity for `handle`, when that call actually
+    /// booted under a DIFFERENT candidate than `handle` was created with (see
+    /// [`Self::start`]'s own doc for when). Read back ONCE by
+    /// `rightsize::container::create_started_container`, immediately after a
+    /// successful `start()` call — mirroring [`Self::last_checkpoint_captured_cmdline`]'s
+    /// own "read once, right after the call it answers for" contract, rather
+    /// than changing [`Self::start`]'s own return type: `start` is called from
+    /// two sites in this crate today, and every one of the ten-plus
+    /// [`SandboxBackend`] implementors (real and test doubles alike) would
+    /// otherwise need a matching, almost-always-trivial change for a re-key
+    /// that only ever actually happens on one backend, on one platform, for
+    /// one kind of boot.
+    ///
+    /// `None` covers both "nothing changed" (an ordinary boot; a restore whose
+    /// very first attempt succeeded; a restore with no candidate batch at
+    /// all) and "this backend never re-keys `start()` at all" (the default
+    /// here, used by docker and every test double — `start()`'s own default
+    /// behavior already covers them). The caller treats both identically:
+    /// keep using `handle` as is. Called with the SAME `handle` value
+    /// `start()` itself was just called with — an implementation that DOES
+    /// re-key looks it up by `handle.id()`, exactly like
+    /// [`Self::last_checkpoint_captured_cmdline`] does.
+    fn winning_start_handle(&self, _handle: &dyn SandboxHandle) -> Option<Box<dyn SandboxHandle>> {
+        None
+    }
     /// Stops a running container. Safe to call on an already-stopped one.
     async fn stop(&self, handle: &dyn SandboxHandle) -> Result<()>;
     /// Removes a stopped container's resources.

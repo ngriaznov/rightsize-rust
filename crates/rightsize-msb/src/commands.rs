@@ -550,6 +550,7 @@ mod tests {
             tmpfs_root_mb: None,
             network_disabled: false,
             checkpoint_captured_cmdline: None,
+            restore_name_candidates: None,
         }
     }
 
