@@ -306,11 +306,17 @@ reaches its first tagged release.
   either way); and if the broker itself can't even launch (no `powershell.exe`,
   a CIM failure, a temp-file write failure), that one attempt falls back to a
   direct spawn and the walk keeps going rather than turning the broker into a
-  new single point of failure. Non-Windows platforms never broker at all — the
-  signature this whole class is keyed on simply never occurs there. This has
-  also been reported to the microsandbox project upstream. Internal-only:
-  the microsandbox backend gained an injectable restore-launcher seam so this
-  is fully unit-tested without a real Windows host; no public API changed.
+  new single point of failure. That fallback now also covers a CIM call that
+  fails INSIDE an otherwise-running `powershell.exe` (WMI disabled, the RPC
+  service unreachable, a denied CIM session): the launcher checks the outer
+  script process's own exit status and confirms its stdout actually reached
+  the point of issuing the CIM call before trusting anything in it, rather
+  than treating any exit — however the process got there — as a completed
+  brokered attempt. Non-Windows platforms never broker at all — the signature
+  this whole class is keyed on simply never occurs there. This has also been
+  reported to the microsandbox project upstream. Internal-only: the
+  microsandbox backend gained an injectable restore-launcher seam so this is
+  fully unit-tested without a real Windows host; no public API changed.
 
 ## [0.7.9] - 2026-09-10
 

@@ -43,7 +43,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -469,12 +469,29 @@ fn is_name_conflict(output: &str) -> bool {
 /// io error: Access is denied. (os error 5)
 /// ```
 ///
-/// The just-written snapshot artifact's file handle hasn't finished being
-/// released by the OS yet when `restore` tries to read it — msb's own docs
-/// describe deferred file-handle release on Windows — so this is a race, not a
-/// real permissions problem, and clears on a short retry (see
-/// [`RESTORE_ACCESS_DENIED_RETRY_DELAY`] and the one-shot retry arm in
-/// [`spawn_and_await_running`]).
+/// The ORIGINAL theory (still the one [`spawn_and_await_running`]'s own
+/// one-shot retry is built on): the just-written snapshot artifact's file
+/// handle hasn't finished being released by the OS yet when `restore` tries to
+/// read it — msb's own docs describe deferred file-handle release on Windows —
+/// so it's a race, not a real permissions problem, and clears on a short retry
+/// (see [`RESTORE_ACCESS_DENIED_RETRY_DELAY`]).
+///
+/// A round-10 live diagnostic campaign on Windows CI found this SAME wording
+/// also covers a second, unrelated, and NON-transient cause specific to the
+/// checkpoint-reboot call site: msb's detached `restore` always spawns its VM
+/// supervisor with `CREATE_BREAKAWAY_FROM_JOB`, which `CreateProcess` denies
+/// outright when the calling `msb.exe` sits inside a Windows job object that
+/// doesn't grant breakaway (exactly the job objects Gradle test workers and
+/// cargo-test binaries run inside). This is structural, not a race — no
+/// amount of waiting clears it, and the CHANGELOG entry for the fresh-name
+/// checkpoint-reboot walk / job-free broker escalation (POLICY v2) documents
+/// the live evidence. This is WHY [`spawn_and_await_reboot_restore`] treats an
+/// identical match here completely differently from
+/// [`spawn_and_await_running`]: instead of retrying in place, it surfaces the
+/// failure immediately so [`reboot_with_already_exists_retry`] can advance to
+/// a fresh candidate name and, on Windows, escalate the remaining attempts to
+/// the job-free broker — retrying under the SAME name would just reproduce the
+/// same structural denial.
 ///
 /// Matches conservatively — msb's own "Access is denied" phrase together with
 /// EITHER "io error" or "os error 5" — so a genuine, unrelated access-denied
@@ -2789,6 +2806,42 @@ where
     }
 }
 
+/// Turns the OUTER `powershell -NoProfile -File <script>` process's own exit —
+/// not the inner restore it launched via WMI/CIM, [`classify_broker_report`]'s
+/// concern — into a [`RestoreLaunch`], or into the `Err` that tells
+/// [`broker_with_direct_fallback`] to fall back to a direct attempt.
+///
+/// POLICY v2 item 5 requires a CIM error (WMI disabled, RPC unreachable, a CIM
+/// session denied, ...) to be treated as a broker INFRASTRUCTURE failure, same
+/// as a missing `powershell.exe` or a script-write failure. When
+/// `Invoke-CimMethod` itself throws, the outer script can terminate early —
+/// nonzero, or even zero if PowerShell swallows the error — without ever
+/// reaching its own `Write-Output "CIM_RETURN:..."` line, so `status.success()`
+/// alone isn't a reliable signal either way: this treats BOTH a non-success
+/// exit AND a "successful" exit whose stdout never printed `CIM_RETURN:` (the
+/// very first thing [`build_broker_script`] writes, before anything else that
+/// could fail) as that same infrastructure failure. Only a script that both
+/// exited successfully AND actually reached the CIM call has its stdout hand
+/// off to [`parse_broker_script_output`]/[`classify_broker_report`] — the same
+/// classification a direct attempt's exit gets, per POLICY v2 item 3.
+fn broker_launch_from_child_exit(
+    status: ExitStatus,
+    script_stdout: &str,
+    argv: &[String],
+    is_listed: impl Fn(&str) -> Option<bool>,
+) -> std::io::Result<RestoreLaunch> {
+    if !status.success() || !script_stdout.contains("CIM_RETURN:") {
+        return Err(std::io::Error::other(format!(
+            "broker script's outer powershell process exited {status} without completing \
+             (its own CIM diagnostics never appeared in stdout/stderr: {script_stdout:?}) — \
+             treating this as a broker infrastructure failure so the caller falls back to a \
+             direct restore attempt, per POLICY v2 item 5"
+        )));
+    }
+    let report = parse_broker_script_output(script_stdout);
+    Ok(classify_broker_report(argv, &report, is_listed))
+}
+
 /// The real [`RestoreLauncher`] POLICY v2 escalates to: writes
 /// [`build_broker_script`]'s own script to a fresh temp file
 /// ([`broker_temp_file`]), runs it via `powershell -NoProfile -File <script>`
@@ -2798,10 +2851,17 @@ where
 /// point), waits for the OUTER script to exit (bounded by [`FIRST_RUN_TIMEOUT`],
 /// the same generous headroom every restore attempt gets — the script's OWN
 /// internal ecFile wait is a much shorter ~30s, per [`build_broker_script`]),
-/// parses its stdout ([`parse_broker_script_output`]), and classifies the result
-/// ([`classify_broker_report`]) using a real `msb ls` for the missing-ecFile
-/// fallback. Best-effort cleanup of the script/out/ec temp files runs regardless
-/// of outcome.
+/// and hands the OUTER process's own exit status and stdout to
+/// [`broker_launch_from_child_exit`] — which is itself the POLICY v2 item 5
+/// gate: only once that outer process is confirmed to have actually run the
+/// script (a success exit that reached its own CIM diagnostics) does anything
+/// parse ([`parse_broker_script_output`]) or classify
+/// ([`classify_broker_report`]) its stdout as a real restore outcome, using a
+/// real `msb ls` for the missing-ecFile fallback; anything else — a nonzero
+/// exit, or a "successful" exit that never got that far — surfaces as an
+/// `io::Error` so [`broker_with_direct_fallback`]'s fallback actually engages.
+/// Best-effort cleanup of the script/out/ec temp files runs regardless of
+/// outcome.
 ///
 /// Only ever WIRED IN on Windows — see [`MsbCliBackend::new`]'s own
 /// `cfg!(windows)` gate on [`MsbCliBackend::restore_broker`], the actual
@@ -2841,16 +2901,15 @@ fn real_broker_restore_launcher(msb: &Path, argv: &[String]) -> std::io::Result<
 
         let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
         loop {
-            if child.try_wait()?.is_some() {
+            if let Some(status) = child.try_wait()? {
                 let _ = t_out.join();
                 let _ = t_err.join();
                 let script_stdout = collect_tail(&tail);
-                let report = parse_broker_script_output(&script_stdout);
-                return Ok(classify_broker_report(argv, &report, |name| {
+                return broker_launch_from_child_exit(status, &script_stdout, argv, |name| {
                     invoke_standalone(msb, &commands::ls(), LOGS_TIMEOUT)
                         .ok()
                         .and_then(|r| ls_json::try_is_listed(&r.stdout, name))
-                }));
+                });
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -5934,6 +5993,118 @@ mod tests {
             matches!(launch, RestoreLaunch::TimedOut { .. }),
             "neither an ecFile nor an `ls` hit must never be silently treated as success"
         );
+    }
+
+    /// Fabricates an [`ExitStatus`] for [`broker_launch_from_child_exit`]'s own
+    /// tests without spawning a real process — `code == 0` is success on both
+    /// platforms' encodings, matching how `Child::try_wait` would report a
+    /// real `powershell.exe` exit.
+    #[cfg(unix)]
+    fn fake_exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw((code & 0xff) << 8)
+    }
+
+    #[cfg(windows)]
+    fn fake_exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
+
+    #[test]
+    fn broker_launch_from_child_exit_a_nonzero_outer_exit_is_an_infra_failure() {
+        // POLICY v2 item 5: the OUTER `powershell -File` process itself
+        // failing (a CIM error, a WMI/RPC failure, ...) must fall back to a
+        // direct attempt — never be treated as a completed brokered run, even
+        // though this stdout looks exactly like a real success report.
+        let stdout =
+            "CIM_RETURN:0\nCIM_PID:1234\nEC_FOUND:True\nEC:0\nOUT_BEGIN\nrestored\nOUT_END\n";
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let err = broker_launch_from_child_exit(fake_exit_status(1), stdout, &argv, |_| {
+            panic!("an infrastructure failure must not consult ls")
+        })
+        .expect_err(
+            "a nonzero outer exit must surface as an io::Error, not a classified RestoreLaunch",
+        );
+        assert!(err.to_string().contains("outer"), "{err}");
+    }
+
+    #[test]
+    fn broker_launch_from_child_exit_a_success_exit_with_no_cim_diagnostics_is_also_an_infra_failure()
+     {
+        // Defensive per POLICY v2 item 5: Invoke-CimMethod can throw before
+        // the script ever reaches its own `Write-Output "CIM_RETURN:..."`
+        // line, yet PowerShell can still exit 0 — this must not be misread as
+        // "the script ran fine, the restore just hasn't finished yet" (which
+        // would otherwise resolve to a silent `Ok(TimedOut)` per
+        // `classify_broker_report`'s missing-ecFile fallback, defeating the
+        // fallback-to-direct guarantee).
+        let stdout = "";
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let err = broker_launch_from_child_exit(fake_exit_status(0), stdout, &argv, |_| {
+            panic!("an infrastructure failure must not consult ls")
+        })
+        .expect_err("a success exit with no CIM diagnostics must still fall back to direct");
+        assert!(err.to_string().contains("CIM"), "{err}");
+    }
+
+    #[test]
+    fn broker_launch_from_child_exit_a_confirmed_run_is_classified_like_a_direct_success() {
+        let stdout =
+            "CIM_RETURN:0\nCIM_PID:1234\nEC_FOUND:True\nEC:0\nOUT_BEGIN\nrestored\nOUT_END\n";
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let launch = broker_launch_from_child_exit(fake_exit_status(0), stdout, &argv, |_| {
+            panic!("must not consult ls once the CIM diagnostics confirm the script ran")
+        })
+        .expect("a success exit with real CIM diagnostics must be classified, not errored");
+        match launch {
+            RestoreLaunch::Exited {
+                success,
+                code,
+                output,
+            } => {
+                assert!(success);
+                assert_eq!(code, Some(0));
+                assert_eq!(output, "restored");
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broker_launch_from_child_exit_a_confirmed_run_can_still_classify_a_failed_restore() {
+        let stdout = "CIM_RETURN:0\nCIM_PID:1234\nEC_FOUND:True\nEC:1\nOUT_BEGIN\nerror: io \
+                       error: Access is denied. (os error 5)\nOUT_END\n";
+        let argv = vec![
+            "restore".to_string(),
+            "--name".to_string(),
+            "rz-1".to_string(),
+        ];
+        let launch = broker_launch_from_child_exit(fake_exit_status(0), stdout, &argv, |_| {
+            panic!("must not consult ls once the CIM diagnostics confirm the script ran")
+        })
+        .expect("a success exit with real CIM diagnostics must be classified, not errored");
+        match launch {
+            RestoreLaunch::Exited {
+                success, output, ..
+            } => {
+                assert!(!success);
+                assert!(is_restore_access_denied(&output), "{output}");
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
     }
 
     #[test]
