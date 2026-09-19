@@ -31,8 +31,8 @@ use std::net::UdpSocket;
 use std::sync::Once;
 use std::time::Duration;
 
+use rightsize::Container;
 use rightsize::backend::BackendProvider;
-use rightsize::{Container, Wait};
 use rightsize_msb::MsbBackendProvider;
 
 static REGISTER: Once = Once::new();
@@ -101,20 +101,18 @@ async fn host_reaches_a_udp_exposed_guest_port_via_the_mapped_port() {
     let payload = format!("hello-udp-{}", payload_nonce());
     let guest_cmd = format!("nc -u -l -p {guest_port} > /srv/got.txt");
 
+    // A udp-only container is vacuously ready under the default wait (see
+    // `Container::with_exposed_udp_ports`'s own doc), and that is exactly what
+    // this test wants: the guest's `nc -u -l` listener produces NO stdout, so
+    // any log-message wait (`times >= 1`) can only time out against a
+    // permanently empty stream — CI proved it, 120s against zero log lines.
+    // Readiness is instead proven the way UDP itself demands: the bounded
+    // resend loop below keeps sending until the guest observably received a
+    // datagram, which also absorbs the listener-still-booting window and
+    // ordinary datagram loss. The Kotlin twin's green CI runs use this shape.
     let container = Container::new("alpine:3.19")
         .with_exposed_udp_ports(&[guest_port])
-        .with_command(&["sh", "-c", &guest_cmd])
-        // A udp-only container is vacuously ready under the default wait (see
-        // `Container::with_exposed_udp_ports`'s own doc) — an explicit
-        // log-message wait is this test's own readiness signal instead, exactly
-        // as that doc recommends for a real UDP-only service. `times = 0` would
-        // be a no-op (ready immediately, before the guest has produced any
-        // output at all — see `wait.rs`'s own doc comment and
-        // `for_log_message_times_zero_succeeds_immediately` test), so this uses
-        // `times = 1` to genuinely block until the guest agent has emitted its
-        // first line of boot chatter (".*" matches any line) before the host
-        // starts sending datagrams.
-        .waiting_for(Wait::for_log_message(".*", 1));
+        .with_command(&["sh", "-c", &guest_cmd]);
     let guard = container.start().await.expect("container must start");
 
     let host_port = guard
