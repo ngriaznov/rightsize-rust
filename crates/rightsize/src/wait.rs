@@ -34,6 +34,13 @@ pub trait WaitTarget: Send + Sync {
     /// The host port the given guest port is published on.
     fn mapped_port(&self, guest_port: u16) -> u16;
     /// Every guest port the container declared with `with_exposed_ports`.
+    /// **TCP only, by construction** — a guest port declared with
+    /// `with_exposed_udp_ports` instead is never returned here, so it stays
+    /// invisible to every built-in wait strategy (UDP is connectionless; "the
+    /// listener accepted a connection" has no UDP equivalent). A container that
+    /// exposes ONLY udp ports is therefore vacuously ready under
+    /// [`Wait::for_listening_port`] — see that builder's own doc for the
+    /// consequence and the recommended `Wait::for_log_message` alternative.
     fn exposed_guest_ports(&self) -> Vec<u16>;
     /// The container's logs so far, for readiness probes and timeout diagnostics.
     async fn current_logs(&self) -> String;

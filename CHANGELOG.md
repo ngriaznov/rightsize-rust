@@ -7,7 +7,42 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **UDP port exposure (Phase 1).** `Container::with_exposed_udp_ports(&[..])` declares
+  guest ports to publish over UDP, backed by a field entirely separate from
+  `with_exposed_ports`' TCP one; `ContainerGuard::get_mapped_udp_port(guest_port)`
+  reads the mapped host port back from an equally separate store. A container may
+  expose the same numeric guest port on both protocols at once (DNS's port 53 is
+  the canonical example) with no collision — `PortBinding` gains a `Protocol`
+  (`Tcp`/`Udp`, defaulting to `Tcp`) tag, so `ContainerSpec::ports` stays the ONE
+  list every backend reads, each entry carrying its own transport. Host UDP ports
+  are allocated by binding a `UdpSocket` (TCP and UDP have independent OS port
+  tables, so the existing `TcpListener` probe proves nothing about UDP
+  availability). Docker emits native `<guest>/udp` `ExposedPorts`/`PortBindings`
+  keys; microsandbox appends a `/udp` suffix to its `-p HOST:GUEST` published-port
+  flag, in both the ordinary boot and the checkpoint-restore path.
+  `Container::from_checkpoint` and the named-checkpoint registry both carry UDP
+  exposure through a restore, split by protocol; a checkpoint-registry entry
+  written before this change (no protocol/UDP field at all) still reads back as
+  TCP-only. `crate::reuse`'s identity hash now incorporates declared UDP ports too
+  (a tcp-exposed and a udp-exposed spec never share a reuse identity), and its
+  registry entry gains an additive `udpPorts` map alongside the existing `ports`
+  one. **UDP exposure is invisible to every built-in wait strategy by
+  construction** — `WaitTarget::exposed_guest_ports()` only ever returns TCP
+  ports — so a container exposing only UDP ports is vacuously ready under the
+  default `Wait::for_listening_port`; use an explicit `Wait::for_log_message(...)`
+  strategy for a UDP-only service instead. **Unsupported on microsandbox network
+  links**: msb has no guest-to-guest networking at all (its emulated links are
+  TCP-only exec-tunnels), so joining an msb `Network` with a UDP-exposed member
+  now fails `start()` fast with a typed, actionable error naming the docker
+  backend (native UDP between network members) or `get_mapped_udp_port` (the
+  msb-compatible host-published-port pattern) as remedies — docker's native
+  networks are unaffected and carry UDP between members with no per-port
+  declaration at all. See [UDP ports](./docs/core-concepts/containers-and-guards.md#udp-ports)
+  for the full story. Every existing public signature is unchanged and every
+  existing producer of a `PortBinding`/`NetworkLink` still yields TCP, explicitly
+  or by `Protocol::default()`.
 
 ## [0.7.10] - 2026-09-18
 

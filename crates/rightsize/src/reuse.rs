@@ -77,6 +77,7 @@ pub(crate) fn compute_identity(
     env: &[(String, String)],
     command: &Option<Vec<String>>,
     exposed_ports: &[u16],
+    exposed_udp_ports: &[u16],
     memory_limit_mb: Option<u64>,
     disk_limit_mb: Option<u64>,
     tmpfs_root_mb: Option<u64>,
@@ -88,6 +89,9 @@ pub(crate) fn compute_identity(
 
     let mut ports_sorted = exposed_ports.to_vec();
     ports_sorted.sort_unstable();
+
+    let mut udp_ports_sorted = exposed_udp_ports.to_vec();
+    udp_ports_sorted.sort_unstable();
 
     let mut copies = Vec::with_capacity(mounts.len());
     for mount in mounts {
@@ -106,6 +110,7 @@ pub(crate) fn compute_identity(
         tmpfs_root_mb,
         network_disabled,
         &copies,
+        &udp_ports_sorted,
     );
     let hash_hex = hex_sha256(canonical.as_bytes());
     let name = format!("rz-reuse-{}", &hash_hex[..12]);
@@ -132,6 +137,7 @@ fn canonical_json(
     tmpfs_root_mb: Option<u64>,
     network_disabled: bool,
     copies_sorted: &[(String, String)],
+    udp_ports_sorted: &[u16],
 ) -> String {
     let mut out = String::new();
     out.push_str("{\"image\":");
@@ -200,6 +206,23 @@ fn canonical_json(
     if network_disabled {
         out.push_str(",\"networkDisabled\":true");
     }
+    // Same "omitted entirely at default" treatment as the three fields just
+    // above — a spec that never calls `with_exposed_udp_ports` (every spec built
+    // before UDP exposure existed, and the overwhelming majority since) renders
+    // — and hashes — byte-for-byte as it did before this parameter existed,
+    // keeping the pinned cross-language vector pinned. A non-empty list still
+    // changes the hash, satisfying the "a tcp-exposed and a udp-exposed spec
+    // must never collide" requirement (see `crate::model::Protocol`'s doc).
+    if !udp_ports_sorted.is_empty() {
+        out.push_str(",\"exposedUdpPorts\":[");
+        for (i, p) in udp_ports_sorted.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&p.to_string());
+        }
+        out.push(']');
+    }
     out.push('}');
     out
 }
@@ -238,6 +261,19 @@ pub(crate) struct RegistryEntry {
     /// The backend's registered name (e.g. `"microsandbox"`, `"docker"`) that
     /// created it.
     pub backend: String,
+    /// UDP counterpart to `ports` — guest port (as a string) -> host UDP port,
+    /// for whatever this identity's spec declared via `with_exposed_udp_ports`.
+    /// ADDITIVE: `#[serde(default)]` so a registry entry written before UDP
+    /// exposure existed still parses (as empty — the correct reading: that
+    /// identity's spec never had any); `skip_serializing_if` keeps a tcp-only
+    /// entry (the overwhelming common case) byte-identical to what this shape
+    /// always wrote.
+    #[serde(
+        rename = "udpPorts",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub udp_ports: BTreeMap<String, u16>,
 }
 
 /// `<cacheDir>/reuse/<hash>.json` for one reuse identity.
@@ -405,6 +441,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -439,6 +476,7 @@ mod tests {
             None,
             false,
             &[],
+            &[],
         );
         assert_eq!(
             json,
@@ -458,6 +496,7 @@ mod tests {
             Some(512),
             true,
             &[],
+            &[],
         );
         assert_eq!(
             json,
@@ -475,6 +514,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -490,6 +530,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -514,6 +555,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -535,6 +577,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             Some(1024),
             None,
@@ -556,6 +599,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             None,
             Some(256),
@@ -577,6 +621,7 @@ mod tests {
             ],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -585,6 +630,63 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a.hash_hex, b.hash_hex);
+    }
+
+    #[test]
+    fn a_udp_exposed_port_changes_the_hash_and_never_collides_with_a_tcp_only_spec() {
+        // Spec item 1: "reuse-hash/spec-equality consumers must incorporate the
+        // protocol so a tcp-exposed and udp-exposed spec never collide" — a spec
+        // whose ONLY difference from the pinned vector is an added UDP exposure
+        // must hash differently from it.
+        let tcp_only = pinned_vector_identity();
+        let with_udp = compute_identity(
+            "redis:7-alpine",
+            &[
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+            &None,
+            &[6379],
+            &[53],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(tcp_only.hash_hex, with_udp.hash_hex);
+    }
+
+    #[test]
+    fn udp_port_order_at_the_call_site_does_not_affect_the_hash() {
+        let a = compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[],
+            &[53, 5353],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        let b = compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[],
+            &[5353, 53],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(a.hash_hex, b.hash_hex, "udp port order must not matter");
     }
 
     #[test]
@@ -607,6 +709,7 @@ mod tests {
             &[],
             &None,
             &[],
+            &[],
             None,
             None,
             None,
@@ -620,6 +723,7 @@ mod tests {
             "redis:7-alpine",
             &[],
             &None,
+            &[],
             &[],
             None,
             None,
@@ -640,6 +744,7 @@ mod tests {
             "redis:7-alpine",
             &[],
             &None,
+            &[],
             &[],
             None,
             None,
@@ -675,6 +780,7 @@ mod tests {
             ports: BTreeMap::from([("6379".to_string(), 32768)]),
             created_iso: "2025-01-01T00:00:00Z".to_string(),
             backend: "docker".to_string(),
+            udp_ports: BTreeMap::new(),
         }
     }
 
@@ -751,6 +857,45 @@ mod tests {
         let raw = std::fs::read_to_string(cache.join("reuse").join("deadbeef.json")).unwrap();
         assert!(raw.contains("\"createdIso\""), "{raw}");
         assert!(!raw.contains("created_iso"), "{raw}");
+    }
+
+    #[test]
+    fn a_registry_entry_written_before_udp_ports_existed_still_parses_as_tcp_only() {
+        // Backward compat (spec item 1): an entry written before UDP exposure
+        // existed has no `udpPorts` key at all — `#[serde(default)]` must still
+        // parse it as an empty map, never fail the whole entry.
+        let cache = temp_cache_dir("no-udp-ports-field");
+        std::fs::create_dir_all(cache.join("reuse")).unwrap();
+        std::fs::write(
+            cache.join("reuse").join("deadbeef.json"),
+            br#"{
+                "name": "rz-reuse-799aad5a3338",
+                "image": "redis:7-alpine",
+                "ports": {"6379": 32768},
+                "createdIso": "2025-01-01T00:00:00Z",
+                "backend": "docker"
+            }"#,
+        )
+        .unwrap();
+        let registry = Registry::new(&cache, "deadbeef");
+        let entry = registry
+            .read()
+            .expect("an entry missing only the additive field must still parse");
+        assert!(entry.udp_ports.is_empty());
+    }
+
+    #[test]
+    fn udp_ports_round_trips_and_is_omitted_from_json_when_empty() {
+        let cache = temp_cache_dir("udp-ports-round-trip");
+        let registry = Registry::new(&cache, "deadbeef");
+        let mut with_udp = sample_entry();
+        with_udp.udp_ports = BTreeMap::from([("53".to_string(), 40000)]);
+        registry.write_atomic(&with_udp).unwrap();
+        assert_eq!(registry.read(), Some(with_udp));
+
+        registry.write_atomic(&sample_entry()).unwrap();
+        let raw = std::fs::read_to_string(cache.join("reuse").join("deadbeef.json")).unwrap();
+        assert!(!raw.contains("udpPorts"), "{raw}");
     }
 
     #[test]

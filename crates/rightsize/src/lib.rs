@@ -47,7 +47,7 @@ pub use diagnostics::{DiagnosticsGuard, diagnostics};
 pub use error::{Result, RightsizeError};
 pub use futures::BoxFuture;
 pub use image_name::ImageName;
-pub use model::{ContainerSpec, ExecResult, FileMount, PortBinding};
+pub use model::{ContainerSpec, ExecResult, FileMount, PortBinding, Protocol};
 pub use mountable_file::MountableFile;
 pub use network::Network;
 pub use run_id::RunId;

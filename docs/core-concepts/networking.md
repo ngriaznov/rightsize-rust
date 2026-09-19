@@ -67,6 +67,16 @@ This is real emulation, not a shortcut, and it has real limits — see below.
   that stripped busybox) fails `start()` fast, with an error naming the missing
   binary and suggesting `RIGHTSIZE_BACKEND=docker` as the workaround — verified by
   this crate's own integration suite using `mongo:8.0` as the no-`nc` counter-example.
+- **UDP links are unsupported (Phase 1).** msb has no guest-to-guest networking at
+  all — the tunnel above is a TCP relay over `exec --stream`, with no UDP
+  equivalent. Joining a network where any member is reachable only via
+  `.with_exposed_udp_ports(...)` fails `start()` fast, the same shape as the
+  missing-`nc` case above, naming the remedy: the docker backend (its native
+  networks carry UDP between members with no per-port declaration), or publish the
+  port and read it back with `guard.get_mapped_udp_port(...)` — reaching it from
+  the host, not from a sibling guest, is the msb-compatible pattern. See
+  [Containers & Guards](./containers-and-guards.md#udp-ports) for the full UDP
+  story.
 - **A target that never propagates TCP close can't be detected by naive EOF.** The
   msb port-publish proxy doesn't propagate the target socket's close to the tunnel,
   so end-of-exchange is inferred from an idle window *after* the first byte arrives

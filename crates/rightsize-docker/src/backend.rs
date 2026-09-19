@@ -254,10 +254,20 @@ impl DockerBackend {
 fn build_create_body(spec: &ContainerSpec) -> CreateContainerBody {
     let env = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
+    // `<guest>/<protocol>` — Docker's native ExposedPorts/PortBindings key shape,
+    // which already supports "tcp"/"udp" (and "sctp") per key; every binding
+    // built before UDP exposure existed carries `Protocol::Tcp` (its default),
+    // so this produces the exact same `<guest>/tcp` keys as before for a
+    // tcp-only spec.
     let exposed_ports = spec
         .ports
         .iter()
-        .map(|p| (format!("{}/tcp", p.guest_port), EmptyObject {}))
+        .map(|p| {
+            (
+                format!("{}/{}", p.guest_port, p.protocol.as_str()),
+                EmptyObject {},
+            )
+        })
         .collect();
 
     let port_bindings = spec
@@ -265,7 +275,7 @@ fn build_create_body(spec: &ContainerSpec) -> CreateContainerBody {
         .iter()
         .map(|p| {
             (
-                format!("{}/tcp", p.guest_port),
+                format!("{}/{}", p.guest_port, p.protocol.as_str()),
                 vec![JsonPortBinding {
                     host_ip: "127.0.0.1".to_string(),
                     host_port: p.host_port.to_string(),
@@ -1415,11 +1425,89 @@ mod tests {
         spec.ports.push(rightsize::model::PortBinding {
             host_port: 32768,
             guest_port: 6379,
+            protocol: rightsize::model::Protocol::Tcp,
         });
         let body = serialize(&spec);
         assert!(body.contains("\"HostIp\":\"127.0.0.1\""));
         assert!(body.contains("\"HostPort\":\"32768\""));
         assert!(body.contains("\"6379/tcp\""));
+    }
+
+    // -- UDP payload capture (spec item 9): "<guest>/udp" keys present, tcp
+    // keys byte-unchanged ------------------------------------------------------
+
+    #[test]
+    fn build_create_body_emits_guest_slash_udp_keys_for_a_udp_binding() {
+        let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        spec.ports.push(rightsize::model::PortBinding {
+            host_port: 40000,
+            guest_port: 53,
+            protocol: rightsize::model::Protocol::Udp,
+        });
+        let body = serialize(&spec);
+        assert!(
+            body.contains("\"53/udp\":{}"),
+            "ExposedPorts must carry a 53/udp key: {body}"
+        );
+        assert!(
+            body.contains("\"53/udp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"40000\"}]"),
+            "PortBindings must carry a 53/udp key with the loopback host binding: {body}"
+        );
+        assert!(
+            !body.contains("\"53/tcp\""),
+            "a udp-only port must never also emit a tcp key: {body}"
+        );
+    }
+
+    #[test]
+    fn build_create_body_carries_both_protocols_for_the_same_guest_port_without_collision() {
+        // DNS on port 53, exposed on both protocols at once.
+        let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        spec.ports.push(rightsize::model::PortBinding {
+            host_port: 30000,
+            guest_port: 53,
+            protocol: rightsize::model::Protocol::Tcp,
+        });
+        spec.ports.push(rightsize::model::PortBinding {
+            host_port: 40000,
+            guest_port: 53,
+            protocol: rightsize::model::Protocol::Udp,
+        });
+        let body = serialize(&spec);
+        assert!(body.contains("\"53/tcp\":{}"), "{body}");
+        assert!(body.contains("\"53/udp\":{}"), "{body}");
+        assert!(
+            body.contains("\"53/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"30000\"}]"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"53/udp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"40000\"}]"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn build_create_body_tcp_only_payload_is_byte_identical_to_before_udp_existed() {
+        // A tcp-only spec's own ExposedPorts/PortBindings shape must not change at
+        // all — no stray key, no reordering — now that a per-binding protocol tag
+        // exists.
+        let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        spec.ports.push(rightsize::model::PortBinding {
+            host_port: 32768,
+            guest_port: 6379,
+            protocol: rightsize::model::Protocol::Tcp,
+        });
+        let body = serialize(&spec);
+        assert!(
+            body.contains("\"ExposedPorts\":{\"6379/tcp\":{}}"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "\"PortBindings\":{\"6379/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"32768\"}]}"
+            ),
+            "{body}"
+        );
     }
 
     #[test]

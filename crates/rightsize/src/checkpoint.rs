@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_dir::unique_tmp_suffix;
 use crate::error::{Result, RightsizeError};
-use crate::model::ContainerSpec;
+use crate::model::{ContainerSpec, Protocol};
 
 /// The outcome of [`crate::ContainerGuard::checkpoint`]: the backend-native ref it
 /// was stored under, which backend created it, and the source container's full spec,
@@ -119,6 +119,22 @@ pub(crate) struct NamedRegistrySpec {
     pub exposed_ports: Vec<u16>,
     #[serde(rename = "memoryLimitMb")]
     pub memory_limit_mb: Option<u64>,
+    /// ADDITIVE, internal field, same precedent as `captured_cmdline` below —
+    /// UDP-exposed guest ports (see `ContainerSpec::ports`'s own [`Protocol`] tag),
+    /// reduced to the guest side only, exactly like `exposed_ports` above.
+    /// `#[serde(default)]` so a registry entry written before UDP exposure existed
+    /// — every entry on disk before this field existed, or one written by a
+    /// language port that hasn't added it yet — still parses cleanly as "no UDP
+    /// ports" (`Vec::new()`, the correct reading: an old entry's container never
+    /// had any); `skip_serializing_if` keeps an entry with no UDP-exposed ports
+    /// (the overwhelming common case) byte-identical to what this shape always
+    /// wrote, rather than growing a stray `"exposedUdpPorts":[]`.
+    #[serde(
+        rename = "exposedUdpPorts",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub exposed_udp_ports: Vec<u16>,
     /// ADDITIVE, internal field — not part of the pinned cross-language contract
     /// the other fields on this type are (see the module doc). Carries the
     /// workload cmdline a microsandbox checkpoint captured from the guest when
@@ -142,12 +158,26 @@ impl NamedRegistrySpec {
     /// Reduces a full `ContainerSpec` down to the fields this shape persists —
     /// the same reduction `ContainerGuard::checkpoint_named` and
     /// `Checkpoint::export_to` both need, factored out here so it's written once.
+    /// `spec.ports`' single list is split by [`Protocol`] here: TCP guest ports
+    /// into `exposed_ports`, UDP ones into `exposed_udp_ports` — each reduced to
+    /// the guest side only, exactly as this shape has always persisted ports.
     pub(crate) fn from_container_spec(spec: &ContainerSpec) -> Self {
         NamedRegistrySpec {
             env: spec.env.iter().cloned().collect(),
             command: spec.command.clone(),
-            exposed_ports: spec.ports.iter().map(|p| p.guest_port).collect(),
+            exposed_ports: spec
+                .ports
+                .iter()
+                .filter(|p| p.protocol == Protocol::Tcp)
+                .map(|p| p.guest_port)
+                .collect(),
             memory_limit_mb: spec.memory_limit_mb,
+            exposed_udp_ports: spec
+                .ports
+                .iter()
+                .filter(|p| p.protocol == Protocol::Udp)
+                .map(|p| p.guest_port)
+                .collect(),
             captured_cmdline: spec.checkpoint_captured_cmdline.clone(),
         }
     }
@@ -379,6 +409,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                exposed_udp_ports: Vec::new(),
                 captured_cmdline: None,
             },
         }
@@ -539,6 +570,78 @@ mod tests {
         registry.write_atomic(&sample_entry()).unwrap();
         let raw = fs::read_to_string(cache.join("checkpoints").join("seeded-db.json")).unwrap();
         assert!(!raw.contains("capturedCmdline"), "{raw}");
+    }
+
+    #[test]
+    fn a_registry_entry_written_before_exposed_udp_ports_existed_still_parses_as_tcp_only() {
+        // Backward compat (spec item 1): an entry written before UDP exposure
+        // existed (or by a language port that hasn't added the field yet) has no
+        // `exposedUdpPorts` key at all — `#[serde(default)]` must still parse it
+        // as an empty list, never fail the whole entry.
+        let cache = temp_cache_dir("no-exposed-udp-ports-field");
+        std::fs::create_dir_all(cache.join("checkpoints")).unwrap();
+        std::fs::write(
+            cache.join("checkpoints").join("seeded-db.json"),
+            br#"{
+                "name": "seeded-db",
+                "ref": "rz-ckpt-seeded-db",
+                "backend": "microsandbox",
+                "createdIso": "2025-01-01T00:00:00Z",
+                "spec": {
+                    "env": {"A": "1"},
+                    "command": null,
+                    "exposedPorts": [6379],
+                    "memoryLimitMb": 256
+                }
+            }"#,
+        )
+        .unwrap();
+        let registry = Registry::new(&cache, "seeded-db");
+        let entry = registry
+            .read()
+            .expect("an entry missing only the additive field must still parse");
+        assert_eq!(entry.spec.exposed_udp_ports, Vec::<u16>::new());
+    }
+
+    #[test]
+    fn exposed_udp_ports_round_trips_and_is_omitted_from_json_when_empty() {
+        let cache = temp_cache_dir("exposed-udp-ports-round-trip");
+        let registry = Registry::new(&cache, "seeded-db");
+        let mut with_udp = sample_entry();
+        with_udp.spec.exposed_udp_ports = vec![53, 5353];
+        registry.write_atomic(&with_udp).unwrap();
+        assert_eq!(registry.read(), Some(with_udp));
+
+        // The ordinary (tcp-only) case never populates this — the written JSON
+        // must not grow a stray `"exposedUdpPorts":[]`.
+        registry.write_atomic(&sample_entry()).unwrap();
+        let raw = fs::read_to_string(cache.join("checkpoints").join("seeded-db.json")).unwrap();
+        assert!(!raw.contains("exposedUdpPorts"), "{raw}");
+    }
+
+    #[test]
+    fn from_container_spec_splits_ports_by_protocol() {
+        let mut spec = ContainerSpec::new("rz-x-0", "redis:8.6-alpine", "deadbeef");
+        spec.ports = vec![
+            crate::model::PortBinding {
+                host_port: 32768,
+                guest_port: 6379,
+                protocol: Protocol::Tcp,
+            },
+            crate::model::PortBinding {
+                host_port: 32769,
+                guest_port: 53,
+                protocol: Protocol::Udp,
+            },
+            crate::model::PortBinding {
+                host_port: 32770,
+                guest_port: 53,
+                protocol: Protocol::Tcp,
+            },
+        ];
+        let reduced = NamedRegistrySpec::from_container_spec(&spec);
+        assert_eq!(reduced.exposed_ports, vec![6379, 53]);
+        assert_eq!(reduced.exposed_udp_ports, vec![53]);
     }
 
     #[test]

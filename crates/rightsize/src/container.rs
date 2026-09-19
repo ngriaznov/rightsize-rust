@@ -25,7 +25,7 @@ use crate::checkpoint::{self, Checkpoint};
 use crate::cleanup::{self, CleanupJob};
 use crate::error::{Result, RightsizeError};
 use crate::free_ports::FreePorts;
-use crate::model::{ContainerSpec, ExecResult, FileMount};
+use crate::model::{ContainerSpec, ExecResult, FileMount, PortBinding, Protocol};
 use crate::mountable_file::MountableFile;
 use crate::network::{Network, NetworkMember};
 use crate::run_id::RunId;
@@ -95,6 +95,12 @@ pub struct Container {
     image: String,
     env: Vec<(String, String)>,
     exposed_ports: Vec<u16>,
+    /// Guest ports to publish over UDP — a SEPARATE field from `exposed_ports`
+    /// (never merged), so UDP exposure stays invisible to the wait-facing
+    /// enumeration (`WaitTarget::exposed_guest_ports`, which reads `exposed_ports`
+    /// only) and a container may expose the same numeric port on both protocols
+    /// at once (e.g. DNS's port 53). See [`Self::with_exposed_udp_ports`].
+    exposed_udp_ports: Vec<u16>,
     command: Option<Vec<String>>,
     network: Option<Arc<Network>>,
     aliases: Vec<String>,
@@ -151,6 +157,7 @@ impl Container {
             image: image.to_string(),
             env: Vec::new(),
             exposed_ports: Vec::new(),
+            exposed_udp_ports: Vec::new(),
             command: None,
             network: None,
             aliases: Vec::new(),
@@ -222,7 +229,24 @@ impl Container {
         let mut c = Container::new(&cp.checkpoint_ref);
         c.env = cp.spec.env.clone();
         c.command = cp.spec.command.clone();
-        c.exposed_ports = cp.spec.ports.iter().map(|p| p.guest_port).collect();
+        // `cp.spec.ports`' single list is split by protocol here — the mirror
+        // image of `checkpoint::NamedRegistrySpec::from_container_spec`'s own
+        // split, and of `checkpoint_from_reduced`'s re-merge when a checkpoint is
+        // rediscovered from its registry entry (see that function's doc).
+        c.exposed_ports = cp
+            .spec
+            .ports
+            .iter()
+            .filter(|p| p.protocol == Protocol::Tcp)
+            .map(|p| p.guest_port)
+            .collect();
+        c.exposed_udp_ports = cp
+            .spec
+            .ports
+            .iter()
+            .filter(|p| p.protocol == Protocol::Udp)
+            .map(|p| p.guest_port)
+            .collect();
         c.memory_limit_mb = cp.spec.memory_limit_mb;
         c.checkpoint_ref = Some(cp.checkpoint_ref.clone());
         c.checkpoint_backend = Some(cp.backend.clone());
@@ -276,6 +300,40 @@ impl Container {
     /// Declares guest ports to publish; each gets a host port assigned before boot.
     pub fn with_exposed_ports(mut self, ports: &[u16]) -> Self {
         self.exposed_ports.extend_from_slice(ports);
+        self
+    }
+
+    /// Declares guest ports to publish over UDP; each gets a host UDP port
+    /// assigned before boot (via a UDP-socket probe — see `free_ports`'s own
+    /// UDP allocator — never the TCP allocator [`Self::with_exposed_ports`]
+    /// uses, since TCP and UDP have independent OS port tables). Read back with
+    /// [`ContainerGuard::get_mapped_udp_port`], the UDP-only counterpart to
+    /// [`ContainerGuard::get_mapped_port`].
+    ///
+    /// A guest port may be declared here AND via [`Self::with_exposed_ports`] at
+    /// once (e.g. DNS's port 53 on both protocols) — the two are tracked in
+    /// entirely separate stores, so neither collides with or shadows the other.
+    ///
+    /// **Invisible to the default wait strategy.** [`Wait::for_listening_port`]
+    /// (and every other built-in [`WaitStrategy`]) only ever probes
+    /// [`Self::with_exposed_ports`]'s TCP ports — UDP is connectionless, so
+    /// "the listener accepted a TCP connection" has no UDP equivalent, and this
+    /// crate does not guess at a datagram-based liveness probe on a caller's
+    /// behalf. A container that exposes ONLY UDP ports is therefore vacuously
+    /// ready under the default wait strategy (nothing to wait for). Callers of a
+    /// UDP-only service should supply an explicit
+    /// [`Self::waiting_for`]`(Wait::for_log_message(...))` strategy instead.
+    ///
+    /// **Unsupported for microsandbox network links.** A container reachable
+    /// only via a UDP-exposed port cannot be joined to an msb [`Network`] as a
+    /// link target — msb's emulated links are TCP-only exec-tunnels (see
+    /// [`crate::backend::SandboxBackend::install_network_links`]'s own doc) —
+    /// installing a link fails fast with a typed, actionable error. Publish the
+    /// port and read it back with [`ContainerGuard::get_mapped_udp_port`]
+    /// instead, or run on the docker backend, whose native networks carry UDP
+    /// between members with no per-port declaration at all.
+    pub fn with_exposed_udp_ports(mut self, ports: &[u16]) -> Self {
+        self.exposed_udp_ports.extend_from_slice(ports);
         self
     }
 
@@ -629,12 +687,13 @@ impl Container {
             }
         }
 
-        let (handle, mapped_ports) = create_started_container(
+        let (handle, mapped_ports, mapped_udp_ports) = create_started_container(
             &backend,
             &self.image,
             &self.env,
             &self.command,
             &self.exposed_ports,
+            &self.exposed_udp_ports,
             &self.mounts,
             self.network.as_deref(),
             &self.aliases,
@@ -667,9 +726,11 @@ impl Container {
             handle: Mutex::new(Some(handle)),
             backend: backend.clone(),
             mapped_ports: Mutex::new(mapped_ports),
+            mapped_udp_ports: Mutex::new(mapped_udp_ports),
             network: self.network.clone(),
             image: self.image.clone(),
             exposed_ports: self.exposed_ports.clone(),
+            exposed_udp_ports: self.exposed_udp_ports.clone(),
             name,
             ledger_name: Mutex::new(Box::leak(ledger_name.into_boxed_str())),
             keep_alive,
@@ -732,6 +793,7 @@ async fn create_started_container(
     env: &[(String, String)],
     command: &Option<Vec<String>>,
     exposed_ports: &[u16],
+    exposed_udp_ports: &[u16],
     mounts: &[FileMount],
     network: Option<&Network>,
     aliases: &[String],
@@ -743,12 +805,19 @@ async fn create_started_container(
     reaper_cache_dir_override: Option<&std::path::Path>,
     checkpoint_ref: Option<&str>,
     checkpoint_captured_cmdline: Option<&[String]>,
-) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
+) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
-    let mut quarantine = ConflictQuarantine(Vec::new());
+    let mut quarantine = ConflictQuarantine(Vec::new(), Vec::new());
 
     for _ in 0..PORT_BIND_ATTEMPTS {
         let mapped_ports = allocate_ports(exposed_ports)?;
+        let mapped_udp_ports = match allocate_ports_udp(exposed_udp_ports) {
+            Ok(p) => p,
+            Err(e) => {
+                release_ports(&mapped_ports);
+                return Err(e);
+            }
+        };
         // POLICY v3 (round 11): a `Container::from_checkpoint` spec
         // (`checkpoint_ref.is_some()`) mints a BATCH of candidate names from
         // this same generator, not just one — a backend whose ordinary
@@ -775,13 +844,7 @@ async fn create_started_container(
             image: image.to_string(),
             env: env.to_vec(),
             command: command.clone(),
-            ports: mapped_ports
-                .iter()
-                .map(|&(guest_port, host_port)| crate::model::PortBinding {
-                    host_port,
-                    guest_port,
-                })
-                .collect(),
+            ports: merge_port_bindings(&mapped_ports, &mapped_udp_ports),
             mounts: mounts.to_vec(),
             network_id: network.map(|n| n.id().to_string()),
             aliases: aliases.to_vec(),
@@ -797,8 +860,19 @@ async fn create_started_container(
         };
 
         if let Some(customizer) = spec_customizer {
-            let lookup: std::collections::HashMap<u16, u16> =
-                mapped_ports.iter().copied().collect();
+            // A customizer's `mapped_fn` looks up by guest port only — same
+            // contract as before UDP exposure existed. When a guest port is
+            // declared on BOTH protocols (e.g. DNS's 53), the TCP mapping wins
+            // this lookup, matching `with_exposed_ports`' own precedent as the
+            // "primary" exposure a customizer (Redpanda/Kafka's advertised-
+            // listener rewrite, etc.) is written against; a customizer that
+            // specifically needs the UDP-side host port reads `spec.ports`
+            // directly, which already carries both, correctly tagged.
+            let lookup: std::collections::HashMap<u16, u16> = mapped_udp_ports
+                .iter()
+                .copied()
+                .chain(mapped_ports.iter().copied())
+                .collect();
             let mapped_fn = move |guest: u16| -> u16 {
                 *lookup
                     .get(&guest)
@@ -862,6 +936,7 @@ async fn create_started_container(
                 // never even ran, so none of them can be a live sandbox — same
                 // rationale as `checkpoint_core`'s own error branch.
                 release_ports(&mapped_ports);
+                release_ports_udp(&mapped_udp_ports);
                 for candidate in &restore_candidates {
                     crate::reaper::after_stop(
                         candidate,
@@ -883,7 +958,7 @@ async fn create_started_container(
                 let handle = backend
                     .winning_start_handle(handle.as_ref())
                     .unwrap_or(handle);
-                return Ok((handle, mapped_ports));
+                return Ok((handle, mapped_ports, mapped_udp_ports));
             }
             Err(e) => {
                 let _ = backend.stop(handle.as_ref()).await;
@@ -901,10 +976,12 @@ async fn create_started_container(
                 if is_port_bind_conflict(&e) {
                     // Quarantined, not released: see `ConflictQuarantine`.
                     quarantine.0.extend(mapped_ports.iter().copied());
+                    quarantine.1.extend(mapped_udp_ports.iter().copied());
                     last_conflict = Some(e);
                     continue;
                 }
                 release_ports(&mapped_ports);
+                release_ports_udp(&mapped_udp_ports);
                 return Err(e);
             }
         }
@@ -1017,17 +1094,66 @@ fn release_ports(mapped_ports: &[(u16, u16)]) {
     }
 }
 
+/// UDP counterpart to [`allocate_ports`] — same shape, probing with
+/// `free_ports().allocate_udp()` (a bound `UdpSocket`, not a `TcpListener`; see
+/// `free_ports`'s own module doc for why the two are tracked independently)
+/// instead of the TCP allocator, which [`allocate_ports`] keeps using unchanged.
+fn allocate_ports_udp(exposed_udp_ports: &[u16]) -> Result<Vec<(u16, u16)>> {
+    let mut mapped = Vec::with_capacity(exposed_udp_ports.len());
+    for &guest_port in exposed_udp_ports {
+        match free_ports().allocate_udp() {
+            Ok(host_port) => mapped.push((guest_port, host_port)),
+            Err(e) => {
+                release_ports_udp(&mapped);
+                return Err(e);
+            }
+        }
+    }
+    Ok(mapped)
+}
+
+/// UDP counterpart to [`release_ports`].
+fn release_ports_udp(mapped_ports: &[(u16, u16)]) {
+    for &(_, host_port) in mapped_ports {
+        free_ports().release_udp(host_port);
+    }
+}
+
+/// Merges a TCP `(guest, host)` mapping and a UDP `(guest, host)` mapping into the
+/// single [`PortBinding`] list [`ContainerSpec::ports`] carries — the ONE spec
+/// ports list every backend reads, each entry tagged with its own [`Protocol`]
+/// (see that type's own doc for why this is a single tagged list rather than a
+/// parallel one). TCP entries first, purely so a spec built before UDP exposure
+/// existed (`exposed_udp_ports` always empty) produces byte-identical `ports`
+/// ordering to before this function existed.
+fn merge_port_bindings(tcp: &[(u16, u16)], udp: &[(u16, u16)]) -> Vec<PortBinding> {
+    tcp.iter()
+        .map(|&(guest_port, host_port)| PortBinding {
+            host_port,
+            guest_port,
+            protocol: Protocol::Tcp,
+        })
+        .chain(udp.iter().map(|&(guest_port, host_port)| PortBinding {
+            host_port,
+            guest_port,
+            protocol: Protocol::Udp,
+        }))
+        .collect()
+}
+
 /// Holds host ports that hit a bind conflict during a create/start retry loop and
 /// releases them back to the allocator only when the loop exits — any exit, success or
 /// error, via `Drop`. Releasing a conflicted port immediately would let the next
 /// attempt legally re-pick the very port that just conflicted (the OS frequently
 /// reissues a just-freed ephemeral port), wasting an attempt on a proven-contended
-/// port.
-struct ConflictQuarantine(Vec<(u16, u16)>);
+/// port. `.0` holds TCP ports, `.1` UDP — released via [`release_ports`]/
+/// [`release_ports_udp`] respectively.
+struct ConflictQuarantine(Vec<(u16, u16)>, Vec<(u16, u16)>);
 
 impl Drop for ConflictQuarantine {
     fn drop(&mut self) {
         release_ports(&self.0);
+        release_ports_udp(&self.1);
     }
 }
 
@@ -1159,6 +1285,7 @@ async fn start_reuse(
         &env,
         &container.command,
         &container.exposed_ports,
+        &container.exposed_udp_ports,
         container.memory_limit_mb,
         container.disk_limit_mb,
         container.tmpfs_root_mb,
@@ -1276,19 +1403,18 @@ async fn try_adopt(
         let host_port = *entry.ports.get(&guest_port.to_string())?;
         mapped_ports.push((guest_port, host_port));
     }
+    let mut mapped_udp_ports = Vec::with_capacity(container.exposed_udp_ports.len());
+    for &guest_port in &container.exposed_udp_ports {
+        let host_port = *entry.udp_ports.get(&guest_port.to_string())?;
+        mapped_udp_ports.push((guest_port, host_port));
+    }
 
     let adopted_spec = ContainerSpec {
         name: identity.name.clone(),
         image: container.image.clone(),
         env: dedup_env_last_wins(container.env.clone()),
         command: container.command.clone(),
-        ports: mapped_ports
-            .iter()
-            .map(|&(guest_port, host_port)| crate::model::PortBinding {
-                host_port,
-                guest_port,
-            })
-            .collect(),
+        ports: merge_port_bindings(&mapped_ports, &mapped_udp_ports),
         mounts: container.mounts.clone(),
         network_id: None,
         aliases: container.aliases.clone(),
@@ -1338,9 +1464,11 @@ async fn try_adopt(
         handle: Mutex::new(Some(handle)),
         backend: backend.clone(),
         mapped_ports: Mutex::new(mapped_ports),
+        mapped_udp_ports: Mutex::new(mapped_udp_ports),
         network: None,
         image: container.image.clone(),
         exposed_ports: container.exposed_ports.clone(),
+        exposed_udp_ports: container.exposed_udp_ports.clone(),
         name: identity.name.clone(),
         ledger_name: Mutex::new(Box::leak(identity.name.clone().into_boxed_str())),
         keep_alive: true,
@@ -1376,25 +1504,26 @@ async fn create_and_start_reuse_sandbox(
     container: &Container,
     identity: &crate::reuse::Identity,
     env: &[(String, String)],
-) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>)> {
+) -> Result<(Box<dyn SandboxHandle>, Vec<(u16, u16)>, Vec<(u16, u16)>)> {
     let mut last_conflict: Option<RightsizeError> = None;
-    let mut quarantine = ConflictQuarantine(Vec::new());
+    let mut quarantine = ConflictQuarantine(Vec::new(), Vec::new());
 
     for _ in 0..PORT_BIND_ATTEMPTS {
         let mapped_ports = allocate_ports(&container.exposed_ports)?;
+        let mapped_udp_ports = match allocate_ports_udp(&container.exposed_udp_ports) {
+            Ok(p) => p,
+            Err(e) => {
+                release_ports(&mapped_ports);
+                return Err(e);
+            }
+        };
 
         let mut spec = ContainerSpec {
             name: identity.name.clone(),
             image: container.image.clone(),
             env: env.to_vec(),
             command: container.command.clone(),
-            ports: mapped_ports
-                .iter()
-                .map(|&(guest_port, host_port)| crate::model::PortBinding {
-                    host_port,
-                    guest_port,
-                })
-                .collect(),
+            ports: merge_port_bindings(&mapped_ports, &mapped_udp_ports),
             mounts: container.mounts.clone(),
             network_id: None,
             aliases: container.aliases.clone(),
@@ -1411,8 +1540,13 @@ async fn create_and_start_reuse_sandbox(
             restore_name_candidates: None,
         };
         if let Some(customizer) = &container.spec_customizer {
-            let lookup: std::collections::HashMap<u16, u16> =
-                mapped_ports.iter().copied().collect();
+            // Same TCP-wins-on-collision precedent as `create_started_container`'s
+            // own customizer lookup — see that call site's comment.
+            let lookup: std::collections::HashMap<u16, u16> = mapped_udp_ports
+                .iter()
+                .copied()
+                .chain(mapped_ports.iter().copied())
+                .collect();
             let mapped_fn = move |guest: u16| -> u16 {
                 *lookup
                     .get(&guest)
@@ -1433,6 +1567,7 @@ async fn create_and_start_reuse_sandbox(
             spec.network_id.as_deref(),
         ) {
             release_ports(&mapped_ports);
+            release_ports_udp(&mapped_udp_ports);
             return Err(e);
         }
 
@@ -1440,21 +1575,24 @@ async fn create_and_start_reuse_sandbox(
             Ok(h) => h,
             Err(e) => {
                 release_ports(&mapped_ports);
+                release_ports_udp(&mapped_udp_ports);
                 return Err(e);
             }
         };
         match backend.start(handle.as_ref()).await {
-            Ok(()) => return Ok((handle, mapped_ports)),
+            Ok(()) => return Ok((handle, mapped_ports, mapped_udp_ports)),
             Err(e) => {
                 let _ = backend.stop(handle.as_ref()).await;
                 let _ = backend.remove(handle.as_ref()).await;
                 if is_port_bind_conflict(&e) {
                     // Quarantined, not released: see `ConflictQuarantine`.
                     quarantine.0.extend(mapped_ports.iter().copied());
+                    quarantine.1.extend(mapped_udp_ports.iter().copied());
                     last_conflict = Some(e);
                     continue;
                 }
                 release_ports(&mapped_ports);
+                release_ports_udp(&mapped_udp_ports);
                 return Err(e);
             }
         }
@@ -1485,7 +1623,7 @@ async fn create_fresh_reuse(
     env: &[(String, String)],
     registry: &crate::reuse::Registry,
 ) -> Result<ContainerGuard> {
-    let (handle, mapped_ports) =
+    let (handle, mapped_ports, mapped_udp_ports) =
         create_and_start_reuse_sandbox(backend, container, identity, env).await?;
 
     let raw = RawWaitTarget {
@@ -1501,6 +1639,7 @@ async fn create_fresh_reuse(
         let _ = backend.stop(handle.as_ref()).await;
         let _ = backend.remove(handle.as_ref()).await;
         release_ports(&mapped_ports);
+        release_ports_udp(&mapped_udp_ports);
         return Err(e);
     }
 
@@ -1517,6 +1656,10 @@ async fn create_fresh_reuse(
             .collect(),
         created_iso: crate::reuse::now_iso8601(),
         backend: backend.name().to_string(),
+        udp_ports: mapped_udp_ports
+            .iter()
+            .map(|&(guest_port, host_port)| (guest_port.to_string(), host_port))
+            .collect(),
     };
     let _ = registry.write_atomic(&entry);
 
@@ -1527,9 +1670,11 @@ async fn create_fresh_reuse(
         handle: Mutex::new(Some(handle)),
         backend: backend.clone(),
         mapped_ports: Mutex::new(mapped_ports),
+        mapped_udp_ports: Mutex::new(mapped_udp_ports),
         network: None,
         image: container.image.clone(),
         exposed_ports: container.exposed_ports.clone(),
+        exposed_udp_ports: container.exposed_udp_ports.clone(),
         name: identity.name.clone(),
         ledger_name: Mutex::new(Box::leak(identity.name.clone().into_boxed_str())),
         keep_alive: true,
@@ -1562,6 +1707,14 @@ async fn create_fresh_reuse(
             {
                 free_ports().release(host_port);
             }
+            for &(_, host_port) in guard
+                .mapped_udp_ports
+                .lock()
+                .expect("mapped_udp_ports mutex poisoned")
+                .iter()
+            {
+                free_ports().release_udp(host_port);
+            }
             return Err(e);
         }
     }
@@ -1584,9 +1737,15 @@ pub struct ContainerGuard {
     handle: Mutex<Option<Box<dyn SandboxHandle>>>,
     backend: Arc<dyn SandboxBackend>,
     mapped_ports: Mutex<Vec<(u16, u16)>>,
+    /// UDP counterpart to `mapped_ports` — a SEPARATE store (never merged with
+    /// the TCP one), read back by [`Self::get_mapped_udp_port`]. See
+    /// [`Container::with_exposed_udp_ports`]'s own doc for the full story.
+    mapped_udp_ports: Mutex<Vec<(u16, u16)>>,
     network: Option<Arc<Network>>,
     image: String,
     exposed_ports: Vec<u16>,
+    /// UDP counterpart to `exposed_ports` — see `mapped_udp_ports`'s own doc.
+    exposed_udp_ports: Vec<u16>,
     /// `SandboxHandle::id()` at creation time — the backend-native id (msb: the
     /// same as `ledger_name`; docker: the daemon-assigned container id). Used only
     /// for internal error text ([`Self::describe`]); the public [`Self::name`]
@@ -1673,12 +1832,22 @@ impl ContainerGuard {
     }
 
     fn as_network_member(&self) -> Arc<dyn NetworkMember> {
+        let tcp = self
+            .mapped_ports
+            .lock()
+            .expect("mapped_ports mutex poisoned")
+            .iter()
+            .map(|&(guest_port, host_port)| (guest_port, host_port, Protocol::Tcp))
+            .collect::<Vec<_>>();
+        let udp = self
+            .mapped_udp_ports
+            .lock()
+            .expect("mapped_udp_ports mutex poisoned")
+            .iter()
+            .map(|&(guest_port, host_port)| (guest_port, host_port, Protocol::Udp))
+            .collect::<Vec<_>>();
         Arc::new(GuardMemberSnapshot {
-            mapped_ports: self
-                .mapped_ports
-                .lock()
-                .expect("mapped_ports mutex poisoned")
-                .clone(),
+            mapped_ports: tcp.into_iter().chain(udp).collect(),
         })
     }
 
@@ -1740,6 +1909,40 @@ impl ContainerGuard {
                 "Port {guest_port} is not exposed on {} — call with_exposed_ports({guest_port}) \
                  before start(), or check exposed_ports for the port you actually declared",
                 self.describe()
+            )))
+        }
+    }
+
+    /// The host UDP port `guest_port` is published on — the UDP counterpart to
+    /// [`Self::get_mapped_port`], reading a SEPARATE store: a port declared via
+    /// [`Container::with_exposed_ports`] is never visible here, and vice versa,
+    /// even when the same numeric port was declared on both protocols.
+    ///
+    /// Distinguishes the same two failure causes as [`Self::get_mapped_port`]: if
+    /// this guard isn't running, the error says so; if it IS running but
+    /// `guest_port` was never declared via [`Container::with_exposed_udp_ports`],
+    /// the error says the port isn't exposed over UDP.
+    pub fn get_mapped_udp_port(&self, guest_port: u16) -> Result<u16> {
+        let mapped = self
+            .mapped_udp_ports
+            .lock()
+            .expect("mapped_udp_ports mutex poisoned");
+        if let Some(&(_, host_port)) = mapped.iter().find(|&&(g, _)| g == guest_port) {
+            return Ok(host_port);
+        }
+        if !self.is_running() {
+            Err(RightsizeError::Backend(format!(
+                "Cannot get mapped udp port {guest_port} on {}: the container is not running — \
+                 call start() first, or check that it did not stop/fail after start()",
+                self.describe()
+            )))
+        } else {
+            Err(RightsizeError::Backend(format!(
+                "UDP port {guest_port} is not exposed on {} — call \
+                 with_exposed_udp_ports({guest_port}) before start(), or check the \
+                 declared UDP ports ({:?}) for the port you actually meant",
+                self.describe(),
+                self.exposed_udp_ports,
             )))
         }
     }
@@ -2294,6 +2497,10 @@ impl ContainerGuard {
                 .lock()
                 .expect("mapped_ports mutex poisoned")
                 .clear();
+            self.mapped_udp_ports
+                .lock()
+                .expect("mapped_udp_ports mutex poisoned")
+                .clear();
             return;
         }
         let _ = self.backend.stop(handle.as_ref()).await;
@@ -2311,17 +2518,27 @@ impl ContainerGuard {
             free_ports().release(host_port);
         }
         mapped.clear();
+        let mut mapped_udp = self
+            .mapped_udp_ports
+            .lock()
+            .expect("mapped_udp_ports mutex poisoned");
+        for &(_, host_port) in mapped_udp.iter() {
+            free_ports().release_udp(host_port);
+        }
+        mapped_udp.clear();
     }
 }
 
 struct GuardMemberSnapshot {
-    mapped_ports: Vec<(u16, u16)>,
+    /// TCP and UDP mapped ports together, each tagged with its own [`Protocol`]
+    /// — see [`ContainerGuard::as_network_member`]'s own construction of this.
+    mapped_ports: Vec<(u16, u16, Protocol)>,
 }
 impl NetworkMember for GuardMemberSnapshot {
     fn is_running(&self) -> bool {
         true // only constructed for a guard that just successfully started.
     }
-    fn mapped_ports(&self) -> Vec<(u16, u16)> {
+    fn mapped_ports(&self) -> Vec<(u16, u16, Protocol)> {
         self.mapped_ports.clone()
     }
 }
@@ -2359,6 +2576,12 @@ impl Drop for ContainerGuard {
                 free_ports().release(host_port);
             }
             mapped.clear();
+        }
+        if let Ok(mut mapped_udp) = self.mapped_udp_ports.lock() {
+            for &(_, host_port) in mapped_udp.iter() {
+                free_ports().release_udp(host_port);
+            }
+            mapped_udp.clear();
         }
         // The Drop-path's own update to the reaping ledger — mirrors `stop_inner`'s
         // `crate::reaper::after_stop` call, but deferred to run on the cleanup thread,
@@ -2760,7 +2983,12 @@ async fn import_from_impl(
 /// `network_id`, `aliases`, `run_id`, `keep_alive`, or `spec.checkpoint_ref`. Host
 /// ports are unknowable from a persisted spec (only the guest side was ever saved)
 /// and unused by `from_checkpoint` either way (it re-derives fresh host ports at
-/// `start()` time), so they're placeholder `0`.
+/// `start()` time), so they're placeholder `0`. `spec.exposed_ports`/
+/// `spec.exposed_udp_ports` are re-merged here into the ONE `ports` list
+/// `ContainerSpec` carries, each tagged with its own [`Protocol`] — the mirror
+/// image of `checkpoint::NamedRegistrySpec::from_container_spec`'s own split, so
+/// `Container::from_checkpoint`'s own re-split (see that method's doc) recovers
+/// exactly the guest ports this reduced spec persisted, on the right protocol.
 fn checkpoint_from_reduced(
     display_name: &str,
     checkpoint_ref: String,
@@ -2770,10 +2998,20 @@ fn checkpoint_from_reduced(
     let ports = spec
         .exposed_ports
         .iter()
-        .map(|&guest_port| crate::model::PortBinding {
+        .map(|&guest_port| PortBinding {
             host_port: 0,
             guest_port,
+            protocol: Protocol::Tcp,
         })
+        .chain(
+            spec.exposed_udp_ports
+                .iter()
+                .map(|&guest_port| PortBinding {
+                    host_port: 0,
+                    guest_port,
+                    protocol: Protocol::Udp,
+                }),
+        )
         .collect();
     Checkpoint {
         checkpoint_ref: checkpoint_ref.clone(),
@@ -3503,6 +3741,113 @@ mod tests {
         guard.stop().await.unwrap();
     }
 
+    // -- UDP exposure (Phase 1): builder/spec plumbing, protocol separation,
+    // same-port-both-protocols, and wait exclusion ------------------------------
+
+    /// `with_exposed_udp_ports` plumbs a UDP-tagged `PortBinding` into the SAME
+    /// `spec.ports` list `with_exposed_ports` uses (spec item 1: no parallel udp
+    /// list on the spec), with its own mapped host port allocated independently
+    /// of the tcp one.
+    #[tokio::test]
+    async fn u1_udp_start_allocates_a_udp_port_and_tags_the_spec_binding() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend).with_exposed_udp_ports(&[9999]);
+        let guard = c.start().await.expect("start must succeed");
+
+        let spec = {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.created.len(), 1);
+            state.created[0].clone()
+        };
+        assert_eq!(spec.ports.len(), 1);
+        assert_eq!(spec.ports[0].guest_port, 9999);
+        assert_eq!(spec.ports[0].protocol, Protocol::Udp);
+        assert!(spec.ports[0].host_port > 0);
+        assert_eq!(
+            guard.get_mapped_udp_port(9999).unwrap(),
+            spec.ports[0].host_port
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    /// TCP and UDP exposure are tracked in entirely separate stores: a guest port
+    /// declared on one protocol is never resolvable through the other's accessor
+    /// — the structural guarantee `GuardWaitTarget`'s TCP-only enumeration relies
+    /// on to keep UDP invisible to the wait strategy (see
+    /// `Container::with_exposed_udp_ports`'s own doc).
+    #[tokio::test]
+    async fn tcp_and_udp_exposure_are_tracked_separately_never_visible_across_protocols() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_exposed_udp_ports(&[9999]);
+        let guard = c.start().await.expect("start must succeed");
+
+        assert!(guard.get_mapped_port(6379).is_ok());
+        assert!(guard.get_mapped_udp_port(9999).is_ok());
+
+        let tcp_lookup_of_udp_port = guard.get_mapped_port(9999).unwrap_err().to_string();
+        assert!(
+            tcp_lookup_of_udp_port.contains("not exposed"),
+            "{tcp_lookup_of_udp_port}"
+        );
+        let udp_lookup_of_tcp_port = guard.get_mapped_udp_port(6379).unwrap_err().to_string();
+        assert!(
+            udp_lookup_of_tcp_port.contains("not exposed"),
+            "{udp_lookup_of_tcp_port}"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    /// A container may expose the SAME guest port on both protocols at once (DNS's
+    /// port 53 is the canonical example) — the two mappings must never share a
+    /// bare-int key or collide: `spec.ports` carries both as distinct,
+    /// protocol-tagged entries, and both accessors resolve independently.
+    #[tokio::test]
+    async fn the_same_guest_port_on_both_protocols_never_collides() {
+        let backend = FakeBackend::new();
+        let c = container_on(&backend)
+            .with_exposed_ports(&[53])
+            .with_exposed_udp_ports(&[53]);
+        let guard = c.start().await.expect("start must succeed");
+
+        let spec = {
+            let state = backend.state.lock().unwrap();
+            state.created.last().unwrap().clone()
+        };
+        let port_53_entries: Vec<_> = spec.ports.iter().filter(|p| p.guest_port == 53).collect();
+        assert_eq!(port_53_entries.len(), 2, "{port_53_entries:?}");
+        assert!(port_53_entries.iter().any(|p| p.protocol == Protocol::Tcp));
+        assert!(port_53_entries.iter().any(|p| p.protocol == Protocol::Udp));
+
+        assert!(guard.get_mapped_port(53).is_ok());
+        assert!(guard.get_mapped_udp_port(53).is_ok());
+
+        guard.stop().await.unwrap();
+    }
+
+    /// Wait-exclusion, against the REAL default wait strategy (`Wait::for_listening_port`,
+    /// never `container_on`'s test-only `ReadyImmediately` override): a container
+    /// exposing ONLY udp ports is vacuously ready, because the tcp-facing
+    /// `exposed_guest_ports()` enumeration `GuardWaitTarget` feeds it is empty —
+    /// there is nothing to probe, exactly as `Container::with_exposed_udp_ports`'s
+    /// own doc documents.
+    #[tokio::test]
+    async fn a_udp_only_container_is_vacuously_ready_under_the_real_default_wait_strategy() {
+        let backend = FakeBackend::new();
+        let c = Container::new("redis:8.6-alpine")
+            .with_backend(backend.clone())
+            .with_exposed_udp_ports(&[9999]);
+        let guard = c
+            .start()
+            .await
+            .expect("a udp-only container must be vacuously ready under the default wait strategy");
+        assert!(guard.get_mapped_udp_port(9999).unwrap() > 0);
+        guard.stop().await.unwrap();
+    }
+
     // require_isolation: a non-isolated backend refuses to start, before any
     // create/network work.
     #[tokio::test]
@@ -4214,6 +4559,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                exposed_udp_ports: Vec::new(),
                 captured_cmdline: None,
             },
         }
@@ -4811,6 +5157,7 @@ mod tests {
                 command: Some(vec!["redis-server".to_string()]),
                 exposed_ports: vec![6379],
                 memory_limit_mb: Some(256),
+                exposed_udp_ports: Vec::new(),
                 captured_cmdline: None,
             },
         }
@@ -5029,6 +5376,7 @@ mod tests {
         spec.ports = vec![crate::model::PortBinding {
             host_port: 0,
             guest_port: 6379,
+            protocol: Protocol::Tcp,
         }];
         spec.memory_limit_mb = Some(256);
         let cp = Checkpoint {
@@ -6024,6 +6372,7 @@ mod tests {
                 alias: "configuration-stub".to_string(),
                 guest_port: 8888,
                 target_host_port: stub_guard.get_mapped_port(8888).unwrap(),
+                protocol: Protocol::Tcp,
             }]
         );
         assert_eq!(
@@ -6067,6 +6416,7 @@ mod tests {
                 alias: "solo".to_string(),
                 guest_port: 9999,
                 target_host_port: solo_guard.get_mapped_port(9999).unwrap(),
+                protocol: Protocol::Tcp,
             }]
         );
 
@@ -7175,6 +7525,7 @@ mod tests {
             ports: std::collections::BTreeMap::from([("6379".to_string(), host_port)]),
             created_iso: "2025-01-01T00:00:00Z".to_string(),
             backend: "reuse-fake".to_string(),
+            udp_ports: std::collections::BTreeMap::new(),
         }
     }
 
@@ -7231,6 +7582,7 @@ mod tests {
             &[],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -7287,6 +7639,7 @@ mod tests {
             &[],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -7343,6 +7696,7 @@ mod tests {
             &[],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -7467,6 +7821,7 @@ mod tests {
             &[],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -7536,6 +7891,7 @@ mod tests {
             &[],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,
@@ -7587,6 +7943,7 @@ mod tests {
             &[],
             &None,
             &[6379],
+            &[],
             None,
             None,
             None,

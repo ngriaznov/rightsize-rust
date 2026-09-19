@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::error::{Result, RightsizeError};
-use crate::model::{ContainerSpec, ExecResult};
+use crate::model::{ContainerSpec, ExecResult, Protocol};
 
 /// Capability flags a backend exposes about its own runtime — a small, growable
 /// struct rather than a single boolean (mirroring the existing
@@ -58,6 +58,14 @@ pub struct NetworkLink {
     pub guest_port: u16,
     /// The host-side port that traffic actually lands on.
     pub target_host_port: u16,
+    /// The transport this link carries. Defaults to [`Protocol::Tcp`] — every link
+    /// built before UDP exposure existed is TCP. Docker never reads this field (its
+    /// native networks resolve aliases regardless of protocol, so
+    /// [`SandboxBackend::install_network_links`]'s default no-op body never even
+    /// looks at `links`); microsandbox's emulated links are TCP-only exec-tunnels
+    /// (see that method's own doc) and must reject any link where this is
+    /// [`Protocol::Udp`] before attempting to install it.
+    pub protocol: Protocol,
 }
 
 /// A backend-native opaque container reference. `id` is whatever the backend's own

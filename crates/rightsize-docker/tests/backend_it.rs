@@ -155,6 +155,7 @@ async fn port_publish_binds_to_host_loopback() {
     spec.ports.push(rightsize::model::PortBinding {
         host_port,
         guest_port: 8000,
+        protocol: rightsize::model::Protocol::Tcp,
     });
     let handle = backend.create(spec).await.expect("create");
     backend.start(handle.as_ref()).await.expect("start");
@@ -196,6 +197,7 @@ async fn start_classifies_a_host_port_conflict_as_a_typed_error() {
     spec.ports.push(rightsize::model::PortBinding {
         host_port,
         guest_port: 8000,
+        protocol: rightsize::model::Protocol::Tcp,
     });
     let handle = backend.create(spec).await.expect("create");
     let start_result = backend.start(handle.as_ref()).await;

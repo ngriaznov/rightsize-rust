@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use rightsize::model::ContainerSpec;
+use rightsize::model::{ContainerSpec, Protocol};
 
 /// Builds the argv for `msb run`, in the pinned order: name, memory (if set),
 /// root-disk (if a disk limit or tmpfs root is set), net (if network is disabled),
@@ -58,7 +58,7 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 
     for port in &spec.ports {
         argv.push("-p".to_string());
-        argv.push(format!("{}:{}", port.host_port, port.guest_port));
+        argv.push(port_flag_value(port));
     }
 
     for (k, v) in &spec.env {
@@ -175,10 +175,23 @@ pub fn restore(spec: &ContainerSpec, snapshot_path: &str) -> Vec<String> {
 
     for port in &spec.ports {
         argv.push("-p".to_string());
-        argv.push(format!("{}:{}", port.host_port, port.guest_port));
+        argv.push(port_flag_value(port));
     }
 
     argv
+}
+
+/// Formats one `-p` flag's value for [`run`]/[`restore`]: `HOST:GUEST` for a TCP
+/// binding, `HOST:GUEST/udp` for a UDP one — msb's own convention (mirroring
+/// `-p`'s Docker-CLI-alike spelling) for tagging a published port's transport.
+/// TCP carries no suffix, so a spec that never declares a UDP port (every spec
+/// built before UDP exposure existed, and the overwhelming majority since)
+/// produces byte-identical argv to before this function existed.
+fn port_flag_value(port: &rightsize::model::PortBinding) -> String {
+    match port.protocol {
+        Protocol::Tcp => format!("{}:{}", port.host_port, port.guest_port),
+        Protocol::Udp => format!("{}:{}/udp", port.host_port, port.guest_port),
+    }
 }
 
 /// Builds the argv for `msb copy <src> <name>:<dst>` — copying a host file or
@@ -535,6 +548,7 @@ mod tests {
             ports: vec![PortBinding {
                 host_port: 12345,
                 guest_port: 6379,
+                protocol: Protocol::Tcp,
             }],
             mounts: vec![FileMount::new(
                 PathBuf::from("/tmp/f.conf"),
@@ -831,6 +845,69 @@ mod tests {
                 "--name",
                 "rz-bare-1",
             ]
+        );
+    }
+
+    // -- UDP port emission (spec item 7): "/udp" suffix in both run and restore --
+
+    #[test]
+    fn run_command_appends_slash_udp_for_a_udp_binding_and_leaves_tcp_unsuffixed() {
+        let mut spec = full_spec();
+        spec.ports.push(PortBinding {
+            host_port: 40000,
+            guest_port: 53,
+            protocol: Protocol::Udp,
+        });
+        let cmd = run(&spec);
+        assert!(
+            cmd.windows(2).any(|w| w[0] == "-p" && w[1] == "12345:6379"),
+            "the tcp binding must stay byte-identical to before UDP existed: {cmd:?}"
+        );
+        assert!(
+            cmd.windows(2)
+                .any(|w| w[0] == "-p" && w[1] == "40000:53/udp"),
+            "a udp binding must emit the /udp suffix: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn restore_command_appends_slash_udp_for_a_udp_binding_and_leaves_tcp_unsuffixed() {
+        let mut spec = full_spec();
+        spec.ports.push(PortBinding {
+            host_port: 40000,
+            guest_port: 53,
+            protocol: Protocol::Udp,
+        });
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert!(
+            cmd.windows(2).any(|w| w[0] == "-p" && w[1] == "12345:6379"),
+            "the tcp binding must stay byte-identical to before UDP existed: {cmd:?}"
+        );
+        assert!(
+            cmd.windows(2)
+                .any(|w| w[0] == "-p" && w[1] == "40000:53/udp"),
+            "a udp binding must emit the /udp suffix: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn run_command_with_only_a_udp_port_emits_exactly_one_suffixed_flag() {
+        let mut spec = ContainerSpec::new("rz-udp-only", "alpine:3.19", "run-1");
+        spec.ports = vec![PortBinding {
+            host_port: 51000,
+            guest_port: 5353,
+            protocol: Protocol::Udp,
+        }];
+        let cmd = run(&spec);
+        assert!(
+            cmd.windows(2)
+                .any(|w| w[0] == "-p" && w[1] == "51000:5353/udp"),
+            "{cmd:?}"
+        );
+        assert_eq!(
+            cmd.iter().filter(|a| a.as_str() == "-p").count(),
+            1,
+            "{cmd:?}"
         );
     }
 

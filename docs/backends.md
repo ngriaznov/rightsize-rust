@@ -176,6 +176,14 @@ but a few edges are real, not just timing quirks:
 - **Network-alias tunnels on microsandbox serve one connection at a time.** See
   [Networking](./core-concepts/networking.md#limits-on-the-microvm-backend) — a real
   capability gap versus Docker's native bridge networking, not a timing quirk.
+- **UDP is host-reachable on both backends, but guest-to-guest UDP is docker-only
+  (Phase 1).** `.with_exposed_udp_ports(...)`/`guard.get_mapped_udp_port(...)` work
+  identically on both — docker emits native `<guest>/udp` `ExposedPorts`/
+  `PortBindings` keys, msb appends a `/udp` suffix to its `-p HOST:GUEST` published-port
+  flag — but joining an msb [`Network`](./core-concepts/networking.md) with a
+  UDP-exposed member fails `start()` fast (msb has no guest-to-guest networking of
+  any kind), where docker's native networks carry UDP between members with no
+  per-port declaration at all. See [UDP ports](./core-concepts/containers-and-guards.md#udp-ports).
 - **Checkpointing restarts the workload on microsandbox, not on Docker.** Both
   backends support `checkpoint()`/`checkpoint_named()` (`capabilities().checkpoint`
   is `true` on both), but by different mechanisms: Docker commits the running

@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use rightsize::backend::{Capabilities, FollowHandle, NetworkLink, SandboxBackend, SandboxHandle};
 use rightsize::error::{Result, RightsizeError};
-use rightsize::model::{ContainerSpec, ExecResult};
+use rightsize::model::{ContainerSpec, ExecResult, Protocol};
 
 use crate::commands;
 use crate::exec_tunnel::ExecTunnel;
@@ -1110,6 +1110,7 @@ impl SandboxBackend for MsbCliBackend {
         if links.is_empty() {
             return Ok(());
         }
+        require_no_udp_links(links)?;
         require_no_duplicate_guest_ports(links)?;
         require_aliases_are_valid(links)?;
         require_nc_available(self, handle).await?;
@@ -4157,6 +4158,31 @@ fn require_aliases_are_valid(links: &[NetworkLink]) -> Result<()> {
                 "use a valid DNS label instead (allowed: letters, digits, '.', '_', '-')",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Phase-1 fail-fast: microsandbox's emulated network links are TCP-only
+/// exec-tunnels (see [`MsbCliBackend::install_network_links`]'s own doc — a
+/// microVM has no real bridge/subnet, so this backend fakes a link with an
+/// `/etc/hosts` alias plus a relayed `nc` process piping bytes over `msb exec`,
+/// which has no UDP-datagram equivalent). Same
+/// unsupported-with-remedy error shape as [`require_nc_available`] just below —
+/// checked first, before the `nc`-availability probe even runs, since a UDP link
+/// can never be installed regardless of what the consumer image has.
+fn require_no_udp_links(links: &[NetworkLink]) -> Result<()> {
+    if links.iter().any(|l| l.protocol == Protocol::Udp) {
+        return Err(RightsizeError::unsupported_with_remedy(
+            "UDP network links on microsandbox",
+            "microsandbox",
+            "msb has no guest-to-guest networking, so rightsize's emulated links \
+             are TCP-only exec-tunnels — join this network on the docker backend \
+             instead (its native networks carry UDP between members with no \
+             per-port declaration), or publish the port with \
+             with_exposed_udp_ports(...) and read it back with \
+             get_mapped_udp_port(...), the msb-compatible pattern for reaching a \
+             UDP service from the host",
+        ));
     }
     Ok(())
 }
@@ -7504,11 +7530,13 @@ mod tests {
                 alias: "a".to_string(),
                 guest_port: 8000,
                 target_host_port: 1,
+                protocol: Protocol::Tcp,
             },
             NetworkLink {
                 alias: "b".to_string(),
                 guest_port: 8000,
                 target_host_port: 2,
+                protocol: Protocol::Tcp,
             },
         ];
         let err = require_no_duplicate_guest_ports(&links).unwrap_err();
@@ -7522,11 +7550,13 @@ mod tests {
                 alias: "a".to_string(),
                 guest_port: 8000,
                 target_host_port: 1,
+                protocol: Protocol::Tcp,
             },
             NetworkLink {
                 alias: "b".to_string(),
                 guest_port: 8001,
                 target_host_port: 2,
+                protocol: Protocol::Tcp,
             },
         ];
         assert!(require_no_duplicate_guest_ports(&links).is_ok());
@@ -7538,6 +7568,7 @@ mod tests {
             alias: "configuration-stub.local_1".to_string(),
             guest_port: 8000,
             target_host_port: 1,
+            protocol: Protocol::Tcp,
         }];
         assert!(require_aliases_are_valid(&links).is_ok());
     }
@@ -7548,9 +7579,53 @@ mod tests {
             alias: "bad'alias".to_string(),
             guest_port: 8000,
             target_host_port: 1,
+            protocol: Protocol::Tcp,
         }];
         let err = require_aliases_are_valid(&links).unwrap_err();
         assert!(err.to_string().contains("bad'alias"), "{err}");
+    }
+
+    // -- UDP link fail-fast (spec item 8) --------------------------------------
+
+    #[test]
+    fn require_no_udp_links_rejects_when_any_link_is_udp() {
+        let links = vec![
+            NetworkLink {
+                alias: "tcp-sibling".to_string(),
+                guest_port: 8000,
+                target_host_port: 1,
+                protocol: Protocol::Tcp,
+            },
+            NetworkLink {
+                alias: "dns".to_string(),
+                guest_port: 53,
+                target_host_port: 2,
+                protocol: Protocol::Udp,
+            },
+        ];
+        let err = require_no_udp_links(&links).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("UDP"), "{msg}");
+        assert!(
+            msg.contains("docker") && msg.contains("get_mapped_udp_port"),
+            "the error must name a remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn require_no_udp_links_allows_an_all_tcp_batch() {
+        let links = vec![NetworkLink {
+            alias: "redis".to_string(),
+            guest_port: 6379,
+            target_host_port: 1,
+            protocol: Protocol::Tcp,
+        }];
+        assert!(require_no_udp_links(&links).is_ok());
+    }
+
+    #[test]
+    fn require_no_udp_links_allows_an_empty_batch() {
+        assert!(require_no_udp_links(&[]).is_ok());
     }
 
     #[test]

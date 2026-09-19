@@ -35,15 +35,21 @@ A reuse container's identity is `sha256` over a canonical JSON serialization of:
 
 ```text
 {image, env (sorted by key), command, exposedPorts (sorted), memoryLimitMb,
- copies: [{guestPath, sha256(content)}] sorted by guestPath}
+ copies: [{guestPath, sha256(content)}] sorted by guestPath,
+ exposedUdpPorts (sorted, omitted entirely when empty)}
 ```
 
 Two `Container`s hash identically — and therefore adopt the same sandbox — only if
 their image, environment (regardless of the order `.with_env` was called in), command,
-exposed ports, memory limit, and every copied-in file's content all match exactly.
-Change any one of those and the next `start()` computes a different hash, a different
-`rz-reuse-<12hex>` name, and boots a brand-new sandbox alongside the old one (which
-still needs manual cleanup — see below).
+exposed TCP and UDP ports, memory limit, and every copied-in file's content all match
+exactly. Change any one of those and the next `start()` computes a different hash, a
+different `rz-reuse-<12hex>` name, and boots a brand-new sandbox alongside the old one
+(which still needs manual cleanup — see below). `exposedUdpPorts` is omitted from the
+canonical JSON entirely when empty — the overwhelming common case, and every spec
+built before `.with_exposed_udp_ports` existed — so a tcp-only spec still hashes
+byte-for-byte as it always has; a tcp-exposed and a udp-exposed spec for the SAME
+numeric port are still distinct identities, since a set value always changes the
+hash.
 
 Notably NOT part of the identity: network membership (see
 [Unsupported: custom networks](#unsupported-custom-networks-together) below), wait
@@ -72,9 +78,16 @@ successfully and passes its wait strategy:
   "image": "redis:7-alpine",
   "ports": { "6379": 32768 },
   "createdIso": "2025-01-01T00:00:00Z",
-  "backend": "microsandbox"
+  "backend": "microsandbox",
+  "udpPorts": { "53": 40000 }
 }
 ```
+
+`udpPorts` is the UDP counterpart of `ports` — guest port to mapped host UDP port,
+for whatever the identity's spec declared via `.with_exposed_udp_ports`. Additive: an
+entry written before UDP exposure existed has no `udpPorts` key at all, and reads
+back as empty — a tcp-only entry is byte-identical to what this shape always wrote
+(the key is omitted entirely when empty, not written as `{}`).
 
 ## Start flow
 

@@ -29,7 +29,8 @@ The builder surface, as it exists today:
 | `Container::new(image)` | Starts building from an image reference. |
 | `.with_env(k, v)` | Sets an env var. Calling it again with the same key overwrites the value but keeps the key's *first* position — last-value-wins, first-position-wins, exactly `LinkedHashMap` semantics. |
 | `.remove_env(key)` | Removes every entry for `key` set so far. No-op if never set. Needed when a later env var must retract an earlier one's *effect on the entrypoint*, not just be shadowed by value — see [`ArangoContainer::with_root_password`](../modules/arango.md) for the worked example. |
-| `.with_exposed_ports(&[..])` | Declares guest ports to publish; each gets a host port assigned before boot. |
+| `.with_exposed_ports(&[..])` | Declares guest ports to publish over TCP; each gets a host port assigned before boot. |
+| `.with_exposed_udp_ports(&[..])` | Declares guest ports to publish over UDP; each gets its own host UDP port, allocated independently of the TCP pool — see [UDP ports](#udp-ports) below. |
 | `.with_command(&[..])` | Overrides the image's default entrypoint/command. |
 | `.with_network(&net)` | Joins an `Arc<Network>` — see [Networking](./networking.md). |
 | `.with_network_aliases(&[..])` | Names this container is reachable as on its network. |
@@ -130,6 +131,8 @@ Once you have a `ContainerGuard`:
   published on. Distinguishes two failure causes in its error message: the guard
   isn't running at all (never started, or already stopped), versus the guard is
   running but that guest port was never declared via `with_exposed_ports`.
+- `guard.get_mapped_udp_port(guest_port)` — the UDP counterpart, reading a
+  completely separate store — see [UDP ports](#udp-ports) below.
 - `guard.is_running()` — `true` from a successful `start()` until `stop()`.
 - `guard.exec(&["cmd", "arg"]).await` — runs a command inside the running container,
   returns `ExecResult { exit_code, stdout, stderr }`.
@@ -146,6 +149,53 @@ Once you have a `ContainerGuard`:
   for `Container::from_checkpoint(...)` to restore later; `guard.checkpoint_named(name).await`
   does the same but persists a registry entry a later process can rediscover. See
   [Checkpoint / Restore](../checkpoints.md).
+
+## UDP ports
+
+`.with_exposed_udp_ports(&[..])`/`guard.get_mapped_udp_port(guest_port)` are the UDP
+counterparts of `.with_exposed_ports(&[..])`/`guard.get_mapped_port(guest_port)` —
+same shape, but tracked in an entirely separate store on both the builder and the
+guard. A guest port declared on one protocol is never visible through the other's
+accessor, and the same numeric guest port can be declared on **both** protocols at
+once (DNS's port 53 is the canonical example) without either mapping colliding or
+overwriting the other:
+
+```rust,ignore
+let dns = Container::new("some/dns-image")
+    .with_exposed_ports(&[53])       // TCP zone transfers, etc.
+    .with_exposed_udp_ports(&[53])   // ordinary DNS queries
+    .start()
+    .await?;
+
+let tcp_port = dns.get_mapped_port(53)?;
+let udp_port = dns.get_mapped_udp_port(53)?;
+```
+
+Host UDP ports are allocated by binding a `UdpSocket`, never the `TcpListener` probe
+`.with_exposed_ports` uses — TCP and UDP have independent OS port tables, so a bound
+TCP listener proves nothing about whether a UDP port is free.
+
+**UDP exposure is invisible to the default wait strategy, by design.**
+[`Wait::for_listening_port`](./wait-strategies.md) (and every other built-in wait
+strategy) only ever probes the TCP-exposed ports — UDP is connectionless, so "the
+listener accepted a connection" has no UDP equivalent, and this crate does not guess
+at a datagram-based liveness probe on your behalf. **A container that exposes ONLY
+UDP ports is therefore vacuously ready under the default wait** (there is nothing to
+probe). If you're starting a UDP-only service, supply an explicit
+`.waiting_for(Wait::for_log_message(...))` strategy instead of relying on the default.
+
+**Unsupported on microsandbox network links.** A member reachable only via a
+UDP-exposed port cannot be a link target on an msb-backed
+[`Network`](./networking.md) — msb has no guest-to-guest networking at all, and
+rightsize's emulated links (`/etc/hosts` alias + an exec-tunneled relay) only ever
+carry TCP. Joining an msb network with a UDP-exposed member fails `start()` fast,
+before any tunnel work, naming the remedy: run on the docker backend instead (its
+native networks carry UDP between members with no per-port declaration at all), or
+publish the port with `.with_exposed_udp_ports(...)` and read it back with
+`get_mapped_udp_port(...)` — the msb-compatible pattern for reaching a UDP service
+from the host. Docker itself has no such limitation: its native networks resolve
+aliases and carry UDP between members regardless of protocol, with no code path in
+this crate even needing to look at it.
 
 ## The `OnceCell` shared-container recipe
 

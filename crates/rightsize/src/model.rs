@@ -5,6 +5,48 @@
 
 use std::path::PathBuf;
 
+/// The transport protocol a [`PortBinding`]/[`crate::backend::NetworkLink`] carries.
+///
+/// Defaults to [`Protocol::Tcp`] — every port/link built before UDP exposure existed
+/// is TCP, and every existing producer in this crate either sets this explicitly or
+/// gets it for free via [`Default`], so nothing that only ever spoke TCP has to
+/// change. A `tcp`-exposed and a `udp`-exposed [`PortBinding`] for the SAME numeric
+/// port are deliberately distinct values (this field participates in
+/// [`PortBinding`]'s `PartialEq`/`Eq`, and in `crate::reuse`'s identity hash) — a
+/// container may expose the same guest port on both protocols at once (DNS's port
+/// 53 is the canonical example), and the two must never collide or be silently
+/// merged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    /// Transmission Control Protocol — every port/link in this crate before UDP
+    /// exposure existed, and still the default for anything that doesn't say
+    /// otherwise.
+    #[default]
+    Tcp,
+    /// User Datagram Protocol. See the module-level UDP exposure docs
+    /// (`Container::with_exposed_udp_ports`, `ContainerGuard::get_mapped_udp_port`)
+    /// for the Phase 1 scope and its one hard limitation (msb network links).
+    Udp,
+}
+
+impl Protocol {
+    /// The lowercase wire spelling (`"tcp"`/`"udp"`) both backends use: Docker's
+    /// `<port>/<proto>` `ExposedPorts`/`PortBindings` keys, and msb's `-p
+    /// HOST:GUEST[/udp]` (TCP has no suffix — see `rightsize_msb::commands`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A host↔guest port map entry. The runtime binds `host_port` on loopback and forwards
 /// traffic to `guest_port` inside the container.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +56,9 @@ pub struct PortBinding {
     pub host_port: u16,
     /// The port the workload listens on inside the guest.
     pub guest_port: u16,
+    /// The transport this binding carries. Defaults to [`Protocol::Tcp`] — see that
+    /// type's own doc for the full backward-compatibility and identity story.
+    pub protocol: Protocol,
 }
 
 /// A host file or directory exposed inside the guest at `guest_path`.
@@ -270,6 +315,7 @@ mod tests {
         let a = PortBinding {
             host_port: 32768,
             guest_port: 6379,
+            protocol: Protocol::Tcp,
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -281,5 +327,36 @@ mod tests {
         };
         assert_eq!(r.exit_code, 0);
         assert_eq!(r.stdout, "ok");
+    }
+
+    #[test]
+    fn protocol_defaults_to_tcp() {
+        assert_eq!(Protocol::default(), Protocol::Tcp);
+    }
+
+    #[test]
+    fn protocol_as_str_and_display_are_the_lowercase_wire_spelling() {
+        assert_eq!(Protocol::Tcp.as_str(), "tcp");
+        assert_eq!(Protocol::Udp.as_str(), "udp");
+        assert_eq!(Protocol::Tcp.to_string(), "tcp");
+        assert_eq!(Protocol::Udp.to_string(), "udp");
+    }
+
+    #[test]
+    fn port_binding_equality_distinguishes_protocol_on_the_same_numeric_port() {
+        // DNS on port 53: a tcp-exposed and a udp-exposed binding for the SAME
+        // guest/host ports must never compare equal or collide — see
+        // `Protocol`'s own doc.
+        let tcp = PortBinding {
+            host_port: 32768,
+            guest_port: 53,
+            protocol: Protocol::Tcp,
+        };
+        let udp = PortBinding {
+            host_port: 32768,
+            guest_port: 53,
+            protocol: Protocol::Udp,
+        };
+        assert_ne!(tcp, udp);
     }
 }

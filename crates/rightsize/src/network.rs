@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::{NetworkLink, SandboxBackend};
 use crate::error::{Result, RightsizeError};
+use crate::model::Protocol;
 
 /// The view of a running container `Network` needs to compute links for later joiners —
 /// implemented by `ContainerGuard`. Kept as a small trait rather than a
@@ -19,8 +20,11 @@ pub(crate) trait NetworkMember: Send + Sync {
     /// Whether this member is currently running (a stopped/never-started member
     /// contributes no links).
     fn is_running(&self) -> bool;
-    /// This member's exposed guest port → mapped host port pairs, as of now.
-    fn mapped_ports(&self) -> Vec<(u16, u16)>;
+    /// This member's exposed guest port → mapped host port pairs, as of now — TCP
+    /// and UDP exposures together, each tagged with its own [`Protocol`] so
+    /// [`Network::links_for_new_member`] can carry it onto the [`NetworkLink`] it
+    /// builds.
+    fn mapped_ports(&self) -> Vec<(u16, u16, Protocol)>;
 }
 
 struct Member {
@@ -95,11 +99,12 @@ impl Network {
         for member in members.iter().filter(|m| m.container.is_running()) {
             let ports = member.container.mapped_ports();
             for alias in &member.aliases {
-                for &(guest_port, target_host_port) in &ports {
+                for &(guest_port, target_host_port, protocol) in &ports {
                     links.push(NetworkLink {
                         alias: alias.clone(),
                         guest_port,
                         target_host_port,
+                        protocol,
                     });
                 }
             }
@@ -142,13 +147,13 @@ mod tests {
 
     struct FakeMember {
         running: bool,
-        ports: Vec<(u16, u16)>,
+        ports: Vec<(u16, u16, Protocol)>,
     }
     impl NetworkMember for FakeMember {
         fn is_running(&self) -> bool {
             self.running
         }
-        fn mapped_ports(&self) -> Vec<(u16, u16)> {
+        fn mapped_ports(&self) -> Vec<(u16, u16, Protocol)> {
             self.ports.clone()
         }
     }
@@ -218,7 +223,7 @@ mod tests {
         let net = Network::new_network();
         let member: Arc<dyn NetworkMember> = Arc::new(FakeMember {
             running: true,
-            ports: vec![(6379, 32768)],
+            ports: vec![(6379, 32768, Protocol::Tcp)],
         });
         net.register(member, vec!["redis".to_string()], Arc::new(FakeBackend));
 
@@ -246,7 +251,7 @@ mod tests {
         let net = Network::new_network();
         let running = Arc::new(FakeMember {
             running: true,
-            ports: vec![(6379, 32768), (16379, 32769)],
+            ports: vec![(6379, 32768, Protocol::Tcp), (16379, 32769, Protocol::Tcp)],
         });
         net.register(
             running,
@@ -256,7 +261,7 @@ mod tests {
 
         let not_running = Arc::new(FakeMember {
             running: false,
-            ports: vec![(80, 40000)],
+            ports: vec![(80, 40000, Protocol::Tcp)],
         });
         net.register(
             not_running,
@@ -279,6 +284,25 @@ mod tests {
                 && l.target_host_port == 32769)
         );
         assert!(!links.iter().any(|l| l.alias == "stopped"));
+    }
+
+    #[test]
+    fn links_for_new_member_carries_each_port_s_own_protocol_onto_the_link() {
+        let net = Network::new_network();
+        let member = Arc::new(FakeMember {
+            running: true,
+            ports: vec![(53, 32768, Protocol::Tcp), (53, 32769, Protocol::Udp)],
+        });
+        net.register(member, vec!["dns".to_string()], Arc::new(FakeBackend));
+
+        let links = net.links_for_new_member();
+        assert_eq!(links.len(), 2, "{links:?}");
+        assert!(links.iter().any(|l| l.guest_port == 53
+            && l.target_host_port == 32768
+            && l.protocol == Protocol::Tcp));
+        assert!(links.iter().any(|l| l.guest_port == 53
+            && l.target_host_port == 32769
+            && l.protocol == Protocol::Udp));
     }
 
     #[tokio::test]

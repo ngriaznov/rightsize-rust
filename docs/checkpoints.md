@@ -93,16 +93,18 @@ pub struct Checkpoint {
 `spec` is the source container's full spec at checkpoint time **only** when the
 `Checkpoint` came directly back from `checkpoint()`/`checkpoint_named()`. A
 `Checkpoint` rediscovered via `Checkpoint::find`/`Checkpoint::list` instead carries a
-reconstructed spec: only `env`, `command`, exposed ports, and the memory limit are
-real (the four fields `from_checkpoint` actually reads back); every other field is a
-placeholder, since the registry never persists the full spec — see "Reusing
+reconstructed spec: only `env`, `command`, exposed TCP and UDP ports, and the memory
+limit are real (the fields `from_checkpoint` actually reads back); every other field
+is a placeholder, since the registry never persists the full spec — see "Reusing
 checkpoints across runs" below.
 
 `Container::from_checkpoint(&checkpoint)` builds a normal `Container` whose image is
-`checkpoint.checkpoint_ref` and whose env, command, exposed ports, and memory limit default
-to the source container's — everything a restored container needs to behave like
-the original. Every ordinary builder still works on the result, so a caller can
-override anything before `.start()`:
+`checkpoint.checkpoint_ref` and whose env, command, exposed ports (TCP and UDP,
+re-split by protocol from `spec.ports` into the right builder field — see
+`Container::with_exposed_udp_ports`), and memory limit default to the source
+container's — everything a restored container needs to behave like the original.
+Every ordinary builder still works on the result, so a caller can override anything
+before `.start()`:
 
 ```rust,ignore
 let restored = Container::from_checkpoint(&checkpoint)
