@@ -107,11 +107,14 @@ async fn host_reaches_a_udp_exposed_guest_port_via_the_mapped_port() {
         // A udp-only container is vacuously ready under the default wait (see
         // `Container::with_exposed_udp_ports`'s own doc) — an explicit
         // log-message wait is this test's own readiness signal instead, exactly
-        // as that doc recommends for a real UDP-only service. `alpine`'s
-        // `sh -c` entrypoint itself produces no log line before `nc` blocks, so
-        // this waits for the guest agent's own boot chatter (".*", the first
-        // line at all) rather than anything nc-specific.
-        .waiting_for(Wait::for_log_message(".*", 0));
+        // as that doc recommends for a real UDP-only service. `times = 0` would
+        // be a no-op (ready immediately, before the guest has produced any
+        // output at all — see `wait.rs`'s own doc comment and
+        // `for_log_message_times_zero_succeeds_immediately` test), so this uses
+        // `times = 1` to genuinely block until the guest agent has emitted its
+        // first line of boot chatter (".*" matches any line) before the host
+        // starts sending datagrams.
+        .waiting_for(Wait::for_log_message(".*", 1));
     let guard = container.start().await.expect("container must start");
 
     let host_port = guard

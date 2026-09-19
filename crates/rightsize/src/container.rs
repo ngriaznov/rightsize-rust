@@ -7627,6 +7627,84 @@ mod tests {
         guard.stop().await.unwrap();
     }
 
+    // A UDP-exposed reuse container's full adopt round trip: `try_adopt` must read
+    // the registry's own `udp_ports` map (not just its `ports` map) and hand back a
+    // guard whose `get_mapped_udp_port` reflects the REGISTRY's port, exactly the
+    // way the TCP-only adopt test above proves for `get_mapped_port` — this is the
+    // code path (`entry.udp_ports` lookup in `try_adopt`) that only structural
+    // inspection covered before. The container also exposes port 53 on BOTH
+    // protocols, exercising the same-numeric-port-different-protocol case end to
+    // end through a real adopt, not just through the identity-hash/registry-JSON
+    // unit tests in `reuse.rs`.
+    #[tokio::test]
+    async fn adopt_path_with_udp_exposed_ports_uses_the_registry_udp_mapping_too() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("adopt-udp-hit");
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379, 53],
+            &[53],
+            None,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+
+        // A previous process already created, started, and registered this
+        // sandbox, then exited cleanly — this process's first start() should adopt
+        // it, mapped UDP port included.
+        backend.mark_running(&identity.name);
+        let mut entry = sample_registry_entry(&identity, 40321);
+        entry.ports.insert("53".to_string(), 40322 /* tcp:53 */);
+        entry.udp_ports = std::collections::BTreeMap::from([("53".to_string(), 40323)]);
+        crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+            .write_atomic(&entry)
+            .unwrap();
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379, 53])
+            .with_exposed_udp_ports(&[53])
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("adopt must succeed");
+
+        assert_eq!(guard.name(), identity.name);
+        assert_eq!(
+            guard.get_mapped_port(6379).unwrap(),
+            40321,
+            "must use the registry's tcp:6379 port"
+        );
+        assert_eq!(
+            guard.get_mapped_port(53).unwrap(),
+            40322,
+            "must use the registry's tcp:53 port"
+        );
+        assert_eq!(
+            guard.get_mapped_udp_port(53).unwrap(),
+            40323,
+            "must use the registry's udp:53 port — a distinct mapping from tcp:53, \
+             never sharing a bare-int key with it"
+        );
+        {
+            let state = backend.state.lock().unwrap();
+            assert!(
+                state.created.is_empty(),
+                "adopt must not call backend.create, udp ports included"
+            );
+            assert!(state.find_running_calls >= 1);
+        }
+        guard.stop().await.unwrap();
+    }
+
     // Stale registry: the backend reports the recorded sandbox is NOT running ->
     // best-effort remove-by-name + delete the registry file, then fall through to a
     // fresh create that rewrites the registry.
