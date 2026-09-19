@@ -599,6 +599,7 @@ async fn sweep_reaps_a_fabricated_dead_run_at_the_backend_level() {
         ports: vec![PortBinding {
             host_port,
             guest_port: 8000,
+            protocol: rightsize::model::Protocol::Tcp,
         }],
         ..ContainerSpec::new(&name, "alpine:3.19", "contract-sweep-it")
     };
