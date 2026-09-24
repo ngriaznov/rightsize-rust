@@ -15,9 +15,8 @@ containers). Read on for how to build, test, and submit changes.
   - **microsandbox**: macOS on Apple Silicon, Linux (x86_64/arm64) with a
     readable `/dev/kvm`, or Windows (x86_64/arm64) with the Windows
     Hypervisor Platform (WHP) enabled — upstream beta, CI-verified on
-    `windows-2022`/`windows-2025` hosted runners. rightsize-rust
-    self-provisions the `msb` binary on first use — no manual install
-    required.
+    `windows-2025` hosted runners. rightsize-rust self-provisions the `msb`
+    binary on first use — no manual install required.
   - **Docker**: any Docker-compatible daemon reachable at the platform default —
     the unix socket `/var/run/docker.sock` on unix, or Docker Desktop's native named
     pipe `\\.\pipe\docker_engine` on Windows — or via `DOCKER_HOST`

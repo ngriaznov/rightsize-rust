@@ -5,8 +5,9 @@
 `Network`, `Wait` strategies, `FreePorts`, `RunId`, the `SandboxBackend` trait +
 `BackendProvider` registry, and the error enum — and depends on no backend.
 `rightsize-msb` drives the pinned `msb` CLI as attached child processes, provisions
-the toolchain from GitHub releases, and emulates networking with TCP-over-`exec
---stream` tunnels. `rightsize-docker` is a from-scratch Docker HTTP client over a
+the toolchain from GitHub releases, and emulates networking — TCP links over
+`exec --stream` tunnels, UDP links over an in-guest `nc`-based forwarder script.
+`rightsize-docker` is a from-scratch Docker HTTP client over a
 unix domain socket (unix) or Docker Desktop's named pipe (Windows), and the
 correctness oracle the microVM backend is checked against. `rightsize-modules` ships the preconfigured containers covered in
 [Modules](./modules/index.md). Host ports are pre-allocated core-side — **backends
@@ -76,6 +77,11 @@ to 5 times with fresh ports specifically to absorb it; see
 [Containers & Guards](./core-concepts/containers-and-guards.md#the-raii-lifecycle).
 
 ## Exec-tunnels: the microVM networking workaround
+
+This section covers TCP links specifically; a UDP-exposed link target uses a
+different mechanism — an in-guest `nc -u -l` forwarder script plus a
+`--net-rule` on the consumer's boot/restore argv, not this exec-tunnel byte
+pump — see [UDP network links on the microVM backend](./core-concepts/networking.md#udp-network-links-on-the-microvm-backend).
 
 Showcased in full in [Networking](./core-concepts/networking.md), the mechanism in
 one paragraph: microsandbox microVMs share no bridge network with each other, and

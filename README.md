@@ -140,8 +140,8 @@ rightsize-rust picks a backend automatically; override with
 | Linux without KVM | Docker (auto-fallback) |
 
 ¹ Windows support runs on the Windows Hypervisor Platform (WHP) and is upstream
-beta. CI-verified on `windows-2022`/`windows-2025` hosted runners, where WHP is
-already enabled with no reboot required. If WHP isn't enabled on your machine,
+beta. CI-verified on `windows-2025` hosted runners, where WHP is already
+enabled with no reboot required. If WHP isn't enabled on your machine,
 `RIGHTSIZE_BACKEND=microsandbox` fails naming the precondition (run
 `msb doctor --fix` in an elevated terminal - this may require a reboot); leaving
 `RIGHTSIZE_BACKEND` unset falls back to Docker silently.
@@ -247,9 +247,17 @@ isolated from each other - rightsize-rust transparently installs an `/etc/hosts`
 entry plus a TCP relay tunneled over the sandbox's exec channel.
 
 The microVM emulation has limits worth knowing: start dependencies before their
-consumers, one connection at a time per tunnel (fine for config fetches; not for
-a cross-container Kafka consumer), and the consumer image needs `nc`/busybox.
-Violations fail fast with an actionable error.
+consumers (a consumer started first gets no link to them), one connection at a
+time per TCP tunnel (fine for config fetches; not for a cross-container Kafka
+consumer), and the consumer image needs `nc`/busybox - without it, `start()`
+fails fast with an actionable error. A container exposing UDP ports with
+`.with_exposed_udp_ports(...)` can also be a link target - the consumer gets an
+in-guest `nc`-based forwarder instead of the TCP tunnel, without the
+one-connection-at-a-time limit, but datagrams must stay at or under 1472 bytes of
+payload: msb raises no error above that, it breaks the receiving sandbox's entire
+inbound networking. See
+[UDP network links on the microVM backend](docs/core-concepts/networking.md#udp-network-links-on-the-microvm-backend)
+for the full picture.
 
 ## How it works
 
@@ -359,7 +367,7 @@ RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it   # 
 RIGHTSIZE_BACKEND=docker       cargo test --workspace --features sandbox-it   # needs a reachable Docker daemon
 ```
 
-CI runs the full matrix (`unit`, `msb-linux`, `msb-macos`, `docker-fallback`).
+CI runs the full matrix (`unit`, `msb-linux`, `msb-windows`, `docker-fallback`).
 A change to a `SandboxBackend` implementation, or anything the shared contract
 suite exercises, should run the `sandbox-it` suite against both backends before a
 PR - see [CONTRIBUTING.md](.github/CONTRIBUTING.md).

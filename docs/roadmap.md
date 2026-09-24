@@ -27,9 +27,9 @@ fix there.
 
 ## Module breadth
 
-The gaps Testcontainers users will hit first: LocalStack, Elasticsearch /
-OpenSearch, Vault, MinIO, NATS, Cassandra, MSSQL, Oracle Free, and Ollama
-(LLM-in-a-box testing, which also fits the isolation story).
+The gaps Testcontainers users will hit first: LocalStack, OpenSearch, Vault,
+NATS, MSSQL, Oracle Free, and Ollama (LLM-in-a-box testing, which also fits
+the isolation story).
 
 ## Framework integrations
 

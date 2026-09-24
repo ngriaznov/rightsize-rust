@@ -71,8 +71,9 @@ rightsize-rust picks a backend automatically; override with
 |---|---|
 | macOS (Apple Silicon) | microsandbox (microVMs) |
 | Linux x86_64 / arm64 with `/dev/kvm` | microsandbox (microVMs) |
+| Windows x86_64 / arm64 with WHP enabled | microsandbox (microVMs) |
 | Intel Mac | Docker (auto-fallback) |
-| Windows | Docker (auto-fallback) |
+| Windows without WHP | Docker (auto-fallback) |
 | Linux without KVM | Docker (auto-fallback) |
 
 Both backends satisfy one behavioral contract (`SandboxBackend`), verified by a
@@ -84,8 +85,8 @@ ports of this library — see [Cross-Language Parity](./parity.md).
 
 ## Honest limits, up front
 
-- **Not yet published to crates.io.** Depend on it via a git reference until a
-  tagged release exists — see [Getting Started](./getting-started.md).
+- **Published to crates.io.** Add `rightsize`/`rightsize-modules` as a plain
+  registry dependency — see [Getting Started](./getting-started.md).
 - **Twenty-three modules, not an exhaustive catalog.** Anything else is the plain
   `Container` API — a thin wrapper is a small, welcome contribution; see the
   [Modules index](./modules/index.md) for the full list.

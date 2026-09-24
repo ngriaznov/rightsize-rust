@@ -23,8 +23,8 @@ upstream still labels this beta. `Platform::current()` reports a Windows build
 exists; `virtualization_available()` on Windows is attempt-and-report (no cheap,
 reliable, no-elevation WHP-state probe exists in portable `std`) — an unusable
 WHP surfaces at `msb`'s own first-boot failure rather than at resolution time.
-CI-verified on `windows-2022`/`windows-2025` hosted runners: WHP was already
-Enabled with `RestartNeeded: False`, so no enablement step or reboot was needed.
+CI-verified on `windows-2025` hosted runners: WHP was already Enabled with
+`RestartNeeded: False`, so no enablement step or reboot was needed.
 If `RIGHTSIZE_BACKEND=microsandbox` is forced on a Windows host without usable
 WHP, resolution errors naming the precondition (`msb doctor --fix` in an
 elevated terminal, which may require a reboot) rather than silently falling

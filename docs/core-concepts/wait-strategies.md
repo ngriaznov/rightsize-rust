@@ -10,7 +10,7 @@ On timeout, every built-in strategy's error message includes the container's
 `describe()` and its last 50 log lines, so a failure is diagnosable from the test
 output alone without re-running anything.
 
-## The four built-in strategies
+## The three built-in strategies
 
 ### `Wait::for_listening_port()`
 

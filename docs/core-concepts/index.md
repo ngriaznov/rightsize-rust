@@ -9,7 +9,7 @@ this section applies identically regardless of which backend (`rightsize-msb` or
 
 - [Containers & Guards](./containers-and-guards.md) — the builder, the RAII lifecycle,
   and the two-tier cleanup story.
-- [Wait Strategies](./wait-strategies.md) — the four built-in readiness checks and
+- [Wait Strategies](./wait-strategies.md) — the three built-in readiness checks and
   when to reach for a custom one.
 - [Networking](./networking.md) — cross-container alias resolution and its limits on
   the microVM backend.
