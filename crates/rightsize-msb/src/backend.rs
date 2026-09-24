@@ -5249,7 +5249,9 @@ mod tests {
     /// version, so the cycle's OWN mid-cycle `rm <old_name>` (and any
     /// best-effort `rm` of a FAILED candidate — see
     /// `MsbCliBackend::create_checkpoint`'s own `reboot` closure) can't
-    /// prematurely release it before the winning `restore` has even run).
+    /// prematurely release it before the winning `restore` has even run). It
+    /// also gives up once `dir` itself is gone, and records its own PID in
+    /// `<dir>/exec-pids` for [`assert_fake_exec_children_gone`].
     ///
     /// **Deliberately does not take a `fresh_name` parameter at all.** The
     /// candidate batch's actual names are minted by the CALLER now (a real
@@ -5304,7 +5306,8 @@ mod tests {
              exec)\n\
              shift\n\
              echo \"$*\" >> \"$dir/exec-calls\"\n\
-             while [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
+             echo $$ >> \"$dir/exec-pids\"\n\
+             while [ -d \"$dir\" ] && [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
              exit 0\n\
              ;;\n\
              stop|rm)\n\
@@ -5321,6 +5324,47 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod fake msb checkpoint-reboot script");
         script
+    }
+
+    /// Touches `<dir>/stop-requested` on drop, releasing every fake `exec` loop
+    /// still polling in `dir`. A test's own `stop()` is what reaps the revival
+    /// child; this guard covers the panic path, where the test never gets that
+    /// far and would otherwise leave the fake running after the test binary exits.
+    #[cfg(unix)]
+    struct ReleaseFakeExecsOnDrop(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for ReleaseFakeExecsOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("stop-requested"), "");
+        }
+    }
+
+    /// Asserts that every fake `exec` process listed in `<dir>/exec-pids` has
+    /// exited AND been reaped (`kill -0` still succeeds on a zombie). `stop()`
+    /// reaps the attached revival child before returning, so the first probe
+    /// normally finds it gone; the short poll only absorbs scheduling noise.
+    #[cfg(unix)]
+    fn assert_fake_exec_children_gone(dir: &Path) {
+        let pids = std::fs::read_to_string(dir.join("exec-pids"))
+            .expect("the fake exec must have recorded its pid");
+        assert!(!pids.trim().is_empty(), "no fake exec pid was recorded");
+        for pid in pids.split_whitespace() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .expect("run kill -0 to probe the fake exec child")
+                .success()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake exec child {pid} is still alive after the test stopped its sandbox"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -5491,6 +5535,7 @@ mod tests {
         ];
         let already_exists_refusals = 2;
         let script = write_fake_msb_for_checkpoint_reboot(&dir, already_exists_refusals);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let backend = MsbCliBackend::new(script);
         let spec = ContainerSpec {
             command: Some(vec!["redis-server".to_string()]),
@@ -5574,6 +5619,13 @@ mod tests {
             stop_rm_calls.contains(&format!("rm {}", candidates[1])),
             "the second refused candidate must be best-effort removed: {stop_rm_calls}"
         );
+
+        backend
+            .stop(new_handle.as_ref())
+            .await
+            .expect("stop on the winning candidate must succeed");
+        assert_fake_exec_children_gone(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- round 10 / POLICY v2: access-denied advances immediately (never a
@@ -5632,7 +5684,8 @@ mod tests {
              exec)\n\
              shift\n\
              echo \"$*\" >> \"$dir/exec-calls\"\n\
-             while [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
+             echo $$ >> \"$dir/exec-pids\"\n\
+             while [ -d \"$dir\" ] && [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
              exit 0\n\
              ;;\n\
              stop|rm)\n\
@@ -5672,6 +5725,7 @@ mod tests {
             "rz-checkpoint-ad-cand-1".to_string(),
         ];
         let script = write_fake_msb_for_checkpoint_reboot_access_denied(&dir, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let backend = MsbCliBackend::new(script);
         let spec = ContainerSpec {
             command: Some(vec!["redis-server".to_string()]),
@@ -5712,6 +5766,11 @@ mod tests {
              {restore_argv}"
         );
 
+        backend
+            .stop(new_handle.as_ref())
+            .await
+            .expect("stop on the winning candidate must succeed");
+        assert_fake_exec_children_gone(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5733,6 +5792,7 @@ mod tests {
             "rz-checkpoint-broker-cand-1".to_string(),
         ];
         let script = write_fake_msb_for_checkpoint_reboot_access_denied(&dir, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let broker_calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let broker_calls_for_closure = broker_calls.clone();
         let dir_for_closure = dir.clone();
@@ -5781,6 +5841,12 @@ mod tests {
             "the escalated candidate must never reach the direct restore path: {restore_calls}"
         );
 
+        backend
+            .stop(new_handle.as_ref())
+            .await
+            .expect("stop on the winning candidate must succeed");
+        assert_fake_exec_children_gone(&dir);
+
         let calls = broker_calls.lock().unwrap();
         assert_eq!(
             calls.len(),
@@ -5815,6 +5881,7 @@ mod tests {
             "rz-checkpoint-broker-infra-cand-1".to_string(),
         ];
         let script = write_fake_msb_for_checkpoint_reboot_access_denied(&dir, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let broker_calls = Arc::new(Mutex::new(0u32));
         let broker_calls_for_closure = broker_calls.clone();
         let backend = MsbCliBackend::with_restore_broker(script, move |_msb, _argv| {
@@ -5853,6 +5920,11 @@ mod tests {
              candidate 1: {restore_argv}"
         );
 
+        backend
+            .stop(new_handle.as_ref())
+            .await
+            .expect("stop on the winning candidate must succeed");
+        assert_fake_exec_children_gone(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8145,7 +8217,8 @@ mod tests {
     ///   immediately, first echoing `<dir>/exec-stderr`'s contents (if that file
     ///   also exists) to stderr — the early-exit red-proofs;
     /// - otherwise `exec` BLOCKS until `<dir>/stop-requested` appears (the fake's
-    ///   own `stop`/`rm` cases touch it) — the long-lived, successful case; a
+    ///   own `stop`/`rm` cases touch it) or `dir` is removed — the long-lived,
+    ///   successful case; a
     ///   test driving `try_restore_and_await_running`/`spawn_and_await_running`
     ///   directly (never calling `stop`) is responsible for killing the child it
     ///   gets back itself;
@@ -8225,7 +8298,7 @@ mod tests {
              if [ -f \"$dir/exec-stderr\" ]; then cat \"$dir/exec-stderr\" 1>&2; fi\n\
              exit \"$(cat \"$dir/exec-exit-code\")\"\n\
              fi\n\
-             while [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
+             while [ -d \"$dir\" ] && [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
              exit 0\n\
              ;;\n\
              stop|rm)\n\
@@ -8762,7 +8835,8 @@ mod tests {
              exec)\n\
              shift\n\
              echo \"$*\" >> \"$dir/exec-calls\"\n\
-             while [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
+             echo $$ >> \"$dir/exec-pids\"\n\
+             while [ -d \"$dir\" ] && [ ! -f \"$dir/stop-requested\" ]; do sleep 0.05; done\n\
              exit 0\n\
              ;;\n\
              stop|rm)\n\
@@ -8878,6 +8952,7 @@ mod tests {
             "rz-ordinary-restore-broker-cand-1".to_string(),
         ];
         let script = write_fake_msb_for_ordinary_restore_access_denied(&dir, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let broker_calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let broker_calls_for_closure = broker_calls.clone();
         let dir_for_closure = dir.clone();
@@ -8911,6 +8986,11 @@ mod tests {
                 .winning_start_handle(handle.as_ref())
                 .expect("candidate 1 won, so this must report a re-key");
             assert_eq!(winning.id(), candidates[1]);
+
+            backend
+                .stop(winning.as_ref())
+                .await
+                .expect("stop on the winning candidate must succeed");
         });
 
         // Candidate 0's direct attempt reached the fake script exactly once
@@ -8938,6 +9018,7 @@ mod tests {
             calls[0]
         );
 
+        assert_fake_exec_children_gone(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8955,6 +9036,7 @@ mod tests {
             "rz-ordinary-restore-broker-infra-cand-1".to_string(),
         ];
         let script = write_fake_msb_for_ordinary_restore_access_denied(&dir, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let broker_calls = Arc::new(Mutex::new(0u32));
         let broker_calls_for_closure = broker_calls.clone();
         let backend = MsbCliBackend::with_restore_broker(script, move |_msb, _argv| {
@@ -8979,6 +9061,11 @@ mod tests {
                 .winning_start_handle(handle.as_ref())
                 .expect("candidate 1 won, so this must report a re-key");
             assert_eq!(winning.id(), candidates[1]);
+
+            backend
+                .stop(winning.as_ref())
+                .await
+                .expect("stop on the winning candidate must succeed");
         });
 
         assert_eq!(
@@ -8993,6 +9080,7 @@ mod tests {
              1: {restore_argv}"
         );
 
+        assert_fake_exec_children_gone(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9008,6 +9096,7 @@ mod tests {
             "rz-ordinary-restore-first-cand-1".to_string(),
         ];
         let script = write_fake_msb_for_ordinary_restore_access_denied(&dir, 0);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
         let backend = MsbCliBackend::new(script);
         let spec = ContainerSpec {
             command: Some(vec!["redis-server".to_string()]),
@@ -9028,6 +9117,11 @@ mod tests {
                 "the first candidate won, so there is nothing to re-key"
             );
             assert_eq!(handle.id(), candidates[0]);
+
+            backend
+                .stop(handle.as_ref())
+                .await
+                .expect("stop on the first (winning) candidate must succeed");
         });
 
         let restore_calls: u32 = std::fs::read_to_string(dir.join("restore-calls"))
@@ -9037,6 +9131,7 @@ mod tests {
             .unwrap();
         assert_eq!(restore_calls, 1, "only ever one attempt: {restore_calls}");
 
+        assert_fake_exec_children_gone(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
