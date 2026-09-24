@@ -176,14 +176,18 @@ but a few edges are real, not just timing quirks:
 - **Network-alias tunnels on microsandbox serve one connection at a time.** See
   [Networking](./core-concepts/networking.md#limits-on-the-microvm-backend) — a real
   capability gap versus Docker's native bridge networking, not a timing quirk.
-- **UDP is host-reachable on both backends, but guest-to-guest UDP is docker-only
-  (Phase 1).** `.with_exposed_udp_ports(...)`/`guard.get_mapped_udp_port(...)` work
-  identically on both — docker emits native `<guest>/udp` `ExposedPorts`/
-  `PortBindings` keys, msb appends a `/udp` suffix to its `-p HOST:GUEST` published-port
-  flag — but joining an msb [`Network`](./core-concepts/networking.md) with a
-  UDP-exposed member fails `start()` fast (msb has no guest-to-guest networking of
-  any kind), where docker's native networks carry UDP between members with no
-  per-port declaration at all. See [UDP ports](./core-concepts/containers-and-guards.md#udp-ports).
+- **UDP works on both backends, by different mechanisms.**
+  `.with_exposed_udp_ports(...)`/`guard.get_mapped_udp_port(...)` work identically
+  on both — docker emits native `<guest>/udp` `ExposedPorts`/`PortBindings` keys,
+  msb appends a `/udp` suffix to its `-p HOST:GUEST` published-port flag. Joining a
+  [`Network`](./core-concepts/networking.md) with a UDP-exposed member also works on
+  both: docker's native networks carry UDP between members with no per-port
+  declaration at all, while msb — which has no guest-to-guest networking of any
+  kind — installs an in-guest forwarder per link and needs the consumer image to
+  have a busybox-style `nc`; a datagram over 1472 bytes of payload also permanently
+  breaks a msb sandbox's own inbound networking. See
+  [UDP ports](./core-concepts/containers-and-guards.md#udp-ports) and
+  [Networking](./core-concepts/networking.md#udp-network-links-on-the-microvm-backend).
 - **Checkpointing restarts the workload on microsandbox, not on Docker.** Both
   backends support `checkpoint()`/`checkpoint_named()` (`capabilities().checkpoint`
   is `true` on both), but by different mechanisms: Docker commits the running

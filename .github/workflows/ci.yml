@@ -1,10 +1,6 @@
 name: ci
 on:
   push:
-    # win-docker is a temporary CI trigger branch for the docker-backend Windows
-    # named-pipe transport work — remove once that work merges to main. udp is
-    # this workspace's own UDP-exposure (Phase 1) work branch — remove once it
-    # merges to main.
     branches: [main]
   pull_request:
   workflow_dispatch:

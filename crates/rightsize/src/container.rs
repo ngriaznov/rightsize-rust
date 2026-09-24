@@ -324,14 +324,15 @@ impl Container {
     /// UDP-only service should supply an explicit
     /// [`Self::waiting_for`]`(Wait::for_log_message(...))` strategy instead.
     ///
-    /// **Unsupported for microsandbox network links.** A container reachable
-    /// only via a UDP-exposed port cannot be joined to an msb [`Network`] as a
-    /// link target — msb's emulated links are TCP-only exec-tunnels (see
-    /// [`crate::backend::SandboxBackend::install_network_links`]'s own doc) —
-    /// installing a link fails fast with a typed, actionable error. Publish the
-    /// port and read it back with [`ContainerGuard::get_mapped_udp_port`]
-    /// instead, or run on the docker backend, whose native networks carry UDP
-    /// between members with no per-port declaration at all.
+    /// **On microsandbox network links.** A container reachable via a
+    /// UDP-exposed port CAN be joined to an msb [`Network`] as a link target —
+    /// the consumer's sandbox gets an in-guest forwarder relaying
+    /// `alias:guestPort` to this container's mapped host UDP port (see
+    /// [`crate::backend::SandboxBackend::install_network_links`]'s own doc).
+    /// The consumer image needs a busybox-style `nc` (with `-u`/`-e`) and
+    /// `timeout` — installing the link fails fast with a typed, actionable
+    /// error otherwise. docker's native networks carry UDP between members
+    /// with no per-port declaration at all.
     pub fn with_exposed_udp_ports(mut self, ports: &[u16]) -> Self {
         self.exposed_udp_ports.extend_from_slice(ports);
         self
@@ -687,6 +688,24 @@ impl Container {
             }
         }
 
+        // Computed BEFORE `create_started_container` (and so before
+        // `backend.create` ever runs) — a member's UDP egress policy has to be
+        // in its `msb run`/`restore` argv from the start (msb cannot modify a
+        // running sandbox's network policy), so the links a new member needs
+        // must be known before the spec is even built. Read once, here, and
+        // threaded unchanged into both `create_started_container` (as
+        // `host_udp_egress_ports`) and `link_register_and_wait` (as `links`)
+        // — never recomputed later, so the policy actually installed always
+        // matches whatever policy the backend booted with. Still computed
+        // strictly before this member registers on `net` (below), so it can
+        // never contain a self-link.
+        let links = self
+            .network
+            .as_deref()
+            .map(Network::links_for_new_member)
+            .unwrap_or_default();
+        let host_udp_egress_ports = udp_egress_ports(&links);
+
         let (handle, mapped_ports, mapped_udp_ports) = create_started_container(
             &backend,
             &self.image,
@@ -701,6 +720,7 @@ impl Container {
             self.disk_limit_mb,
             self.tmpfs_root_mb,
             self.network_disabled,
+            &host_udp_egress_ports,
             self.spec_customizer.as_deref(),
             self.reaper_cache_dir_override.as_deref(),
             self.checkpoint_ref.as_deref(),
@@ -748,6 +768,7 @@ impl Container {
             &guard,
             &backend,
             self.network.as_deref(),
+            links,
             &self.aliases,
             guard.wait_strategy.as_ref(),
         )
@@ -786,6 +807,22 @@ impl Container {
     }
 }
 
+/// Reduces `links` to the distinct, ascending-sorted host UDP ports
+/// [`ContainerSpec::host_udp_egress_ports`] carries — distinct because two
+/// aliases (or two guest ports) can legitimately resolve to the same sibling
+/// target, and a backend that opens a host port per entry needs it exactly
+/// once; sorted for deterministic argv, matching that field's own doc.
+fn udp_egress_ports(links: &[crate::backend::NetworkLink]) -> Vec<u16> {
+    let mut ports: Vec<u16> = links
+        .iter()
+        .filter(|l| l.protocol == Protocol::Udp)
+        .map(|l| l.target_host_port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_started_container(
     backend: &Arc<dyn SandboxBackend>,
@@ -801,6 +838,7 @@ async fn create_started_container(
     disk_limit_mb: Option<u64>,
     tmpfs_root_mb: Option<u64>,
     network_disabled: bool,
+    host_udp_egress_ports: &[u16],
     spec_customizer: Option<&SpecCustomizer>,
     reaper_cache_dir_override: Option<&std::path::Path>,
     checkpoint_ref: Option<&str>,
@@ -857,6 +895,7 @@ async fn create_started_container(
             network_disabled,
             checkpoint_captured_cmdline: checkpoint_captured_cmdline.map(<[String]>::to_vec),
             restore_name_candidates: checkpoint_ref.is_some().then(|| restore_names.clone()),
+            host_udp_egress_ports: host_udp_egress_ports.to_vec(),
         };
 
         if let Some(customizer) = spec_customizer {
@@ -1185,18 +1224,22 @@ async fn link_register_and_wait(
     guard: &ContainerGuard,
     backend: &Arc<dyn SandboxBackend>,
     network: Option<&Network>,
+    links: Vec<crate::backend::NetworkLink>,
     aliases: &[String],
     wait_strategy: &dyn WaitStrategy,
 ) -> Result<Vec<crate::backend::NetworkLink>> {
-    let links = if let Some(net) = network {
-        let links = net.links_for_new_member();
+    // `links` was computed by the caller BEFORE `backend.create` — see
+    // `Container::start()`'s own comment — and installed here EXACTLY as
+    // computed, never recomputed: the spec this container just booted from
+    // (its UDP egress policy in particular) was built from this same list, so
+    // installing anything else would desync the two. Called whenever this
+    // container joins a network at all — never skipped just because `links`
+    // happens to be empty, matching this call's own pre-existing contract.
+    if network.is_some() {
         backend
             .install_network_links(&guard.handle_ref(), &links)
             .await?;
-        links
-    } else {
-        Vec::new()
-    };
+    }
     if let Some(net) = network {
         net.register(guard.as_network_member(), aliases.to_vec(), backend.clone());
     }
@@ -1433,6 +1476,11 @@ async fn try_adopt(
         // Same rationale as `checkpoint_ref` above — a reuse sandbox never
         // restores from a checkpoint, so it never has a candidate batch.
         restore_name_candidates: None,
+        // Reuse is rejected up front whenever `.with_network(...)` is also set
+        // (`Container::start()`'s own `ReuseNetworkConflict` check) — an
+        // adopted sandbox never has network links to carry a UDP egress policy
+        // for.
+        host_udp_egress_ports: Vec::new(),
     };
 
     let Ok(Some(handle)) = backend.find_running(&adopted_spec).await else {
@@ -1538,6 +1586,9 @@ async fn create_and_start_reuse_sandbox(
             // A reuse sandbox is never a checkpoint restore (see
             // `Container::start()`'s own `ReuseCheckpointConflict` check).
             restore_name_candidates: None,
+            // Same rationale as `try_adopt`'s own `adopted_spec` above — reuse
+            // and `.with_network(...)` are mutually exclusive up front.
+            host_udp_egress_ports: Vec::new(),
         };
         if let Some(customizer) = &container.spec_customizer {
             // Same TCP-wins-on-collision precedent as `create_started_container`'s
@@ -3044,6 +3095,11 @@ fn checkpoint_from_reduced(
             // batch is minted fresh by `create_started_container` at restore
             // time, never carried by the checkpoint record itself.
             restore_name_candidates: None,
+            // Per-run wiring, not identity — never written to
+            // `NamedRegistrySpec` in the first place (see
+            // `ContainerSpec::host_udp_egress_ports`'s own doc), so there is
+            // nothing to recover here either.
+            host_udp_egress_ports: Vec::new(),
         },
     }
 }
@@ -6380,6 +6436,99 @@ mod tests {
             "configuration-stub:8888"
         );
         assert!(net.resolve("nope", 1).is_err());
+
+        app_guard.stop().await.unwrap();
+        stub_guard.stop().await.unwrap();
+    }
+
+    // UDP links (start sequencing, spec item 2): the consumer's spec carries the
+    // sorted distinct UDP target host ports of running siblings — computed and
+    // set on the spec `backend.create` actually receives, BEFORE `create` runs —
+    // and `install_network_links` receives that exact same precomputed list.
+    #[tokio::test]
+    async fn starting_on_a_network_with_a_udp_sibling_carries_its_mapped_port_as_host_udp_egress() {
+        let backend = FakeBackend::new();
+        let net = Arc::new(Network::new_network());
+        let echo = container_on(&backend)
+            .with_exposed_udp_ports(&[9153])
+            .with_network(&net)
+            .with_network_aliases(&["udp-echo"]);
+        let echo_guard = echo.start().await.unwrap();
+        let echo_host_port = echo_guard.get_mapped_udp_port(9153).unwrap();
+
+        let consumer = container_on(&backend).with_network(&net);
+        let consumer_guard = consumer.start().await.unwrap();
+
+        let consumer_spec = backend
+            .state
+            .lock()
+            .unwrap()
+            .created
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(consumer_spec.host_udp_egress_ports, vec![echo_host_port]);
+
+        let (_, links) = {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.installed_links.len(), 1);
+            state.installed_links[0].clone()
+        };
+        assert_eq!(
+            links,
+            vec![crate::backend::NetworkLink {
+                alias: "udp-echo".to_string(),
+                guest_port: 9153,
+                target_host_port: echo_host_port,
+                protocol: Protocol::Udp,
+            }]
+        );
+
+        consumer_guard.stop().await.unwrap();
+        echo_guard.stop().await.unwrap();
+    }
+
+    // UDP links: no network, or a network whose only running sibling exposes
+    // TCP only, both leave `host_udp_egress_ports` empty.
+    #[tokio::test]
+    async fn a_container_with_no_network_or_only_tcp_links_gets_an_empty_host_udp_egress_list() {
+        let backend = FakeBackend::new();
+
+        let lone = container_on(&backend).with_exposed_ports(&[8080]);
+        let lone_guard = lone.start().await.unwrap();
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .created
+                .last()
+                .unwrap()
+                .host_udp_egress_ports
+                .is_empty()
+        );
+        lone_guard.stop().await.unwrap();
+
+        let net = Arc::new(Network::new_network());
+        let stub = container_on(&backend)
+            .with_exposed_ports(&[8888])
+            .with_network(&net)
+            .with_network_aliases(&["configuration-stub"]);
+        let stub_guard = stub.start().await.unwrap();
+
+        let app = container_on(&backend).with_network(&net);
+        let app_guard = app.start().await.unwrap();
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .created
+                .last()
+                .unwrap()
+                .host_udp_egress_ports
+                .is_empty()
+        );
 
         app_guard.stop().await.unwrap();
         stub_guard.stop().await.unwrap();

@@ -230,6 +230,18 @@ pub struct ContainerSpec {
     /// `checkpoint_ref` above — no public builder sets this directly.
     /// Defaults to `None`.
     pub restore_name_candidates: Option<Vec<String>>,
+    /// The host loopback UDP ports this sandbox's network links need to reach —
+    /// filled in by the core from the UDP-protocol links computed for this
+    /// start (see `rightsize::container`'s start sequencing), sorted ascending
+    /// and de-duplicated for deterministic argv. A backend that routes links
+    /// through the host rather than a real bridge (microsandbox) opens exactly
+    /// these host ports in the sandbox's egress policy; docker ignores the
+    /// field — its native networks carry UDP between members directly, with no
+    /// per-port declaration. Per-run wiring, never identity: never written to
+    /// the named-checkpoint registry's reduced spec, never part of the reuse
+    /// identity hash, never shown in the pinned diagnostics report format.
+    /// Defaults to empty.
+    pub host_udp_egress_ports: Vec<u16>,
 }
 
 impl ContainerSpec {
@@ -258,6 +270,7 @@ impl ContainerSpec {
             network_disabled: false,
             checkpoint_captured_cmdline: None,
             restore_name_candidates: None,
+            host_udp_egress_ports: Vec::new(),
         }
     }
 }
@@ -286,6 +299,7 @@ mod tests {
         assert!(!spec.network_disabled);
         assert!(spec.checkpoint_captured_cmdline.is_none());
         assert!(spec.restore_name_candidates.is_none());
+        assert!(spec.host_udp_egress_ports.is_empty());
     }
 
     #[test]

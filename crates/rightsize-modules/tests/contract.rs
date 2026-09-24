@@ -81,6 +81,14 @@
 //! - A checkpoint stores its artifact under the cache dir and restores from it
 //!   (msb-only — docker checkpoints are image tags, not filesystem artifacts):
 //!   [`a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_it`]
+//!
+//! Plus one network-link behavior, UDP scenario 1 (mirrors
+//! `rightsize-msb/tests/udp_it.rs`'s own msb-only scenario, run here against BOTH
+//! backends so the same test proves docker's real bridge network and msb's in-guest
+//! forwarder emulation indistinguishable from the caller's side):
+//!
+//! - A consumer reaches a udp-exposed sibling by alias over a shared `Network`:
+//!   [`consumer_reaches_a_udp_exposed_sibling_via_alias`]
 
 #![cfg(feature = "sandbox-it")]
 
@@ -94,7 +102,7 @@ use std::time::{Duration, Instant};
 
 use rightsize::backend::{BackendProvider, SandboxBackend};
 use rightsize::model::{ContainerSpec, PortBinding};
-use rightsize::{Container, MountableFile, Wait};
+use rightsize::{Container, MountableFile, Network, Wait};
 // Feature-gated like the lib's own registration: `rightsize-docker` is unix-only, and
 // a Windows build of this suite selects `--no-default-features --features
 // backend-msb,sandbox-it` (see the msb-windows CI lane), so the crate is never linked
@@ -1872,4 +1880,69 @@ async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_
     );
 
     restored_guard.stop().await.unwrap();
+}
+
+// ============================ network links: UDP scenario 1 =========================
+
+/// Network-link contract, UDP scenario 1 (mirrors `rightsize-msb/tests/udp_it.rs`'s
+/// own msb-only
+/// `consumer_reaches_a_udp_exposed_sibling_via_alias_through_the_forwarder`, run here
+/// against BOTH backends): a consumer on the same `Network` reaches a udp-exposed
+/// sibling by alias — docker's real bridge network + DNS alias carries UDP
+/// natively, msb routes it through the in-guest forwarder
+/// (`install_udp_forwarder`) — from the caller's side the two are
+/// indistinguishable. Server: `alpine/socat:1.8.1.3`'s own entrypoint kept, args
+/// only (`-T5 UDP4-RECVFROM:9153,fork EXEC:cat`), started FIRST so its mapped UDP
+/// host port is known before the consumer's own `start()` builds its network
+/// policy. UDP is lossy, so the send is wrapped in a short bounded resend loop
+/// rather than trusting a single datagram to land.
+#[tokio::test]
+async fn consumer_reaches_a_udp_exposed_sibling_via_alias() {
+    require_backend!();
+    let net = Arc::new(Network::new_network());
+
+    let server = Container::new("alpine/socat:1.8.1.3")
+        .with_command(&["-T5", "UDP4-RECVFROM:9153,fork", "EXEC:cat"])
+        .with_exposed_udp_ports(&[9153])
+        .with_network(&net)
+        .with_network_aliases(&["udp-echo"]);
+    let server_guard = server.start().await.expect("server must start");
+
+    let consumer = Container::new("alpine:3.19")
+        .with_command(&["sleep", "3600"])
+        .with_network(&net)
+        .waiting_for(Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(30)));
+    let consumer_guard = consumer.start().await.expect("consumer must start");
+
+    let payload = format!(
+        "rz-udp-link-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let mut delivered = false;
+    for attempt in 0..10 {
+        let result = consumer_guard
+            .exec(&[
+                "sh",
+                "-c",
+                &format!("echo {payload} | nc -u -w2 udp-echo 9153"),
+            ])
+            .await
+            .expect("exec must run");
+        if result.exit_code == 0 && result.stdout.contains(&payload) {
+            delivered = true;
+            break;
+        }
+        eprintln!("attempt {attempt}: echo not observed yet through the udp-echo alias, retrying");
+    }
+    assert!(
+        delivered,
+        "the consumer never observed its own payload echoed back through udp-echo:9153"
+    );
+
+    consumer_guard.stop().await.unwrap();
+    server_guard.stop().await.unwrap();
 }

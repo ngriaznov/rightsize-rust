@@ -2,7 +2,8 @@
 //! tiny, because two runtimes as different as Docker and a microVM-over-CLI both live
 //! behind it. Docker maps most calls straight to the daemon API; the microsandbox backend
 //! drives the `msb` CLI and *emulates* the parts a microVM lacks — most notably
-//! networking, which it fakes with per-link exec-stream tunnels (see
+//! networking, which it fakes per link: a TCP link gets an exec-stream tunnel, a
+//! UDP link gets an in-guest forwarder script (see
 //! [`SandboxBackend::install_network_links`], a no-op default for backends with real
 //! networks).
 //!
@@ -62,9 +63,11 @@ pub struct NetworkLink {
     /// built before UDP exposure existed is TCP. Docker never reads this field (its
     /// native networks resolve aliases regardless of protocol, so
     /// [`SandboxBackend::install_network_links`]'s default no-op body never even
-    /// looks at `links`); microsandbox's emulated links are TCP-only exec-tunnels
-    /// (see that method's own doc) and must reject any link where this is
-    /// [`Protocol::Udp`] before attempting to install it.
+    /// looks at `links`); microsandbox installs the two protocols by entirely
+    /// different mechanisms — a TCP link gets an exec-tunnel, a UDP link gets an
+    /// in-guest forwarder script (see that method's own doc) — and fails fast with
+    /// a typed, actionable error for a UDP link whose consumer image lacks a
+    /// capable `nc`.
     pub protocol: Protocol,
 }
 

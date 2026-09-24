@@ -36,14 +36,17 @@ networking and embedded DNS resolve `alias:port` for you. No emulation, no tunne
 full native container-to-container connectivity.
 
 **On microsandbox:** microVMs are fully isolated from each other — there's no shared
-bridge network to attach to. rightsize-rust transparently installs:
+bridge network to attach to. rightsize-rust transparently installs, for every link:
 
 1. An `/etc/hosts` entry inside the consuming container's guest, mapping the alias to
    `127.0.0.1`.
-2. A TCP relay tunneled over the sandbox's `exec --stream` channel — the *only* guest
-   data path available on this msb build (no sandbox→host TCP under any net-rule
-   tried; SSH forwarding was found broken too). The tunnel pumps raw bytes,
-   unbuffered, flush-per-read, in both directions.
+2. A TCP link gets a relay tunneled over the sandbox's `exec --stream` channel — the
+   *only* guest data path available on this msb build (no sandbox→host TCP under any
+   net-rule tried; SSH forwarding was found broken too). The tunnel pumps raw bytes,
+   unbuffered, flush-per-read, in both directions. A UDP link instead gets an
+   in-guest forwarder script — see
+   [UDP network links on the microVM backend](#udp-network-links-on-the-microvm-backend)
+   below for how it differs.
 
 This is real emulation, not a shortcut, and it has real limits — see below.
 
@@ -54,29 +57,21 @@ This is real emulation, not a shortcut, and it has real limits — see below.
   see [Containers & Guards](./containers-and-guards.md#the-raii-lifecycle), step 4.
   A container started before its dependency is up won't retroactively gain a link to
   it.
-- **One connection at a time per tunnel.** The in-guest `nc -l` listener backing a
-  tunnel serves one connection, then gets respawned for the next. Fine for
+- **One TCP connection at a time per tunnel.** The in-guest `nc -l` listener backing
+  a TCP link serves one connection, then gets respawned for the next. Fine for
   config-fetch-style traffic; not fine for a long-lived cross-container consumer
   (e.g. a Kafka consumer reading continuously from a broker on a sibling microVM).
-- **Client speaks first.** The tunnel protocol assumes the connecting side sends the
-  first bytes — matches HTTP requests and most RPC-style protocols; a server that
-  waits silently for the client to speak needs the client end to actually be the one
-  initiating data, which HTTP/REST calls naturally are.
-- **The consumer image needs `nc`/busybox.** The tunnel is implemented as a shelled-out
-  `nc` listener inside the guest. An image without it (a scratch-based image, or one
-  that stripped busybox) fails `start()` fast, with an error naming the missing
-  binary and suggesting `RIGHTSIZE_BACKEND=docker` as the workaround — verified by
-  this crate's own integration suite using `mongo:8.0` as the no-`nc` counter-example.
-- **UDP links are unsupported (Phase 1).** msb has no guest-to-guest networking at
-  all — the tunnel above is a TCP relay over `exec --stream`, with no UDP
-  equivalent. Joining a network where any member is reachable only via
-  `.with_exposed_udp_ports(...)` fails `start()` fast, the same shape as the
-  missing-`nc` case above, naming the remedy: the docker backend (its native
-  networks carry UDP between members with no per-port declaration), or publish the
-  port and read it back with `guard.get_mapped_udp_port(...)` — reaching it from
-  the host, not from a sibling guest, is the msb-compatible pattern. See
-  [Containers & Guards](./containers-and-guards.md#udp-ports) for the full UDP
-  story.
+  UDP links don't share this limit — see the dedicated section below.
+- **A TCP link's client speaks first.** The tunnel protocol assumes the connecting
+  side sends the first bytes — matches HTTP requests and most RPC-style protocols; a
+  server that waits silently for the client to speak needs the client end to
+  actually be the one initiating data, which HTTP/REST calls naturally are.
+- **The consumer image needs `nc`/busybox, for either protocol.** Both link
+  mechanisms are implemented as shelled-out `nc` inside the guest. An image without
+  it (a scratch-based image, or one that stripped busybox) fails `start()` fast,
+  with an error naming the missing binary and suggesting `RIGHTSIZE_BACKEND=docker`
+  as the workaround — verified by this crate's own integration suite using
+  `mongo:8.0` as the no-`nc` counter-example.
 - **A target that never propagates TCP close can't be detected by naive EOF.** The
   msb port-publish proxy doesn't propagate the target socket's close to the tunnel,
   so end-of-exchange is inferred from an idle window *after* the first byte arrives
@@ -90,6 +85,32 @@ on this backend, not a timing quirk that will resolve itself with retries — pi
 `RIGHTSIZE_BACKEND=docker` for a network topology this doesn't fit, or restructure the
 test to fit inside these bounds (they cover this project's own contract suite, which
 is mostly one-shot config-fetch-shaped traffic).
+
+## UDP network links on the microVM backend
+
+A container reachable only via `.with_exposed_udp_ports(...)` can be joined to a
+`Network` as a link target — the consumer's sandbox reaches `alias:guestPort` through
+an in-guest forwarder, not the TCP tunnel above.
+
+**Requirements:**
+
+- The target exposes the port with `.with_exposed_udp_ports(...)` and is started
+  *before* the consumer — same link-computation-order rule as every other link (see
+  [Limits on the microVM backend](#limits-on-the-microvm-backend) above).
+- The consumer image needs a busybox-style `nc` (with `-u` and `-e`) and `timeout`.
+  Alpine and other busybox-based images have both; Debian/Ubuntu images and
+  OpenBSD's own `nc` do not.
+
+**Behavior:** the consumer's sandbox gets one host-UDP egress rule per linked port —
+nothing broader than that, so it still can't reach an arbitrary host UDP port it
+didn't link to. Each distinct client socket through a link holds its own small relay
+for up to 60 seconds.
+
+**Limits:** a datagram must stay at or under 1472 bytes of payload — this applies to
+`.with_exposed_udp_ports(...)` just as much as to a link. A larger one permanently
+breaks the RECEIVING sandbox's entire inbound networking (every published port, not
+just the oversized one) — an msb limitation, not something this crate can guard
+against from the host side.
 
 ## Blocking public-internet access
 

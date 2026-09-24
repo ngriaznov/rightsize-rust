@@ -7,7 +7,32 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **UDP network links on microsandbox.** A container exposing UDP ports with
+  `.with_exposed_udp_ports(...)` can now be a link target on a `Network` on the
+  microsandbox backend, exactly as it already could on docker — the UDP-link rejection
+  is gone. The consumer's `msb run`/`restore` argv
+  carries one `--net-rule allow@host:udp:<port>` (or, on restore, a full
+  `--net-default deny`/`--net-rule` replacement policy) per linked UDP port, computed
+  from `Network::links_for_new_member()` BEFORE `backend.create` runs — msb cannot
+  change a running sandbox's network policy afterward. Installed as an in-guest
+  forwarder script (`nc -u -l` respawned per client, `timeout 60` per relay), not the
+  TCP path's exec-tunnel; the consumer image needs a busybox-style `nc` (`-u`/`-e`)
+  and `timeout` — a fail-fast typed error names the missing capability and the docker
+  remedy, mirroring the existing TCP no-`nc` error shape. A TCP and a UDP link on the
+  same guest port (DNS's port 53 on both) are accepted; two UDP links on one guest
+  port are rejected, same as two TCP links already were. **Datagram size
+  limit**: a payload over 1472 bytes permanently breaks the receiving sandbox's entire
+  inbound networking on msb — an upstream msb limitation, not specific to links (it
+  applies to `.with_exposed_udp_ports(...)` too). See
+  [UDP network links on the microVM backend](./docs/core-concepts/networking.md#udp-network-links-on-the-microvm-backend)
+  for the full story.
+- **`ContainerSpec::host_udp_egress_ports`.** A new public `Vec<u16>` field: the host
+  UDP ports a sandbox's network links need to reach, filled in by the core for each
+  start (never part of a checkpoint's recorded spec or the reuse identity). Code that
+  builds `ContainerSpec` with a struct literal and no `..` spread must add it;
+  `ContainerSpec::new(...)` and `..` spreads are unaffected.
 
 ## [0.7.11] - 2026-09-19
 

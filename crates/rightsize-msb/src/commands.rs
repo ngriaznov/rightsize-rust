@@ -13,10 +13,11 @@ use rightsize::model::{ContainerSpec, Protocol};
 
 /// Builds the argv for `msb run`, in the pinned order: name, memory (if set),
 /// root-disk (if a disk limit or tmpfs root is set), net (if network is disabled),
-/// ports, env, mounts, image, then `-- <command>` iff `spec.command`
-/// is `Some` — a `None` command means "run the image's default
-/// `ENTRYPOINT`/`CMD`", which requires omitting the trailing `--` entirely rather
-/// than passing it with no arguments after it.
+/// one `--net-rule` per UDP link's host egress port (if any), ports, env,
+/// mounts, image, then `-- <command>` iff `spec.command` is `Some` — a `None`
+/// command means "run the image's default `ENTRYPOINT`/`CMD`", which requires
+/// omitting the trailing `--` entirely rather than passing it with no
+/// arguments after it.
 ///
 /// A spec with `checkpoint_ref` set (built from
 /// [`rightsize::Container::from_checkpoint`]) must never reach this function —
@@ -54,6 +55,20 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
     if spec.network_disabled {
         argv.push("--net".to_string());
         argv.push("private".to_string());
+    }
+
+    // One `--net-rule` per UDP network link this member consumes — msb's
+    // default policy silently drops host-bound traffic other than DNS, and a
+    // bare `--net-rule` (no `--net` profile flag) PREPENDS to that default
+    // rather than replacing it, so public internet, DNS, and this sandbox's
+    // own published-port ingress all keep working. `host_udp_egress_ports` is
+    // already the distinct, sorted list the core computed — emitted in that
+    // order, one flag per port, for deterministic argv. Empty list (every
+    // spec with no UDP links, the overwhelming majority) leaves this argv
+    // byte-identical to before UDP links existed.
+    for port in &spec.host_udp_egress_ports {
+        argv.push("--net-rule".to_string());
+        argv.push(format!("allow@host:udp:{port}"));
     }
 
     for port in &spec.ports {
@@ -160,6 +175,13 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 ///   already rejected `--root-disk` combined with `--from-snapshot` at its own CLI
 ///   layer (see `Container::with_disk_limit`/`with_tmpfs_root`'s docs), so this
 ///   was never a combination a caller could rely on either.
+///
+/// DOES carry `spec.host_udp_egress_ports`, unlike every field above — but as a
+/// full replacement `--net-default`/`--net-rule` policy rather than `run`'s
+/// additive `--net-rule`, since `restore` has no `--net` profile flag and its
+/// own `--net-rule` only parses alongside `--net-default`/`--no-net`. See the
+/// emission site below for the three reasons the replacement policy has to
+/// spell out every direction at once.
 pub fn restore(spec: &ContainerSpec, snapshot_path: &str) -> Vec<String> {
     let mut argv = vec![
         "restore".to_string(),
@@ -176,6 +198,29 @@ pub fn restore(spec: &ContainerSpec, snapshot_path: &str) -> Vec<String> {
     for port in &spec.ports {
         argv.push("-p".to_string());
         argv.push(port_flag_value(port));
+    }
+
+    // `restore` does not carry a CLI-given `run` policy into the restored
+    // sandbox at all — it falls back to msb's own default, which is why
+    // `run`'s own `--net-rule` (above) has no counterpart in the unconditional
+    // part of this argv. `restore`'s `--net-rule` only parses together with
+    // `--net-default`/`--no-net` (no `--net` profile flag exists here), and
+    // `--net-default` sets BOTH directions at once — so a non-empty egress
+    // list needs the COMPLETE replacement policy in one shot: public internet,
+    // DNS, this member's own UDP egress ports, and (since `--net-default`
+    // covers ingress too) this sandbox's own published-port ingress, or a
+    // restored consumer would come back unable to reach its own links AND
+    // unreachable on its own published ports at once.
+    if !spec.host_udp_egress_ports.is_empty() {
+        let mut rule = "allow@public,allow@dns".to_string();
+        for port in &spec.host_udp_egress_ports {
+            rule.push_str(&format!(",allow@host:udp:{port}"));
+        }
+        rule.push_str(",allow:ingress@any");
+        argv.push("--net-default".to_string());
+        argv.push("deny".to_string());
+        argv.push("--net-rule".to_string());
+        argv.push(rule);
     }
 
     argv
@@ -565,6 +610,7 @@ mod tests {
             network_disabled: false,
             checkpoint_captured_cmdline: None,
             restore_name_candidates: None,
+            host_udp_egress_ports: Vec::new(),
         }
     }
 
@@ -908,6 +954,77 @@ mod tests {
             cmd.iter().filter(|a| a.as_str() == "-p").count(),
             1,
             "{cmd:?}"
+        );
+    }
+
+    // -- UDP network links: host_udp_egress_ports argv on run/restore --------
+
+    #[test]
+    fn run_command_omits_net_rule_entirely_when_host_udp_egress_ports_is_empty() {
+        let cmd = run(&full_spec());
+        assert!(!cmd.contains(&"--net-rule".to_string()), "{cmd:?}");
+    }
+
+    #[test]
+    fn run_command_emits_one_net_rule_flag_per_udp_egress_port_next_to_net() {
+        let mut spec = full_spec();
+        spec.network_disabled = true;
+        spec.host_udp_egress_ports = vec![40001, 40002];
+        let cmd = run(&spec);
+        assert_eq!(
+            cmd,
+            vec![
+                "run",
+                "--name",
+                "rz-abc-1",
+                "--net",
+                "private",
+                "--net-rule",
+                "allow@host:udp:40001",
+                "--net-rule",
+                "allow@host:udp:40002",
+                "-p",
+                "12345:6379",
+                "-e",
+                "A=1",
+                "--mount-file",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
+                "redis:8.6-alpine",
+                "--",
+                "redis-server",
+                "--port",
+                "6379",
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_command_omits_net_default_and_net_rule_when_host_udp_egress_ports_is_empty() {
+        let cmd = restore(&full_spec(), "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert!(!cmd.contains(&"--net-default".to_string()), "{cmd:?}");
+        assert!(!cmd.contains(&"--net-rule".to_string()), "{cmd:?}");
+    }
+
+    #[test]
+    fn restore_command_emits_the_complete_replacement_policy_for_host_udp_egress_ports() {
+        let mut spec = full_spec();
+        spec.host_udp_egress_ports = vec![40001, 40002];
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert_eq!(
+            cmd,
+            vec![
+                "restore",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "--name",
+                "rz-abc-1",
+                "-p",
+                "12345:6379",
+                "--net-default",
+                "deny",
+                "--net-rule",
+                "allow@public,allow@dns,allow@host:udp:40001,allow@host:udp:40002,\
+                 allow:ingress@any",
+            ]
         );
     }
 

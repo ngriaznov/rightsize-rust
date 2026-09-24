@@ -1110,14 +1110,33 @@ impl SandboxBackend for MsbCliBackend {
         if links.is_empty() {
             return Ok(());
         }
-        require_no_udp_links(links)?;
         require_no_duplicate_guest_ports(links)?;
         require_aliases_are_valid(links)?;
-        require_nc_available(self, handle).await?;
+
+        // Split by protocol — TCP keeps the existing exec-tunnel path
+        // untouched; UDP installs an in-guest forwarder instead (see
+        // `install_udp_forwarder`'s own doc). Each side is probed for tool
+        // availability only when this batch actually needs it, so a
+        // UDP-only batch against an image with `nc` but no `-u`/`-e` still
+        // gets the sharper UDP-specific error rather than passing the
+        // looser TCP probe and failing obscurely later.
+        let (tcp_links, udp_links) = partition_links_by_protocol(links);
+
+        if !tcp_links.is_empty() {
+            require_nc_available(self, handle).await?;
+        }
+        if !udp_links.is_empty() {
+            require_udp_nc_available(self, handle).await?;
+        }
+
         install_hosts_aliases(self, handle, links).await?;
 
-        let tunnels: Vec<ExecTunnel> = links
-            .iter()
+        for link in &udp_links {
+            install_udp_forwarder(self, handle, link).await?;
+        }
+
+        let tunnels: Vec<ExecTunnel> = tcp_links
+            .into_iter()
             .map(|link| ExecTunnel::new(self.msb.clone(), handle.id().to_string(), link.clone()))
             .collect();
         let mut handles = self.handles.lock().expect("handles mutex poisoned");
@@ -4123,12 +4142,23 @@ fn spawn_tail_drain(
     })
 }
 
-/// Rejects two siblings on the same network exposing the same guest port — installing
-/// tunnels for both would race the same in-guest listener port.
+/// Splits `links` into (TCP, UDP), each preserving `links`' own relative
+/// order — [`MsbCliBackend::install_network_links`]'s single routing
+/// decision, factored out so it has one definition instead of being
+/// re-derived at each of that method's several TCP-vs-UDP branches.
+fn partition_links_by_protocol(links: &[NetworkLink]) -> (Vec<&NetworkLink>, Vec<&NetworkLink>) {
+    links.iter().partition(|l| l.protocol == Protocol::Tcp)
+}
+
+/// Rejects two siblings on the same network exposing the same (protocol, guest
+/// port) pair — installing two listeners for it would race the same in-guest
+/// port. Keyed on protocol too, not guest port alone: a TCP and a UDP link on
+/// the SAME guest port are distinct listeners (DNS's port 53 on both
+/// protocols is the canonical example) and never collide.
 fn require_no_duplicate_guest_ports(links: &[NetworkLink]) -> Result<()> {
     let mut seen = HashSet::new();
     for link in links {
-        if !seen.insert(link.guest_port) {
+        if !seen.insert((link.protocol, link.guest_port)) {
             return Err(RightsizeError::unsupported(
                 format!(
                     "two siblings exposing the same guest port {} on one network",
@@ -4158,31 +4188,6 @@ fn require_aliases_are_valid(links: &[NetworkLink]) -> Result<()> {
                 "use a valid DNS label instead (allowed: letters, digits, '.', '_', '-')",
             ));
         }
-    }
-    Ok(())
-}
-
-/// Phase-1 fail-fast: microsandbox's emulated network links are TCP-only
-/// exec-tunnels (see [`MsbCliBackend::install_network_links`]'s own doc — a
-/// microVM has no real bridge/subnet, so this backend fakes a link with an
-/// `/etc/hosts` alias plus a relayed `nc` process piping bytes over `msb exec`,
-/// which has no UDP-datagram equivalent). Same
-/// unsupported-with-remedy error shape as [`require_nc_available`] just below —
-/// checked first, before the `nc`-availability probe even runs, since a UDP link
-/// can never be installed regardless of what the consumer image has.
-fn require_no_udp_links(links: &[NetworkLink]) -> Result<()> {
-    if links.iter().any(|l| l.protocol == Protocol::Udp) {
-        return Err(RightsizeError::unsupported_with_remedy(
-            "UDP network links on microsandbox",
-            "microsandbox",
-            "msb has no guest-to-guest networking, so rightsize's emulated links \
-             are TCP-only exec-tunnels — join this network on the docker backend \
-             instead (its native networks carry UDP between members with no \
-             per-port declaration), or publish the port with \
-             with_exposed_udp_ports(...) and read it back with \
-             get_mapped_udp_port(...), the msb-compatible pattern for reaching a \
-             UDP service from the host",
-        ));
     }
     Ok(())
 }
@@ -4238,6 +4243,205 @@ async fn install_hosts_aliases(
         )));
     }
     Ok(())
+}
+
+/// Stricter than [`require_nc_available`]: a UDP link's forwarder needs `nc`
+/// with BOTH `-u` (UDP mode) and `-e PROG` (exec a relay on accept), plus
+/// `timeout` to bound each locked relay — busybox provides all three, so this
+/// probes for exactly that combination rather than settling for a bare
+/// `command -v nc`, which a non-busybox `nc` (OpenBSD's, on Debian/Ubuntu
+/// images) would also pass despite having neither flag. busybox prints its
+/// `--help` usage to STDERR with a non-zero exit, hence `2>&1` before the
+/// `grep` — a `-q` match against stdout alone would find nothing on any
+/// busybox build.
+async fn require_udp_nc_available(
+    backend: &MsbCliBackend,
+    handle: &dyn SandboxHandle,
+) -> Result<()> {
+    let probe = backend
+        .exec(
+            handle,
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "command -v nc >/dev/null && command -v timeout >/dev/null && \
+                 nc --help 2>&1 | grep -q -- '-e PROG' && nc --help 2>&1 | grep -q -- '-u'"
+                    .to_string(),
+            ],
+        )
+        .await?;
+    if probe.exit_code != 0 {
+        return Err(RightsizeError::unsupported_with_remedy(
+            format!(
+                "UDP network links (consumer image '{}' has no busybox-style nc with \
+                 -u/-e, or no timeout)",
+                handle.spec().image
+            ),
+            "microsandbox",
+            "run this test with RIGHTSIZE_BACKEND=docker instead",
+        ));
+    }
+    Ok(())
+}
+
+/// The in-guest UDP-link forwarder, installed once per UDP link by
+/// [`install_udp_forwarder`] and launched detached — see that function's own
+/// doc for the write+launch mechanics. Takes the guest port to listen on
+/// (`$1`, `P`) and the target sibling's host port (`$2`, `HP`).
+///
+/// Busybox `nc -u -l` locks onto the FIRST client's source address forever
+/// and never forks for UDP, so serving more than one client needs a fresh
+/// listener started as soon as the current one locks onto its peer — this
+/// loop starts one, waits for it to actually EXEC into `nc` (right after
+/// `fork` the child's `/proc/<pid>/cmdline` still reads as this script's own
+/// invocation; treating THAT as "locked" piles up listeners), then waits
+/// again for its cmdline to stop containing ` -l ` — busybox `timeout` keeps
+/// the wrapped program's own pid, so a locked listener's `comm` goes back to
+/// `nc`, and only its cmdline still distinguishes "listening" from "locked
+/// onto a peer". `timeout 60` bounds each locked relay: msb's own UDP
+/// sessions expire after 60s idle, so a relay held open past that is already
+/// dead weight, and a client that keeps sending past 60s gets a fresh relay
+/// on its next datagram instead of silence. Targets the gateway's IPv4
+/// literal read from `/etc/hosts`, never the `host.microsandbox.internal`
+/// name directly — that name also resolves to an IPv6 gateway, which msb
+/// rewrites to `::1`, where the target's 127.0.0.1-bound published port is
+/// not listening.
+///
+/// Contains no double-quote character, on purpose: on Windows hosts the
+/// JDK's default `ProcessBuilder` command-line building wraps an argument in
+/// quotes without escaping ones already inside it, so a `"` anywhere in an
+/// exec argument reaches `msb.exe` mangled — this script is identical across
+/// all three libraries, including that one, so it stays quote-free here too
+/// even though this crate's own [`Command`] escapes correctly on Windows.
+/// Every variable is a number or an IP literal, so nothing here needs
+/// quoting; `: ${H:=host.microsandbox.internal}` is the fallback for when
+/// `/etc/hosts` has no IPv4 gateway line.
+const UDP_LINK_FORWARDER_SCRIPT: &str = r#"P=$1; HP=$2
+H=$(awk -v n=host.microsandbox.internal '$2 == n && $1 ~ /^[0-9.]+$/ { print $1; exit }' /etc/hosts)
+: ${H:=host.microsandbox.internal}
+while true; do
+  nc -u -l -p $P -e timeout 60 nc -u $H $HP &
+  pid=$!
+  while [ -e /proc/$pid ] && grep -q rz-udp-link /proc/$pid/cmdline 2>/dev/null; do sleep 0.01; done
+  while [ -e /proc/$pid ] && tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -q -- ' -l '; do sleep 0.05; done
+  [ -e /proc/$pid ] || sleep 0.2
+done
+"#;
+
+/// Installs and starts [`UDP_LINK_FORWARDER_SCRIPT`] for one UDP `link`
+/// inside `handle`'s guest — the msb-emulated equivalent of a TCP link's
+/// [`ExecTunnel`], but with no host-side resource and no teardown code: the
+/// forwarder is a plain guest process, and guest processes die with the
+/// sandbox. Writes the script to `/tmp/rz-udp-link-<guest_port>.sh` via a
+/// QUOTED heredoc (no shell expansion while writing — the script's own `$`
+/// variables must reach the guest literally, not get expanded by the exec's
+/// own shell) and launches it detached in the SAME exec, so one `msb exec`
+/// covers both the write and the launch. Run as a FILE, never inlined into
+/// `sh -c`: the script's own pre-exec detection greps the launched child's
+/// `/proc/<pid>/cmdline` for `rz-udp-link`, which only the script's own path
+/// puts there. `/tmp` is tmpfs on every image msb boots, so a checkpoint
+/// reboot's link replay rewrites the script fresh in the rebooted guest
+/// rather than finding a stale one from before the reboot.
+async fn install_udp_forwarder(
+    backend: &MsbCliBackend,
+    handle: &dyn SandboxHandle,
+    link: &NetworkLink,
+) -> Result<()> {
+    let guest_port = link.guest_port;
+    let target_host_port = link.target_host_port;
+    let script_path = format!("/tmp/rz-udp-link-{guest_port}.sh");
+    let log_path = format!("/tmp/rz-udp-link-{guest_port}.log");
+
+    let install = format!(
+        "cat > {script_path} <<'RZ_UDP_LINK_EOF'\n{UDP_LINK_FORWARDER_SCRIPT}RZ_UDP_LINK_EOF\n\
+         nohup sh {script_path} {guest_port} {target_host_port} >{log_path} 2>&1 &"
+    );
+    let result = backend
+        .exec(handle, &["sh".to_string(), "-c".to_string(), install])
+        .await?;
+    if result.exit_code != 0 {
+        return Err(RightsizeError::Backend(format!(
+            "failed to install the UDP link forwarder for guest port {guest_port} in {}: {}",
+            handle.id(),
+            result.stderr
+        )));
+    }
+
+    await_udp_forwarder_bound(
+        backend,
+        handle,
+        guest_port,
+        &log_path,
+        UDP_FORWARDER_BIND_TIMEOUT,
+        UDP_FORWARDER_BIND_POLL,
+    )
+    .await
+}
+
+/// How often [`await_udp_forwarder_bound`] re-polls, and the total budget it
+/// gives the forwarder to reach its first `nc -u -l` bind, at the production
+/// install call site above — generous enough for a freshly-booted guest's
+/// own `msb exec` round trip, short enough that a genuinely broken forwarder
+/// fails `start()` fast rather than stalling it.
+const UDP_FORWARDER_BIND_POLL: Duration = Duration::from_millis(100);
+const UDP_FORWARDER_BIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Polls `/proc/net/udp`/`udp6` for `guest_port` bound as a UDP socket — `msb
+/// exec` returning from the install step only confirms the LAUNCH, not that
+/// the backgrounded forwarder has actually reached its first bind, so
+/// readiness has to be read back from the guest's own kernel state. The
+/// hex-port match is the guest kernel's own `/proc/net/udp` convention
+/// (`<local addr>:<PORT in 4 uppercase hex digits>`, e.g. 5000 -> `1388`),
+/// matched against the address field's last 5 characters so it never depends
+/// on which local address the kernel reports. `timeout` and `poll_interval`
+/// are parameters, not constants, so a test can shrink them; the production
+/// call site above passes [`UDP_FORWARDER_BIND_TIMEOUT`] and
+/// [`UDP_FORWARDER_BIND_POLL`], the single source of truth for those values.
+async fn await_udp_forwarder_bound(
+    backend: &MsbCliBackend,
+    handle: &dyn SandboxHandle,
+    guest_port: u16,
+    log_path: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    let probe_script = format!(
+        "awk -v p=':{guest_port:04X}' 'NR>1 && substr($2, length($2)-4) == p {{f=1}} \
+         END {{exit !f}}' /proc/net/udp /proc/net/udp6"
+    );
+    let deadline = Instant::now() + timeout;
+    loop {
+        let probe = backend
+            .exec(
+                handle,
+                &["sh".to_string(), "-c".to_string(), probe_script.clone()],
+            )
+            .await?;
+        if probe.exit_code == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let tail = backend
+                .exec(
+                    handle,
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("tail -c 2000 {log_path} 2>/dev/null"),
+                    ],
+                )
+                .await
+                .map(|r| r.stdout)
+                .unwrap_or_default();
+            return Err(RightsizeError::Backend(format!(
+                "UDP link forwarder for guest port {guest_port} in {} never bound within \
+                 {timeout:?} — forwarder log tail: {}",
+                handle.id(),
+                tail.trim()
+            )));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 #[cfg(test)]
@@ -7596,6 +7800,34 @@ mod tests {
     }
 
     #[test]
+    fn partition_links_by_protocol_splits_a_mixed_batch_tcp_still_gets_its_own_path() {
+        let tcp = NetworkLink {
+            alias: "redis".to_string(),
+            guest_port: 6379,
+            target_host_port: 1,
+            protocol: Protocol::Tcp,
+        };
+        let udp = NetworkLink {
+            alias: "udp-echo".to_string(),
+            guest_port: 9153,
+            target_host_port: 2,
+            protocol: Protocol::Udp,
+        };
+        let links = vec![tcp.clone(), udp.clone()];
+        let (tcp_links, udp_links) = partition_links_by_protocol(&links);
+        assert_eq!(
+            tcp_links,
+            vec![&tcp],
+            "the TCP link must route to the exec-tunnel path"
+        );
+        assert_eq!(
+            udp_links,
+            vec![&udp],
+            "the UDP link must route to the forwarder path"
+        );
+    }
+
+    #[test]
     fn require_no_duplicate_guest_ports_rejects_a_genuine_duplicate() {
         let links = vec![
             NetworkLink {
@@ -7634,6 +7866,49 @@ mod tests {
         assert!(require_no_duplicate_guest_ports(&links).is_ok());
     }
 
+    // -- duplicate guest ports are keyed on (protocol, guest port) --------------
+
+    #[test]
+    fn require_no_duplicate_guest_ports_allows_the_same_guest_port_on_tcp_and_udp() {
+        // DNS's port 53 on both protocols at once — the canonical case a
+        // protocol-blind key would wrongly reject.
+        let links = vec![
+            NetworkLink {
+                alias: "dns".to_string(),
+                guest_port: 53,
+                target_host_port: 1,
+                protocol: Protocol::Tcp,
+            },
+            NetworkLink {
+                alias: "dns".to_string(),
+                guest_port: 53,
+                target_host_port: 2,
+                protocol: Protocol::Udp,
+            },
+        ];
+        assert!(require_no_duplicate_guest_ports(&links).is_ok());
+    }
+
+    #[test]
+    fn require_no_duplicate_guest_ports_rejects_the_same_guest_port_on_udp_twice() {
+        let links = vec![
+            NetworkLink {
+                alias: "a".to_string(),
+                guest_port: 53,
+                target_host_port: 1,
+                protocol: Protocol::Udp,
+            },
+            NetworkLink {
+                alias: "b".to_string(),
+                guest_port: 53,
+                target_host_port: 2,
+                protocol: Protocol::Udp,
+            },
+        ];
+        let err = require_no_duplicate_guest_ports(&links).unwrap_err();
+        assert!(err.to_string().contains("53"), "{err}");
+    }
+
     #[test]
     fn require_aliases_are_valid_accepts_dns_label_charset() {
         let links = vec![NetworkLink {
@@ -7657,47 +7932,235 @@ mod tests {
         assert!(err.to_string().contains("bad'alias"), "{err}");
     }
 
-    // -- UDP link fail-fast (spec item 8) --------------------------------------
+    // -- UDP network links: probe, install, readiness ---------------------------
 
-    #[test]
-    fn require_no_udp_links_rejects_when_any_link_is_udp() {
-        let links = vec![
-            NetworkLink {
-                alias: "tcp-sibling".to_string(),
-                guest_port: 8000,
-                target_host_port: 1,
-                protocol: Protocol::Tcp,
-            },
-            NetworkLink {
-                alias: "dns".to_string(),
-                guest_port: 53,
-                target_host_port: 2,
-                protocol: Protocol::Udp,
-            },
-        ];
-        let err = require_no_udp_links(&links).unwrap_err();
+    /// A stub `msb` that logs every invocation's full argv, one element per
+    /// line, to `calls.log` beside itself and always exits `exit_code` — for
+    /// the UDP-link tests below, where a single fixed answer for every exec
+    /// (install, probe, or readiness poll alike) is enough to drive the
+    /// behavior under test. `printf '%s\n' "$@"`, never `echo "$@"` (see
+    /// [`write_argv_logging_stub`]): the install exec's own argument embeds a
+    /// literal `\0` (`UDP_LINK_FORWARDER_SCRIPT`'s `tr '\0' ' '`), which this
+    /// host's `/bin/sh` echo builtin interprets as a backslash escape —
+    /// corrupting the very byte a test needs to assert on — while `printf`'s
+    /// `%s` never interprets its argument's content.
+    #[cfg(unix)]
+    fn write_fixed_exit_stub(dir: &Path, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-fixed-exit.sh");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$(dirname \"$0\")/calls.log\"\nexit {exit_code}\n"
+        );
+        std::fs::write(&script, body).expect("write fixed-exit stub msb script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fixed-exit stub msb script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_udp_forwarder_writes_the_exact_script_and_launch_command_then_confirms_bound()
+    {
+        // Exits 0 unconditionally: the install exec succeeds, and the very
+        // first readiness poll right after it reports "bound" immediately —
+        // proving the happy path needs exactly one install exec plus one
+        // readiness exec, with the exact script/launch text this design pins.
+        let dir = unique_test_dir("install-udp-forwarder");
+        let script = write_fixed_exit_stub(&dir, 0);
+        let backend = MsbCliBackend::new(script);
+        let handle = Handle {
+            spec: ContainerSpec::new("rz-udp-consumer-1", "alpine:3.19", "run-1"),
+        };
+        let link = NetworkLink {
+            alias: "udp-echo".to_string(),
+            guest_port: 9153,
+            target_host_port: 41000,
+            protocol: Protocol::Udp,
+        };
+
+        install_udp_forwarder(&backend, &handle, &link)
+            .await
+            .expect("install must succeed against a stub that answers every exec 0");
+
+        // The stub's `echo "$@"` reproduces each exec's own embedded newlines
+        // (the install script's heredoc body in particular) verbatim into
+        // `calls.log`, so this reads the log as one block rather than
+        // splitting it into "one line per call".
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            log.contains("cat > /tmp/rz-udp-link-9153.sh <<'RZ_UDP_LINK_EOF'"),
+            "{log}"
+        );
+        assert!(
+            log.contains(UDP_LINK_FORWARDER_SCRIPT.trim_end()),
+            "the exact forwarder script must appear in the install exec: {log}"
+        );
+        assert!(
+            log.contains(
+                "nohup sh /tmp/rz-udp-link-9153.sh 9153 41000 >/tmp/rz-udp-link-9153.log 2>&1 &"
+            ),
+            "the exact launch command must appear in the install exec: {log}"
+        );
+        assert_eq!(
+            log.matches("awk -v p=':23C1'").count(),
+            1,
+            "the readiness poll must probe the guest port's 4-hex-digit form \
+             (9153 -> 23C1) and confirm bound on its very first try against a \
+             stub that always exits 0: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn await_udp_forwarder_bound_times_out_with_a_descriptive_error_including_the_log_tail() {
+        // Exits nonzero unconditionally: the readiness poll never confirms a
+        // bind, so this exercises the timeout branch specifically. A short
+        // timeout/poll interval (rather than the production constants) keeps
+        // this fast without changing what the timeout branch proves.
+        let dir = unique_test_dir("await-udp-forwarder-timeout");
+        let script = write_fixed_exit_stub(&dir, 1);
+        let backend = MsbCliBackend::new(script);
+        let handle = Handle {
+            spec: ContainerSpec::new("rz-udp-consumer-2", "alpine:3.19", "run-2"),
+        };
+
+        let err = await_udp_forwarder_bound(
+            &backend,
+            &handle,
+            9153,
+            "/tmp/rz-udp-link-9153.log",
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("9153"), "{msg}");
+        assert!(msg.contains("never bound"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn require_udp_nc_available_rejects_an_image_whose_probe_exits_nonzero() {
+        let dir = unique_test_dir("require-udp-nc-fail");
+        let script = write_fixed_exit_stub(&dir, 1);
+        let backend = MsbCliBackend::new(script);
+        let handle = Handle {
+            spec: ContainerSpec::new("rz-udp-consumer-3", "debian:12", "run-3"),
+        };
+
+        let err = require_udp_nc_available(&backend, &handle)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("UDP"), "{msg}");
         assert!(
-            msg.contains("docker") && msg.contains("get_mapped_udp_port"),
+            msg.contains("debian:12"),
+            "the error must name the image: {msg}"
+        );
+        assert!(
+            msg.contains("docker"),
             "the error must name a remedy: {msg}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn require_no_udp_links_allows_an_all_tcp_batch() {
-        let links = vec![NetworkLink {
-            alias: "redis".to_string(),
-            guest_port: 6379,
-            target_host_port: 1,
-            protocol: Protocol::Tcp,
-        }];
-        assert!(require_no_udp_links(&links).is_ok());
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn require_udp_nc_available_accepts_an_image_whose_probe_exits_zero() {
+        let dir = unique_test_dir("require-udp-nc-ok");
+        let script = write_fixed_exit_stub(&dir, 0);
+        let backend = MsbCliBackend::new(script);
+        let handle = Handle {
+            spec: ContainerSpec::new("rz-udp-consumer-4", "alpine:3.19", "run-4"),
+        };
+
+        require_udp_nc_available(&backend, &handle)
+            .await
+            .expect("a probe that exits 0 must pass");
+
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            log.contains("-e PROG") && log.contains("-u"),
+            "the probe must check for both -e PROG and -u: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn require_no_udp_links_allows_an_empty_batch() {
-        assert!(require_no_udp_links(&[]).is_ok());
+    /// Every exec the UDP-link install path issues — the busybox-`nc` probe,
+    /// the forwarder script's write+launch, the readiness poll, and (on
+    /// timeout) the log tail — must stay double-quote free: see
+    /// [`UDP_LINK_FORWARDER_SCRIPT`]'s own doc for why a bare `"` in an exec
+    /// argument is unsafe (it reaches a Windows `msb.exe` mangled). Runs the
+    /// path twice against [`write_fixed_exit_stub`]: exit 0 drives the happy
+    /// path (probe, write+launch, first readiness poll all succeed
+    /// immediately); exit 1 with a short timeout drives the readiness poll to
+    /// time out and forces the log-tail exec too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn udp_link_install_path_exec_arguments_contain_no_double_quote() {
+        assert!(
+            !UDP_LINK_FORWARDER_SCRIPT.contains('"'),
+            "the forwarder script constant itself must stay double-quote free: \
+             {UDP_LINK_FORWARDER_SCRIPT}"
+        );
+
+        let dir = unique_test_dir("udp-install-no-quotes-ok");
+        let script = write_fixed_exit_stub(&dir, 0);
+        let backend = MsbCliBackend::new(script);
+        let handle = Handle {
+            spec: ContainerSpec::new("rz-udp-consumer-5", "alpine:3.19", "run-5"),
+        };
+        let link = NetworkLink {
+            alias: "udp-echo".to_string(),
+            guest_port: 9154,
+            target_host_port: 41001,
+            protocol: Protocol::Udp,
+        };
+
+        require_udp_nc_available(&backend, &handle)
+            .await
+            .expect("a probe that exits 0 must pass");
+        install_udp_forwarder(&backend, &handle, &link)
+            .await
+            .expect("install must succeed against a stub that answers every exec 0");
+
+        let happy_log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            !happy_log.contains('"'),
+            "no exec argument from the probe, script write, launch or readiness poll \
+             may contain a double quote: {happy_log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let timeout_dir = unique_test_dir("udp-install-no-quotes-timeout");
+        let timeout_script = write_fixed_exit_stub(&timeout_dir, 1);
+        let timeout_backend = MsbCliBackend::new(timeout_script);
+        let _ = await_udp_forwarder_bound(
+            &timeout_backend,
+            &handle,
+            9154,
+            "/tmp/rz-udp-link-9154.log",
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+
+        let timeout_log = std::fs::read_to_string(timeout_dir.join("calls.log")).unwrap();
+        assert!(
+            !timeout_log.contains('"'),
+            "the readiness poll and its log-tail exec on timeout must stay \
+             double-quote free too: {timeout_log}"
+        );
+        let _ = std::fs::remove_dir_all(&timeout_dir);
     }
 
     #[test]

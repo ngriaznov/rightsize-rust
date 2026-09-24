@@ -184,18 +184,16 @@ UDP ports is therefore vacuously ready under the default wait** (there is nothin
 probe). If you're starting a UDP-only service, supply an explicit
 `.waiting_for(Wait::for_log_message(...))` strategy instead of relying on the default.
 
-**Unsupported on microsandbox network links.** A member reachable only via a
-UDP-exposed port cannot be a link target on an msb-backed
-[`Network`](./networking.md) — msb has no guest-to-guest networking at all, and
-rightsize's emulated links (`/etc/hosts` alias + an exec-tunneled relay) only ever
-carry TCP. Joining an msb network with a UDP-exposed member fails `start()` fast,
-before any tunnel work, naming the remedy: run on the docker backend instead (its
-native networks carry UDP between members with no per-port declaration at all), or
-publish the port with `.with_exposed_udp_ports(...)` and read it back with
-`get_mapped_udp_port(...)` — the msb-compatible pattern for reaching a UDP service
-from the host. Docker itself has no such limitation: its native networks resolve
-aliases and carry UDP between members regardless of protocol, with no code path in
-this crate even needing to look at it.
+**A UDP-exposed member CAN be a link target on an msb-backed
+[`Network`](./networking.md).** msb has no guest-to-guest networking at all, so
+rightsize emulates the link with an in-guest forwarder, distinct from the TCP
+tunnel `.with_exposed_ports(...)`-only members get — see
+[UDP network links on the microVM backend](./networking.md#udp-network-links-on-the-microvm-backend)
+for the requirements (a busybox-style `nc`/`timeout` in the consumer image) and the
+datagram size limit that applies to every UDP path on msb, links included. Docker's
+native networks resolve aliases and carry UDP between members regardless of
+protocol, with no per-port declaration and no code path in this crate even needing
+to look at it.
 
 ## The `OnceCell` shared-container recipe
 
