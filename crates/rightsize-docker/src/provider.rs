@@ -114,31 +114,56 @@ fn probe_linux_daemon_once(target: &std::path::Path) -> std::io::Result<bool> {
 /// body) is a 2xx reply whose JSON body deserializes into a
 /// [`crate::json::VersionResponse`] with `os` equal to `"linux"`, case-insensitively.
 /// Never panics: a non-2xx status, a response with no blank-line header/body
-/// separator, or a body that doesn't deserialize all fall through to `false` the same
-/// way a connect failure or timeout does one layer up in [`probe_linux_daemon`].
+/// separator, a malformed chunked body, or a body that doesn't deserialize all fall
+/// through to `false` the same way a connect failure or timeout does one layer up in
+/// [`probe_linux_daemon`].
 fn response_reports_linux(response: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(response);
-    let status_line = text.lines().next().unwrap_or_default();
-    let is_2xx_status = status_line
-        .split_whitespace()
-        .nth(1)
+    let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&response[..header_end]);
+    let mut lines = head.lines();
+    let is_2xx_status = lines
+        .next()
+        .and_then(|status_line| status_line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .map(|code| (200..300).contains(&code))
-        .unwrap_or(false);
+        .is_some_and(|code| (200..300).contains(&code));
     if !is_2xx_status {
         return false;
     }
-    // The request sent `Connection: close`, so `probe_linux_daemon_once` reads to EOF
-    // rather than honoring `Content-Length`/chunked framing — everything after the
-    // blank line ending the header block is the whole body, no dechunking needed
-    // (`GET /version` never comes back chunked on a real daemon).
-    let Some(header_end) = text.find("\r\n\r\n") else {
-        return false;
+
+    let mut chunked = false;
+    let mut content_length = None;
+    for (name, value) in lines.filter_map(|line| line.split_once(':')) {
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value.to_ascii_lowercase().contains("chunked");
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse::<usize>().ok();
+        }
+    }
+
+    // The request sent `Connection: close` and `probe_linux_daemon_once` read to EOF,
+    // but the body can still be chunked: Docker Engine 29.x answers `GET /version`
+    // with `Transfer-Encoding: chunked`, while older engines send it plain.
+    let raw_body = &response[header_end + 4..];
+    let body: std::borrow::Cow<'_, [u8]> = if chunked {
+        let mut reader = raw_body;
+        match crate::backend::blocking_read_chunked_body(&mut reader) {
+            Ok(body) => body.into(),
+            Err(_) => return false,
+        }
+    } else {
+        match content_length {
+            Some(len) => match raw_body.get(..len) {
+                Some(body) => body.into(),
+                None => return false,
+            },
+            None => raw_body.into(),
+        }
     };
-    let body = &text[header_end + 4..];
-    serde_json::from_str::<crate::json::VersionResponse>(body)
-        .map(|version| version.os.eq_ignore_ascii_case("linux"))
-        .unwrap_or(false)
+    serde_json::from_slice::<crate::json::VersionResponse>(&body)
+        .is_ok_and(|version| version.os.eq_ignore_ascii_case("linux"))
 }
 
 #[cfg(test)]
@@ -189,6 +214,76 @@ mod tests {
     #[test]
     fn response_reports_linux_is_false_for_a_non_2xx_status() {
         let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"Os\":\"linux\"}";
+        assert!(!response_reports_linux(response));
+    }
+
+    #[test]
+    fn response_reports_linux_honors_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"Os\":\"linux\"}";
+        assert!(response_reports_linux(response));
+    }
+
+    /// The response shape Docker Engine 29.8 (Docker Desktop 4.91) actually sends for
+    /// `GET /version`: these headers verbatim (including `Transfer-Encoding: chunked`
+    /// and the `Ostype` header), and a real-shaped JSON body split into `chunk_sizes`
+    /// chunks (the last chunk takes whatever is left).
+    fn chunked_version_response(os: &str, chunk_sizes: &[usize]) -> Vec<u8> {
+        let body = format!(
+            "{{\"Platform\":{{\"Name\":\"Docker Desktop 4.91.0 (239619)\"}},\"Version\":\"29.8.0\",\
+             \"ApiVersion\":\"1.56\",\"MinAPIVersion\":\"1.40\",\"Os\":\"{os}\",\"Arch\":\"arm64\",\
+             \"KernelVersion\":\"6.12.54-linuxkit\",\"BuildTime\":\"2026-09-02T10:11:12.000000000+00:00\"}}"
+        );
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nApi-Version: 1.56\r\nContent-Type: application/json\r\n\
+             Date: Thu, 24 Sep 2026 07:02:11 GMT\r\nDocker-Experimental: false\r\n\
+             Ostype: {os}\r\nServer: Docker/29.8.0 ({os})\r\nConnection: close\r\n\
+             Transfer-Encoding: chunked\r\n\r\n"
+        )
+        .into_bytes();
+        let mut rest = body.as_bytes();
+        for (i, &size) in chunk_sizes.iter().enumerate() {
+            let size = if i + 1 == chunk_sizes.len() {
+                rest.len()
+            } else {
+                size
+            };
+            let (chunk, tail) = rest.split_at(size);
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+            rest = tail;
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    #[test]
+    fn response_reports_linux_is_true_for_a_chunked_linux_version_body() {
+        assert!(response_reports_linux(&chunked_version_response(
+            "linux",
+            &[0]
+        )));
+    }
+
+    #[test]
+    fn response_reports_linux_is_true_when_the_chunked_body_spans_several_chunks() {
+        assert!(response_reports_linux(&chunked_version_response(
+            "linux",
+            &[17, 40, 0]
+        )));
+    }
+
+    #[test]
+    fn response_reports_linux_is_false_for_a_chunked_windows_version_body() {
+        assert!(!response_reports_linux(&chunked_version_response(
+            "windows",
+            &[0]
+        )));
+    }
+
+    #[test]
+    fn response_reports_linux_is_false_for_a_malformed_chunk_size() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n{\"Os\":\"linux\"}\r\n0\r\n\r\n";
         assert!(!response_reports_linux(response));
     }
 
@@ -280,6 +375,32 @@ mod tests {
         });
 
         assert!(!probe_linux_daemon(&sock_path));
+        server.join().expect("fixture server thread must not panic");
+    }
+
+    /// A fixture daemon answering `GET /version` the way Docker Engine 29.8 does, with a
+    /// chunked body, must be reported supported end to end through the real
+    /// blocking-socket probe.
+    #[cfg(unix)]
+    #[test]
+    fn probe_linux_daemon_is_true_when_the_fixture_daemon_answers_chunked() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = blocking_tempdir_shim::TempDir::new();
+        let sock_path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fixture socket");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture connection");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(&chunked_version_response("linux", &[0]))
+                .expect("write fixture response");
+        });
+
+        assert!(probe_linux_daemon(&sock_path));
         server.join().expect("fixture server thread must not panic");
     }
 

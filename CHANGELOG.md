@@ -34,6 +34,16 @@ reaches its first tagged release.
   builds `ContainerSpec` with a struct literal and no `..` spread must add it;
   `ContainerSpec::new(...)` and `..` spreads are unaffected.
 
+### Fixed
+
+- **Docker backend detection on newer engines.** Docker Engine 29.x (Docker Desktop
+  4.91 and later) answers the backend's `GET /version` support probe with a
+  `Transfer-Encoding: chunked` body, which the probe parsed as raw JSON — so
+  `RIGHTSIZE_BACKEND=docker` reported "no supported backend" with a Linux daemon
+  running. The probe now de-chunks the body (and honors `Content-Length`) before
+  reading `"Os"`; a daemon serving Windows containers is still rejected, and the
+  probe keeps its 2-second bound.
+
 ## [0.7.11] - 2026-09-19
 
 ### Added

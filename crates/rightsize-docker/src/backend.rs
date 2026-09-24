@@ -1128,15 +1128,15 @@ fn blocking_get_body_once(socket_path: &std::path::Path, path: &str) -> std::io:
 
 /// Dechunks an HTTP `Transfer-Encoding: chunked` body from `reader` — the blocking
 /// counterpart to `client::read_chunked_body`, needed because [`blocking_get_body`]
-/// runs on a plain OS thread with no Tokio runtime available. Same framing: a hex
+/// and the provider's `GET /version` support probe run where no Tokio runtime is
+/// available. Generic over [`std::io::BufRead`] so the probe, which has already read
+/// the whole response into memory, can hand it a byte slice. Same framing: a hex
 /// chunk-size line, that many bytes, a trailing `\r\n`, repeated until a zero-size
 /// chunk (optionally followed by trailer headers, drained and discarded) ends the
 /// body.
-fn blocking_read_chunked_body(
-    reader: &mut std::io::BufReader<crate::stream::BlockingDockerStream>,
+pub(crate) fn blocking_read_chunked_body<R: std::io::BufRead>(
+    reader: &mut R,
 ) -> std::io::Result<Vec<u8>> {
-    use std::io::{BufRead, Read};
-
     let mut out = Vec::new();
     loop {
         let mut size_line = String::new();
@@ -1176,10 +1176,10 @@ fn blocking_read_chunked_body(
 /// analogue of [`DockerClient::request`], deliberately NOT reusing any of that async
 /// client's code (which is all [`crate::stream::DockerStream`]-shaped, tokio-based):
 /// this runs on a plain OS thread with no Tokio runtime available, so it needs its own
-/// blocking transport. Doesn't need to handle chunked responses — the
-/// only calls made here (`stop`, `force=true remove`) return small `Content-Length`
-/// (or empty) bodies in practice — so this reads until the peer closes and returns
-/// whatever arrived, without trying to interpret framing at all.
+/// blocking transport. Doesn't need to handle chunked responses: the only calls made
+/// here (`stop`, `force=true remove`) are fire-and-forget, so this reads until the peer
+/// closes and discards whatever arrived, chunked or not, without interpreting framing
+/// at all.
 ///
 /// On Windows this runs [`blocking_request_once`] under
 /// [`crate::stream::run_with_deadline`] instead of calling it directly: a Windows
