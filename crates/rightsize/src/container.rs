@@ -1923,7 +1923,7 @@ impl ContainerGuard {
     /// **On microsandbox, this value can change after [`Self::checkpoint`]/
     /// [`Self::checkpoint_named`]**: that backend's checkpoint mechanism reboots
     /// the sandbox under a freshly minted name rather than this one (see
-    /// [`Self::checkpoint_core`]'s own doc) — the sandbox name was never a
+    /// `Self::checkpoint_core`'s own doc) — the sandbox name was never a
     /// stable identifier across a checkpoint on that backend, only an
     /// implementation detail, so this getter's return value tracking that is
     /// documented behavior, not a signature change.
@@ -2151,7 +2151,7 @@ impl ContainerGuard {
     /// down before the new one was attempted).
     ///
     /// The tmpfs-root refusal below (see
-    /// [`Self::ensure_checkpoint_target_survives_a_stop`]) runs BEFORE any of
+    /// `Self::ensure_checkpoint_target_survives_a_stop`) runs BEFORE any of
     /// that replace-removal work — a tmpfs-root re-checkpoint that were instead
     /// refused only once it reached the backend's own `create_checkpoint` would
     /// have already best-effort destroyed the previous same-name entry above,

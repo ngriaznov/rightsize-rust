@@ -822,7 +822,7 @@ impl SandboxBackend for DockerBackend {
     /// A 200 means the tagged image still exists; a 404 is a definite "not
     /// there." Any OTHER status (or a transport-level request failure, via the
     /// `?` above) surfaces as an error — this SPI forbids a probe failure from
-    /// resolving to "absent," unlike [`Self::pull_if_missing`]'s own inspect,
+    /// resolving to "absent," unlike `Self::pull_if_missing`'s own inspect,
     /// which only reacts to affirmatively-404 and doesn't fail loudly on
     /// inspect trouble.
     async fn has_checkpoint(&self, checkpoint_ref: &str) -> Result<bool> {

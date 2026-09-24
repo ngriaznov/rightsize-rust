@@ -48,7 +48,7 @@ macro_rules! msb_version {
     };
 }
 
-/// The pinned microsandbox release this crate provisions. Bumping [`msb_version`] is
+/// The pinned microsandbox release this crate provisions. Bumping `msb_version` is
 /// the only change needed to move to a newer msb — the release URL, asset names,
 /// checksums, and the install-dir path are all derived from it.
 pub const MSB_VERSION: &str = msb_version!();

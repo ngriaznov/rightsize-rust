@@ -11,8 +11,8 @@
 //! exits — typically within seconds, exit 0 on success — while the sandbox keeps
 //! booting in the background and reaches `Running` on its own (verified live). So
 //! `try_restore_and_await_running` waits for that process to exit (classifying a
-//! nonzero exit's output through the same [`PreRunningFailure`] cascade `run` uses,
-//! plus one restore-only transient — see [`is_restore_access_denied`]), then polls
+//! nonzero exit's output through the same `PreRunningFailure` cascade `run` uses,
+//! plus one restore-only transient — see `is_restore_access_denied`), then polls
 //! `msb ls` for `Running` the same way the attached path does.
 //!
 //! **`Running` is not the end of the story, though.** A restored sandbox reaches
@@ -23,12 +23,12 @@
 //! doing. So a third phase re-starts it: `try_restore_and_await_running` spawns
 //! `msb exec [-e K=V]... <name> -- <argv>` (see `commands::exec_workload`) as a
 //! LONG-LIVED attached child and hands IT back as this boot's live child — a
-//! restored sandbox's [`HandleState::attached`] is `Some` again, exactly like an
+//! restored sandbox's `HandleState::attached` is `Some` again, exactly like an
 //! ordinary `run` boot's, so child-exit-based death detection, `stop()`'s reap,
 //! and every other place that already treats `attached` uniformly needs no
 //! changes at all. `<argv>` is the checkpoint's own explicit `command` when it has
 //! one, else the guest cmdline `create_checkpoint`'s own capture step recovered
-//! at checkpoint time (see [`msb_checkpoint_cycle`]) — a checkpoint with neither
+//! at checkpoint time (see `msb_checkpoint_cycle`) — a checkpoint with neither
 //! fails the restore outright with a typed error rather than booting silently
 //! idle.
 //!
@@ -1028,7 +1028,7 @@ impl SandboxBackend for MsbCliBackend {
     }
 
     /// Runs `cmd` in the guest, retrying while msb reports it cannot reach the guest
-    /// agent's endpoint yet (see [`is_agent_endpoint_not_ready`]). A sandbox is
+    /// agent's endpoint yet (see `is_agent_endpoint_not_ready`). A sandbox is
     /// `Running` before that endpoint necessarily exists, so an exec issued immediately
     /// after `start()` can arrive first; the retry closes that window rather than
     /// leaving it for every caller to discover. Only that one signature is retried —
@@ -1055,11 +1055,11 @@ impl SandboxBackend for MsbCliBackend {
 
     /// A fresh `msb logs <name> --tail 1000` invocation, same on every platform. This
     /// is the workload's own output, as distinct from the attached `msb run` child's
-    /// pipe (drained in [`spawn_and_await_running`] into a tail kept only for
+    /// pipe (drained in `spawn_and_await_running` into a tail kept only for
     /// pre-`Running` crash diagnostics): on Windows the attached process does not relay
     /// guest stdout at all, while `msb logs` does everywhere, so this is the only
     /// channel this method can source from. Never errors on a missing/removed sandbox —
-    /// [`invoke_standalone`] only enforces spawn success and the timeout, not the exit
+    /// `invoke_standalone` only enforces spawn success and the timeout, not the exit
     /// code, so a failing `msb logs` call yields whatever (possibly empty) stdout it
     /// produced rather than an `Err`.
     async fn logs(&self, handle: &dyn SandboxHandle) -> Result<String> {
@@ -1076,10 +1076,10 @@ impl SandboxBackend for MsbCliBackend {
     /// relays a single line to its stdout pipe while the sandbox is Running (confirmed
     /// against a real `windows-2025` hosted runner) — a live-follow child can never
     /// deliver on that channel there, so this dispatches to
-    /// [`crate::watchdog::spawn_follow_polling`] instead of the POSIX pipe-follow path.
+    /// `crate::watchdog::spawn_follow_polling` instead of the POSIX pipe-follow path.
     /// Everywhere else, `msb logs -f`'s pipe carries lines live and only its
     /// never-exits-on-its-own defect needs working around (see
-    /// [`crate::watchdog::spawn_follow`]).
+    /// `crate::watchdog::spawn_follow`).
     async fn follow_logs(
         &self,
         handle: &dyn SandboxHandle,
@@ -1288,17 +1288,17 @@ impl SandboxBackend for MsbCliBackend {
     /// not grant breakaway — so `CreateProcess` is refused outright, even though
     /// msb's own `persist_start` stage has ALREADY inserted the candidate's DB
     /// record by the time that spawn runs. Retrying the SAME candidate (as this
-    /// method used to, via [`spawn_and_await_running`]'s own one-shot policy)
+    /// method used to, via `spawn_and_await_running`'s own one-shot policy)
     /// therefore never recovers — it just converts the access-denied into msb's
     /// own "already exists" refusal on the retry, burning a whole candidate per
     /// occurrence and exhausting the batch. So this method's own `reboot`
-    /// closure now calls [`spawn_and_await_reboot_restore`] instead, which
+    /// closure now calls `spawn_and_await_reboot_restore` instead, which
     /// surfaces the access-denied class as its own outcome with NO inline
-    /// same-name retry, and [`reboot_with_already_exists_retry`] now advances to
+    /// same-name retry, and `reboot_with_already_exists_retry` now advances to
     /// the next candidate on that outcome exactly as it already does for msb's
     /// own "already exists." Once this reboot has seen access-denied once, every
     /// REMAINING attempt of the SAME reboot launches through
-    /// [`MsbCliBackend::restore_broker`] (Windows only; the WMI-launched process
+    /// `MsbCliBackend::restore_broker` (Windows only; the WMI-launched process
     /// runs outside this process's own job hierarchy, so its own breakaway spawn
     /// is never blocked by a job this process never put it in — live-verified).
     /// The first attempt of every reboot is always direct, regardless of
@@ -1309,15 +1309,15 @@ impl SandboxBackend for MsbCliBackend {
     /// --from-snapshot` with this dedicated `restore` command, and no longer
     /// takes `--disk-only` for a disk-scope snapshot — see `commands::restore`'s
     /// own doc for what changed and why) — see `msb_checkpoint_cycle`/
-    /// [`reboot_with_already_exists_retry`] for the orchestration this
+    /// `reboot_with_already_exists_retry` for the orchestration this
     /// method's own `reboot` closure walks candidates underneath, and their
     /// unit tests for the failure paths. Runs on a blocking thread, like every
     /// other multi-step msb invocation in this backend. The re-boot reuses
-    /// [`spawn_and_await_reboot_restore`] (this backend's own normal boot path,
-    /// [`spawn_and_await_running`], for everything BUT the access-denied policy
+    /// `spawn_and_await_reboot_restore` (this backend's own normal boot path,
+    /// `spawn_and_await_running`, for everything BUT the access-denied policy
     /// above — see that function's own doc for the two differences) — already
     /// the shape `Container::from_checkpoint`'s ordinary restores use, via
-    /// [`spawn_and_await_running`] — those have always minted a fresh name of
+    /// `spawn_and_await_running` — those have always minted a fresh name of
     /// their own, never hitting the directory-retention issue in the first
     /// place — see the module docs for why an msb `start` resume is not used
     /// here, and for why that re-boot (an `msb restore`, same as any other
@@ -1338,13 +1338,13 @@ impl SandboxBackend for MsbCliBackend {
     /// (as `<source>:<name>` in `snapshot list`) and `snapshot inspect` output, not
     /// the filesystem path. So this method never constructs the final ref itself:
     /// it CAPTURES it by parsing `snapshot create`'s own stdout (the LAST non-empty
-    /// line, required to be an absolute path — see [`parse_snapshot_create_ref`]),
+    /// line, required to be an absolute path — see `parse_snapshot_create_ref`),
     /// and that captured path is what's passed to `restore`/`snapshot rm`/`snapshot
     /// inspect` for this checkpoint from here on, and what's returned to the caller
     /// as the public `Checkpoint.ref`.
     ///
     /// `checkpoint_ref` (this method's own parameter) still plays its previous
-    /// role: a HINT this method resolves via [`path_ref_dir`]/[`mint_checkpoint_ref`]
+    /// role: a HINT this method resolves via `path_ref_dir`/`mint_checkpoint_ref`
     /// into the `--dest-dir` directory and the `rz-ckpt-<nonce-or-name>` name handed
     /// to `snapshot create` — never the final ref by itself anymore. That absolute
     /// hint is minted by `rightsize::ContainerGuard`, one level up, against whatever
@@ -1355,7 +1355,7 @@ impl SandboxBackend for MsbCliBackend {
     /// `--dest-dir`, not just the registry file this crate never touches directly.
     /// A BARE name (no directory component) is minted here instead, purely as a
     /// defensive fallback for a caller that reaches this SPI method directly rather
-    /// than through `ContainerGuard` — see [`path_ref_dir`], the same
+    /// than through `ContainerGuard` — see `path_ref_dir`, the same
     /// absolute-vs-bare branch `has_checkpoint` and `remove_checkpoint` already use.
     ///
     /// A container started with [`ContainerSpec::tmpfs_root_mb`] set is refused
@@ -1652,7 +1652,7 @@ impl SandboxBackend for MsbCliBackend {
     /// The filesystem sweep below (removing a path ref's artifact directory by
     /// hand) only runs when msb's own removal is known to have left nothing
     /// behind: either it actually succeeded, or it reports the ref as already
-    /// gone (see [`is_snapshot_not_found`]) — both cases where msb's index has no
+    /// gone (see `is_snapshot_not_found`) — both cases where msb's index has no
     /// remaining reference to the directory. Every OTHER nonzero exit leaves the
     /// directory alone, most notably msb's HEAD-removal refusal (`invalid
     /// config: cannot remove current head snap_...; first select another
@@ -1694,13 +1694,13 @@ impl SandboxBackend for MsbCliBackend {
         .map_err(|e| RightsizeError::Backend(format!("checkpoint removal task panicked: {e}")))?
     }
 
-    /// A path ref (see [`path_ref_dir`]) is checked on the filesystem instead —
+    /// A path ref (see `path_ref_dir`) is checked on the filesystem instead —
     /// its artifact directory existing AND containing `snapshot.json` — with no
     /// `msb` call at all. A bare-name ref falls through to `msb snapshot inspect
     /// <ref>` — the named-checkpoint existence probe
     /// (`SandboxBackend::has_checkpoint`, `Checkpoint::find`'s staleness check).
     /// Exit 0 -> `Ok(true)`. A nonzero exit whose output names msb's "not found"
-    /// wording (see [`is_snapshot_not_found`]) -> `Ok(false)`. Any other nonzero
+    /// wording (see `is_snapshot_not_found`) -> `Ok(false)`. Any other nonzero
     /// exit, or the invocation itself failing to run, surfaces as a
     /// `RightsizeError::Backend` — this SPI forbids a probe failure from resolving
     /// to "absent."
@@ -1744,8 +1744,8 @@ impl SandboxBackend for MsbCliBackend {
     /// `crate::commands::snapshot_export`'s own doc for why) — the
     /// checkpoint-archive feature's export primitive
     /// (`rightsize::Checkpoint::export_to`), with the Windows salvage described by
-    /// [`salvage_archive_staging_file`] wired in as
-    /// [`msb_export_checkpoint_cycle`]'s recovery step. The Windows gate is
+    /// `salvage_archive_staging_file` wired in as
+    /// `msb_export_checkpoint_cycle`'s recovery step. The Windows gate is
     /// `cfg!(windows)` rather than `#[cfg(windows)]` so the salvage and its
     /// classifier stay compiled — and unit-tested — on every host, and only
     /// whether they are REACHED is platform-specific. Off Windows the fsync msb
@@ -1782,7 +1782,7 @@ impl SandboxBackend for MsbCliBackend {
     /// manifest's original ref) plays no role here: msb's import is
     /// content-addressed, so the effective ref is always the loaded artifact's own
     /// absolute path, parsed from `load`'s stdout (see
-    /// [`msb_import_checkpoint_cycle`] for the orchestration this delegates to) —
+    /// `msb_import_checkpoint_cycle` for the orchestration this delegates to) —
     /// never `ref_hint`, and never a `snapshot list`-resolved digest-dir name (msb
     /// 0.7.1 no longer needs that extra round trip; `load` prints the artifact's
     /// own path directly).

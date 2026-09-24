@@ -150,7 +150,7 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 ///   never reaches THIS argv. That no longer means the restored workload never
 ///   sees it, though: `restore` only brings the guest agent up (verified live —
 ///   the captured/default workload command does NOT re-run on its own), and
-///   [`crate::backend::try_restore_and_await_running`]'s own phase 3 re-starts
+///   `crate::backend::try_restore_and_await_running`'s own phase 3 re-starts
 ///   the workload right after via [`exec_workload`], which DOES carry `spec.env`
 ///   as repeated `-e` flags. `Container::start()`, one layer up, still refuses a
 ///   `Container::from_checkpoint(...)` restore whose final `env` no longer
@@ -375,7 +375,7 @@ pub fn exec(name: &str, cmd: &[String]) -> Vec<String> {
 }
 
 /// Builds the argv for `msb exec [-e KEY=value]... <name> -- <argv...>` — the
-/// workload-revival exec [`crate::backend::try_restore_and_await_running`] spawns
+/// workload-revival exec `crate::backend::try_restore_and_await_running` spawns
 /// as a LONG-LIVED attached child once a checkpoint restore reaches `Running`.
 /// Upstream's own `restore` (msb 0.7.1+) boots the sandbox with only `agentd`
 /// inside — the captured workload command never re-runs on its own, verified live

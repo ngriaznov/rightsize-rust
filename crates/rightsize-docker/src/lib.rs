@@ -6,7 +6,7 @@
 //! no shared HTTP stack the consumer's dependency tree can accidentally reroute onto
 //! TCP. It speaks exactly the daemon endpoints `rightsize` needs (containers, exec,
 //! logs, networks) and decodes the daemon's chunked transfer encoding and 8-byte
-//! log-frame multiplexing format by hand. See [`stream`] for how the two platform
+//! log-frame multiplexing format by hand. See `stream` for how the two platform
 //! transports are unified behind one internal type.
 //!
 //! This backend also doubles as the correctness oracle other backends are checked
