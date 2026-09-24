@@ -179,8 +179,8 @@ async fn follow_logs_watchdog_replays_the_final_unterminated_line_exactly_once()
     // sandbox as Running before it exits — a workload that finishes instantly can race
     // ahead of the very first poll and make `start()` itself fail (msb never reports a
     // sandbox that lived and died between two polls as ever having been Running).
-    // Then echo a final line with NO trailing newline and exit — msb's `logs -f` will
-    // never observe EOF on its own: the watchdog must notice the sandbox left
+    // Then echo a final line with NO trailing newline and exit — msb's `logs -f`
+    // never exits on its own: the watchdog must notice the sandbox left
     // Running and flush the tail itself.
     let spec = ContainerSpec {
         command: Some(vec![

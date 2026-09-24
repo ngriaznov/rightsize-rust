@@ -35,7 +35,7 @@ async fn create_keyspace_table_insert_select_round_trips_via_cqlsh() {
     let guard = CassandraContainer::new()
         .start()
         .await
-        .expect("cassandra must start (this also proves the GPG_KEYS override let it boot)");
+        .expect("cassandra must start");
 
     let cql = "CREATE KEYSPACE IF NOT EXISTS smoke WITH REPLICATION = \
                {'class': 'SimpleStrategy', 'replication_factor': 1}; \

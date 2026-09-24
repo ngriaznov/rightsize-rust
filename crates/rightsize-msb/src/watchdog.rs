@@ -1,9 +1,9 @@
 //! The `follow_logs` watchdog — the hardest moment in this backend.
 //!
-//! `msb logs -f` is documented to exit cleanly once its sandbox stops. On msb 0.6.2 it
-//! doesn't: it blocks on read forever instead, so a workload's final unterminated line
-//! (no trailing `\n`) would otherwise never reach the consumer. This module works
-//! around that with three guarantees, in order:
+//! `msb logs -f` is documented to exit cleanly once its sandbox stops. It doesn't: it
+//! never exits on its own once the sandbox has stopped, so a workload's final
+//! unterminated line (no trailing `\n`) would otherwise never reach the consumer.
+//! This module works around that with three guarantees, in order:
 //!
 //! 1. Once the sandbox leaves `Running` (per `running_names_via`), the watchdog
 //!    **quiesces the stuck follow process first**: kill the child, wait for it, then

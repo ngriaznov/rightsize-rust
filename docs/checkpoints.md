@@ -338,10 +338,9 @@ cache, an artifact store, a shared volume) is the caller's own choice.
 **The image is not bundled.** An archive carries the checkpoint's filesystem
 state, not the base image it was built from — the destination machine pulls the
 image fresh on the restored container's first boot, exactly as it would for any
-other `start()`. This is a deliberate limitation of msb 0.6.6's export format
-(bundling the image fails an integrity check on import), not a rightsize choice;
-see the [roadmap](./roadmap.md) for the self-contained-archive idea this leaves
-open.
+other `start()`. `export_to` doesn't pass msb's own `--with-image` flag, which
+would bundle it; see the [roadmap](./roadmap.md) for the self-contained-archive
+idea this leaves open.
 
 **Same backend required, same as everywhere else.** `export_to`/`import_from`
 apply the same backend-match gate as `from_checkpoint` itself:

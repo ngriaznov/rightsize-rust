@@ -1,8 +1,8 @@
-//! `MsbCliBackend`: drives `msb run` as an ATTACHED child process per container
-//! (detached mode never starts the image `ENTRYPOINT` on 0.6.2, only attached mode
-//! does), classifies port-bind failures from the child's combined output, and works
-//! around `msb logs -f` never exiting on its own once a sandbox stops with a watchdog
-//! that does one authoritative, at-most-once tail replay.
+//! `MsbCliBackend`: drives `msb run` as an ATTACHED child process per container —
+//! attached mode gives a live child to supervise directly, for child-exit-based
+//! death detection and boot failures classified from that child's own combined
+//! output — and works around `msb logs -f` never exiting on its own once a sandbox
+//! stops with a watchdog that does one authoritative, at-most-once tail replay.
 //!
 //! **Checkpoint restore is supervised differently, on purpose.** `msb restore
 //! <path> --name <name>` (msb 0.7.1+, both the checkpoint feature's own re-boot and

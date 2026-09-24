@@ -68,12 +68,12 @@ against.
 ### Attached-mode supervision
 
 Each container is a held child process supervising its own microVM — the image's
-`ENTRYPOINT` runs exactly as it would under Docker. This matters because **detached**
-`msb run -d` never actually starts the image's `ENTRYPOINT` on this msb build —
-attached mode is the only mode that does. Readiness of the sandbox itself (not the
-workload inside it) is "name shows `Running` in `msb ls --format json`"; workload logs
-come from `msb logs`, which has its own quirk (see
-[Backend differences](#backend-differences) below).
+`ENTRYPOINT` runs exactly as it would under Docker. rightsize-rust runs `msb run`
+attached (never `-d`) so it has a live child to supervise directly: child-exit-based
+death detection, and boot failures classified from that child's own combined
+stdout/stderr. Readiness of the sandbox itself (not the workload inside it) is
+"name shows `Running` in `msb ls --format json`"; workload logs come from `msb logs`,
+which has its own quirk (see [Backend differences](#backend-differences) below).
 
 `msb exec` blocks until stdin reaches EOF, so every child process rightsize-rust spawns
 under the hood gets a closed/null stdin — an exec call that's fed an open, never-EOF'd
@@ -159,15 +159,15 @@ The two backends are contract-equivalent on everything the shared suite exercise
 but a few edges are real, not just timing quirks:
 
 - **File mounts behave identically on both backends** — a former difference, closed
-  on the pinned msb 0.6.8. The default mount is read-write and is a view of the host
+  as of msb 0.6.8. The default mount is read-write and is a view of the host
   file (docker binds the host path directly; microsandbox hard-links it into its
   staging directory), so a guest write reaches the host file itself. A mount built
   with `FileMount::read_only` blocks guest writes with `Read-only file system` —
   enforced in-guest on both backends, where earlier releases documented msb's `ro`
   as advisory-only.
 - **`follow_output`'s tail-flush on microsandbox is a watchdog, not a stream close.**
-  `msb logs -f` doesn't exit when its sandbox stops (a documented gap in msb 0.6.2),
-  so this backend polls in the background and replays only the not-yet-delivered tail
+  `msb logs -f` never exits on its own once its sandbox stops, so this backend polls
+  in the background and replays only the not-yet-delivered tail
   once the sandbox is confirmed stopped. Consumers see the same ordered,
   no-duplicate output either backend produces — this is an implementation detail, not
   an observable behavior difference — but it means a `follow_output` subscriber on

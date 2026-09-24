@@ -3,9 +3,9 @@
 //! Keeping this pure makes every flag spelling a plain data-in/data-out unit test,
 //! independent of a real `msb` binary.
 //!
-//! **Attached mode, always** (no `-d`): microsandbox's detached mode never starts the
-//! image's `ENTRYPOINT` on 0.6.2 — only attached mode does — so [`run`] never
-//! emits `-d`, and the backend supervises the resulting child directly.
+//! **Attached mode, always** (no `-d`): [`run`] never emits `-d` — running attached
+//! gives the backend a live child to supervise directly, for child-exit-based death
+//! detection and boot-failure diagnostics from its combined stdout/stderr.
 
 use std::path::Path;
 
@@ -329,11 +329,12 @@ pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
 }
 
 /// Builds the argv for `msb snapshot save <ref> <dest>` — the checkpoint-archive
-/// feature's export primitive (`SandboxBackend::export_checkpoint`). Deliberately
-/// never includes `--with-image`: its import fails an integrity check ("raw
-/// manifest digest mismatch") on msb 0.6.6, so archives never bundle the OCI
-/// image — the destination machine pulls it fresh on the restored sandbox's first
-/// boot instead.
+/// feature's export primitive (`SandboxBackend::export_checkpoint`). Never passes
+/// `--with-image` — msb's own flag for bundling the OCI image into the archive —
+/// so archives never bundle it; the destination machine pulls the image fresh on
+/// the restored sandbox's first boot instead. Not an upstream limitation: wiring
+/// `--with-image` through is on the roadmap (see the checkpoints docs' "The image
+/// is not bundled" section).
 pub fn snapshot_export(snapshot_ref: &str, dest: &Path) -> Vec<String> {
     vec![
         "snapshot".to_string(),
@@ -497,8 +498,9 @@ pub fn parse_captured_cmdline(stdout: &str) -> Option<Vec<String>> {
     if argv.is_empty() { None } else { Some(argv) }
 }
 
-/// Builds the argv for `msb exec --stream` — the only guest data path microsandbox
-/// exposes, used exclusively by the exec-tunnel network-link emulation.
+/// Builds the argv for `msb exec --stream`, used exclusively by the exec-tunnel
+/// network-link emulation to carry a TCP link's bytes between sandboxes, which
+/// share no network with each other.
 pub fn exec_stream(name: &str, cmd: &[String]) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
@@ -1315,8 +1317,8 @@ mod tests {
                 std::path::Path::new("/tmp/cp.archive")
             )
             .contains(&"--with-image".to_string()),
-            "archives must never bundle the OCI image — its import fails an integrity check on \
-             msb 0.6.6"
+            "archives must never bundle the OCI image — snapshot_export doesn't pass \
+             --with-image (see the checkpoints docs' \"The image is not bundled\" section)"
         );
         assert_eq!(
             snapshot_import(

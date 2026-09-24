@@ -386,7 +386,7 @@ pub trait SandboxBackend: Send + Sync {
     /// Writes this backend's own checkpoint payload for `checkpoint_ref` to
     /// `dest_file` — the checkpoint-archive feature's export primitive
     /// (`crate::Checkpoint::export_to`): msb runs `snapshot export <ref> <dest>`
-    /// (never `--with-image` — its import fails an integrity check in 0.6.6, so
+    /// (never `--with-image`, msb's own flag for bundling the OCI image, so
     /// the destination machine pulls the image fresh on first boot instead);
     /// docker runs `docker save -o <dest> <ref>`. `dest_file`'s parent directory
     /// already exists by the time this is called (the generic layer creates a

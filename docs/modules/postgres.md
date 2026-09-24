@@ -44,26 +44,28 @@ it waits for the *second* occurrence, the durable listen. This is the canonical
 showcase for `Wait::for_log_message`'s `times` parameter — see
 [Wait Strategies](../core-concepts/wait-strategies.md).
 
-## The control-character env fix (`DOCKER_PG_LLVM_DEPS`)
+## The control-character env guard (`DOCKER_PG_LLVM_DEPS`)
 
 The official `postgres:*-alpine` image bakes `DOCKER_PG_LLVM_DEPS` into its manifest
 with a **literal tab character** in the value (a package list built with `\t\t`
-continuation). msb 0.6.2's krun VMM builder panics with `InvalidAscii` on that boot-env
-value before the guest ever starts — reproduced with zero rightsize-set env vars, so
-this is the image's own baked value, not anything this module or your test adds.
-Docker is unaffected. The module works around it by overriding the variable to an
-empty string (`.with_env("DOCKER_PG_LLVM_DEPS", "")`) — a no-op for the build the
-image already baked, and harmless on Docker.
+continuation). On older msb releases (0.6.x), the krun VMM builder panicked with
+`InvalidAscii` on that boot-env value before the guest ever started — reproduced with
+zero rightsize-set env vars, so this was the image's own baked value, not anything
+this module or your test adds. Docker was unaffected. On the pinned msb 0.7.1 this is
+fixed upstream: the image boots with its baked `DOCKER_PG_LLVM_DEPS` and no override
+at all. The module still overrides the variable to an empty string
+(`.with_env("DOCKER_PG_LLVM_DEPS", "")`) — a no-op for the build the image already
+baked, harmless on Docker, and now a guard rather than a requirement on microsandbox.
 
 This override was measured against the Alpine-tagged manifest specifically; it stays
 in place unconditionally now that `new()` floats to the Debian-based `postgres:latest`
 — it is a documented no-op on any manifest that doesn't carry the tab-bearing value,
 so keeping it costs nothing and protects a caller who supplies an `*-alpine` tag via
-`with_image`.
+`with_image`, including against an older `MSB_PATH` binary.
 
-If you hit `InvalidAscii` on a *different* image under `RIGHTSIZE_BACKEND=microsandbox`,
-suspect a baked env var with a control character the same way — see
-[Troubleshooting](../troubleshooting.md).
+If you hit `InvalidAscii` on a *different* image under `RIGHTSIZE_BACKEND=microsandbox`
+on an older msb release, suspect a baked env var with a control character the same
+way — see [Troubleshooting](../troubleshooting.md).
 
 ## Complete example
 

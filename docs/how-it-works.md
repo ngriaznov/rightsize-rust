@@ -84,9 +84,8 @@ different mechanism — an in-guest `nc -u -l` forwarder script plus a
 pump — see [UDP network links on the microVM backend](./core-concepts/networking.md#udp-network-links-on-the-microvm-backend).
 
 Showcased in full in [Networking](./core-concepts/networking.md), the mechanism in
-one paragraph: microsandbox microVMs share no bridge network with each other, and
-`exec --stream` is the *only* guest data path available on this msb build — no
-sandbox→host TCP under any net-rule tried, SSH forwarding found broken too. So a
+one paragraph: microsandbox microVMs share no bridge network with each other, so
+`exec --stream` is what carries a TCP link's bytes between them. So a
 network link between two containers is emulated as an `/etc/hosts` entry (the alias
 resolves to `127.0.0.1` inside the consuming guest) plus a raw, unbuffered,
 flush-per-read byte pump tunneled over `exec --stream`, backed by a respawned

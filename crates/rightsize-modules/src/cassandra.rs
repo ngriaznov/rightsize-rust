@@ -1,13 +1,14 @@
 //! A single-node Apache Cassandra container.
 //!
-//! ### `GPG_KEYS` must be overridden to a tab-free value — this is not optional
+//! ### `GPG_KEYS` override — kept as a guard, not required on the pinned msb
 //!
 //! `cassandra:5.0.8`'s baked env includes a `GPG_KEYS` value containing a literal TAB
 //! character (a package-signing key list built with tab-separated continuation,
 //! same shape as the `DOCKER_PG_LLVM_DEPS`/`postgres:*-alpine` case documented on
-//! [`crate::postgres::PostgresContainer`]). msb's krun VMM builder — 0.6.6 and the pinned 0.6.8 alike — panics on any
-//! baked env value containing a control character, and it panics *before the guest
-//! ever boots* — reproduced directly, identical `msb run` invocation:
+//! [`crate::postgres::PostgresContainer`]). On older msb releases (0.6.x), the krun
+//! VMM builder panicked on any baked env value containing a control character,
+//! before the guest ever booted — reproduced directly, identical `msb run`
+//! invocation:
 //!
 //! ```text
 //! sandbox process exited (signal: 6 (SIGABRT)) before agent relay became available
@@ -19,14 +20,14 @@
 //! panicked at msb_krun_vmm-0.1.25/src/builder.rs:1154: ... Err value: InvalidAscii
 //! ```
 //!
-//! `.with_env("GPG_KEYS", "")` sidesteps it: `GPG_KEYS` is build-time-only in this
-//! image (used only when the image itself is built, to import signing keys), so
-//! overriding it has zero effect at container-run time. Verified directly: the
-//! identical `msb run` aborts with the panic above without this override and boots
-//! clean with it. Docker is unaffected either way — this override is a no-op there,
-//! not a workaround for a docker-specific problem. This module always sets it; it is
-//! not exposed as a builder override, because there is no reason a caller would ever
-//! want the tab-bearing value back.
+//! On the pinned msb 0.7.1 this is fixed upstream — the image boots with its baked
+//! `GPG_KEYS` and no override at all. `.with_env("GPG_KEYS", "")` costs nothing
+//! either way: `GPG_KEYS` is build-time-only in this image (used only when the image
+//! itself is built, to import signing keys), so overriding it has zero effect at
+//! container-run time. This module still sets it unconditionally, as a harmless
+//! guard for anyone pointing `MSB_PATH` at an older msb. Docker is unaffected either
+//! way — the override is a no-op there too. It is not exposed as a builder override,
+//! because there is no reason a caller would ever want the tab-bearing value back.
 //!
 //! ### Heap — kept small on purpose
 //!
@@ -70,9 +71,9 @@
 //! `cassandra:latest` so the version tracks upstream rather than this crate's own
 //! release cycle. The `GPG_KEYS`/heap/memory/readiness facts above were all verified
 //! against that `5.0.8` boot specifically — kept unconditionally (the `GPG_KEYS`
-//! override remains required to boot on microsandbox at all, and is a no-op
-//! elsewhere), but do not assume they still hold exactly at whatever version
-//! `latest` resolves to without re-measuring.
+//! override is a harmless guard on microsandbox, not a boot requirement on the
+//! pinned msb, and is a no-op elsewhere), but do not assume they still hold exactly
+//! at whatever version `latest` resolves to without re-measuring.
 
 use std::time::Duration;
 
@@ -108,9 +109,10 @@ impl CassandraContainer {
         Self {
             container: Container::new(image.as_str())
                 .with_exposed_ports(&[CQL_PORT])
-                // Required to boot on msb at all — see the module doc's GPG_KEYS
-                // section for the exact panic this sidesteps and why it's a no-op on
-                // Docker and at Cassandra's own runtime.
+                // A harmless guard on the pinned msb, required on older (0.6.x)
+                // releases — see the module doc's GPG_KEYS section for the exact
+                // panic this sidesteps and why it's a no-op on Docker and at
+                // Cassandra's own runtime.
                 .with_env("GPG_KEYS", "")
                 .with_env("MAX_HEAP_SIZE", "512M")
                 .with_env("HEAP_NEWSIZE", "128M")

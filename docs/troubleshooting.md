@@ -53,20 +53,22 @@ requests under memory pressure is a real, previously-measured trap; see
 [Files & Resources](./core-concepts/files-and-resources.md#memory-limits-when-and-why) for the
 exact measured numbers from two shipped modules that hit this).
 
-### 2. A baked env var with a control character
+### 2. A baked env var with a control character (older msb releases only)
 
-**Cause:** msb 0.6.2's krun VMM builder panics with `InvalidAscii` if any boot-env
-value contains a control character — and at least one official image
-(`postgres:*-alpine`) bakes one into its own manifest (`DOCKER_PG_LLVM_DEPS` with a
-literal tab). This happens before the guest ever boots, with zero rightsize-set env
-vars involved — it's the image, not your test.
+**Cause:** on older msb releases (0.6.x), the krun VMM builder panicked with
+`InvalidAscii` if any boot-env value contained a control character — and at least
+one official image (`postgres:*-alpine`) bakes one into its own manifest
+(`DOCKER_PG_LLVM_DEPS` with a literal tab). This happened before the guest ever
+booted, with zero rightsize-set env vars involved — it was the image, not your test.
+Fixed upstream as of the pinned msb 0.7.1: the same image boots with the baked value
+and no override.
 
-**Fix:** override the offending variable to an empty string
+**Fix (older msb only):** override the offending variable to an empty string
 (`.with_env("VAR_NAME", "")`) — a no-op for whatever the image's build already
-baked, and harmless on Docker. `PostgresContainer` ships this fix already; if a
-*different* image hits `InvalidAscii`, inspect its baked env (`docker inspect
-<image>` and look at `Config.Env`) for anything with an embedded tab/control
-character and apply the same override.
+baked, and harmless on Docker. `PostgresContainer` still sets this override
+unconditionally as a guard; if a *different* image hits `InvalidAscii` on an older
+`msb`, inspect its baked env (`docker inspect <image>` and look at `Config.Env`) for
+anything with an embedded tab/control character and apply the same override.
 
 ## "An in-guest write to a mounted file fails with `Read-only file system`"
 

@@ -1,8 +1,8 @@
 //! `ExecTunnel`: one `alias:guest_port` route into a consumer sandbox, bridged over
-//! `msb exec --stream` — the only guest data path microsandbox exposes on macOS
-//! (confirmed empirically: no sandbox→host TCP under any net-rule, ssh forwarding
-//! broken). Client-speaks-first protocols only; single connection at a time; the
-//! in-guest `nc -l` listener is respawned after every connection.
+//! `msb exec --stream` — sandboxes share no network with each other, so exec is
+//! what carries a TCP link's bytes between them. Client-speaks-first protocols
+//! only; single connection at a time; the in-guest `nc -l` listener is respawned
+//! after every connection.
 //!
 //! **Raw, unbuffered, flush-per-read:** every pump in this module reads into a
 //! plain byte buffer and writes+flushes immediately — never through a `BufReader`.
@@ -34,7 +34,7 @@ use crate::commands;
 /// backoff.
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(200);
 
-/// **Confirmed empirically against the real msb binary, and fixed here:** msb 0.6.2's
+/// **Confirmed empirically against the real msb binary, and fixed here:** msb's
 /// host-port-publish proxy (the `-p host:guest` layer) does not propagate the target's
 /// own TCP close back to this host-side socket: a plain host TCP client reading a
 /// published port past a `Connection: close` HTTP response never observes EOF, even

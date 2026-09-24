@@ -28,14 +28,14 @@ returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
 drop-in replacement from another registry. `new()` goes through this same check
 against its own floating reference, so it can never fail in practice.
 
-## `GPG_KEYS` must be overridden to a tab-free value — this is not optional
+## `GPG_KEYS` override — kept as a guard, not required on the pinned msb
 
 `cassandra:5.0.8`'s baked env includes a `GPG_KEYS` value containing a literal TAB
 character (a package-signing key list built with tab-separated continuation, same
 shape as the `DOCKER_PG_LLVM_DEPS`/`postgres:*-alpine` case documented on
-[`PostgresContainer`](./postgres.md)). msb 0.6.6's krun VMM builder panics on any
-baked env value containing a control character, and it panics *before the guest ever
-boots* — reproduced directly, identical `msb run` invocation:
+[`PostgresContainer`](./postgres.md)). On older msb releases (0.6.x), the krun VMM
+builder panicked on any baked env value containing a control character, before the
+guest ever booted — reproduced directly, identical `msb run` invocation:
 
 ```text
 sandbox process exited (signal: 6 (SIGABRT)) before agent relay became available
@@ -47,14 +47,14 @@ with `msb logs --source system` showing the actual panic site:
 panicked at msb_krun_vmm-0.1.25/src/builder.rs:1154: ... Err value: InvalidAscii
 ```
 
-`.with_env("GPG_KEYS", "")` sidesteps it: `GPG_KEYS` is build-time-only in this image
-(used only when the image itself is built, to import signing keys), so overriding it
-has zero effect at container-run time. Verified directly: the identical `msb run`
-aborts with the panic above without this override and boots clean with it. Docker is
-unaffected either way — this override is a no-op there, not a workaround for a
-docker-specific problem. This module always sets it; it is not exposed as a builder
-override, because there is no reason a caller would ever want the tab-bearing value
-back.
+On the pinned msb 0.7.1 this is fixed upstream — the image boots with its baked
+`GPG_KEYS` and no override at all. `.with_env("GPG_KEYS", "")` costs nothing either
+way: `GPG_KEYS` is build-time-only in this image (used only when the image itself is
+built, to import signing keys), so overriding it has zero effect at container-run
+time. This module still sets it unconditionally, as a harmless guard for anyone
+pointing `MSB_PATH` at an older msb. Docker is unaffected either way — the override
+is a no-op there too. It is not exposed as a builder override, because there is no
+reason a caller would ever want the tab-bearing value back.
 
 ## Heap — kept small on purpose
 
@@ -112,5 +112,6 @@ than a Cassandra driver crate — see
 ## Backend notes
 
 `with_memory_limit(2560)` and the `GPG_KEYS` override are both set unconditionally by
-the module — see Memory and the `GPG_KEYS` section above. The `GPG_KEYS` override is
-required to boot at all on microsandbox; it is a harmless no-op on Docker.
+the module — see Memory and the `GPG_KEYS` section above. On the pinned msb the
+`GPG_KEYS` override is a harmless guard, not a boot requirement; it is a no-op on
+Docker either way.

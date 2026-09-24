@@ -21,9 +21,9 @@ ships now — a checkpoint seeded once in CI can be shipped as a build artifact 
 restored on a fresh runner instead of re-seeding there too. What's left: the
 archive doesn't bundle the OCI image, so the destination machine still pulls it on
 the restored container's first boot — offline restores need the image baked into
-the archive itself. Blocked upstream: msb 0.6.6's own `--with-image` export fails
-an integrity check on import ("raw manifest digest mismatch"), so this waits on a
-fix there.
+the archive itself. msb's own `--with-image` export does the bundling; `export_to`
+just doesn't pass it yet, so the archive format stays image-less until this wires
+that flag through.
 
 ## Module breadth
 

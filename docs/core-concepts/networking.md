@@ -40,10 +40,10 @@ bridge network to attach to. rightsize-rust transparently installs, for every li
 
 1. An `/etc/hosts` entry inside the consuming container's guest, mapping the alias to
    `127.0.0.1`.
-2. A TCP link gets a relay tunneled over the sandbox's `exec --stream` channel — the
-   *only* guest data path available on this msb build (no sandbox→host TCP under any
-   net-rule tried; SSH forwarding was found broken too). The tunnel pumps raw bytes,
-   unbuffered, flush-per-read, in both directions. A UDP link instead gets an
+2. A TCP link gets a relay tunneled over the sandbox's `exec --stream` channel —
+   sandboxes share no network with each other on this msb build, so exec is what
+   carries the bytes between them. The tunnel pumps raw bytes, unbuffered,
+   flush-per-read, in both directions. A UDP link instead gets an
    in-guest forwarder script — see
    [UDP network links on the microVM backend](#udp-network-links-on-the-microvm-backend)
    below for how it differs.

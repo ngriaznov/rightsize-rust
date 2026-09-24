@@ -63,13 +63,15 @@ impl PostgresContainer {
             .with_env("POSTGRES_DB", &database)
             // The official postgres:*-alpine image bakes DOCKER_PG_LLVM_DEPS into its
             // manifest with a literal tab character in the value (a package list built
-            // with `\t\t` continuation). msb 0.6.2's krun VMM builder panics with
-            // InvalidAscii on that boot-env value before the guest ever starts
-            // (reproduced with zero rightsize-set env vars — it's the image, not us).
-            // Docker is unaffected. Overriding the var here wins over the
-            // image default in both backends' env-merge order and is a no-op for the
-            // build the image already baked, so it's a safe, backend-portable fix
-            // rather than an msb-only special case.
+            // with `\t\t` continuation). On older msb releases (0.6.x), the krun VMM
+            // builder panicked with InvalidAscii on that boot-env value before the
+            // guest ever started (reproduced with zero rightsize-set env vars — it's
+            // the image, not us). Fixed upstream as of the pinned msb 0.7.1: the image
+            // boots with the baked value and no override. Docker is unaffected either
+            // way. Overriding the var here wins over the image default in both
+            // backends' env-merge order and is a no-op for the build the image already
+            // baked, so it's kept as a harmless, backend-portable guard rather than an
+            // msb-only special case.
             .with_env("DOCKER_PG_LLVM_DEPS", "")
             // The postgres entrypoint starts the server once to run initdb scripts
             // against it, shuts it down, then starts it again for real — printing
