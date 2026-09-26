@@ -4,10 +4,9 @@ A single-node MinIO container, an S3-compatible object store. Defaults to a
 `testuser`/`testpassword` root credential pair so `s3_url()` plus that pair is
 usable with zero configuration.
 
-**Default image:** floats to `minio/minio:latest` — this module previously
-pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`.
+**Default image:** floats to `pgsty/minio:latest` — see "Why `pgsty/minio`" below.
 **Guest ports:** `9000` (S3 API — what the helpers use), `9001` (web console, exposed but not wrapped)
-**Expected repository:** `minio/minio`
+**Expected repository:** `minio/minio` (`pgsty/minio` also accepted — see below)
 
 | Method | On | Effect |
 |---|---|---|
@@ -25,11 +24,32 @@ pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`.
 `with_image` takes `impl Into<ImageName>` and keeps the image verbatim. `start()`
 then checks that image's repository (registry host, tag, and digest stripped)
 against `minio/minio` before any backend is resolved or any sandbox is created,
-which keeps the constructors infallible like every other module's. A mismatch
+which keeps the constructors infallible like every other module's. Registry-host
+stripping alone covers `quay.io/minio/minio:TAG` and the original `minio/minio:TAG` —
+both parse to the same `minio/minio` repository and are accepted identically, with no
+substitute declaration needed for either. `start()` also accepts a `pgsty/minio`
+repository, this module's own default, as a declared substitute for `minio/minio` —
+see "Why `pgsty/minio`" below. A mismatch
 returns `RightsizeError::IncompatibleImage`; `ImageName::parse(image)
-.as_compatible_substitute_for("minio/minio")` is the escape hatch for a verified
-drop-in replacement from another registry. `new()` goes through this same check
-against its own floating reference, so it can never fail in practice.
+.as_compatible_substitute_for("minio/minio")` is the escape hatch for any other
+verified drop-in replacement. `new()` goes through this same check against its own
+floating reference, so it can never fail in practice.
+
+## Why `pgsty/minio`
+
+MinIO no longer publishes public images. Docker Hub's `minio/minio` was removed, and
+as of September 2026 `quay.io/minio/minio`, this module's previous default, refuses
+anonymous pulls (HTTP 401). `pgsty/minio` is Pigsty's community build of MinIO from
+source, published on Docker Hub for linux/amd64 and linux/arm64 with upstream's image
+layout: the same entrypoint and env defaults, and the `mc` client bundled. `new()`
+floats to its `latest` tag, so the version moves with that image's releases rather
+than this crate's. To pin instead:
+`MinioContainer::with_image("pgsty/minio:RELEASE.2026-08-04T00-00-00Z")`.
+
+The sections below were verified against `minio/minio:RELEASE.2025-09-07T16-13-09Z`.
+Readiness, auth enforcement, and the `mc` round-trip were verified again by this
+module's integration test against `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` (what
+`latest` pointed at) on msb 0.7.3; the memory measurement was not repeated.
 
 ## The default entrypoint does not serve — a command is required
 
@@ -66,8 +86,8 @@ merely being accepted and ignored.
 
 ## Memory — no limit needed, verified directly
 
-This module sets no memory limit. Verified against a real boot with the limit removed
-entirely: MinIO came up in a guest reporting ~480 MB total, answered
+This module sets no memory limit. Verified against a real `minio/minio` boot with the
+limit removed entirely: MinIO came up in a guest reporting ~480 MB total, answered
 `/minio/health/live` on the first poll, and completed a full bucket-create, upload,
 and read-back round-trip. Unlike the JVM modules here
 ([`KeycloakContainer`](./keycloak.md), [`Neo4jContainer`](./neo4j.md)), a single-node
