@@ -66,7 +66,7 @@ impl PostgresContainer {
             // with `\t\t` continuation). On older msb releases (0.6.x), the krun VMM
             // builder panicked with InvalidAscii on that boot-env value before the
             // guest ever started (reproduced with zero rightsize-set env vars — it's
-            // the image, not us). Fixed upstream as of the pinned msb 0.7.1: the image
+            // the image, not us). Fixed upstream as of msb 0.7.1: the image
             // boots with the baked value and no override. Docker is unaffected either
             // way. Overriding the var here wins over the image default in both
             // backends' env-merge order and is a no-op for the build the image already

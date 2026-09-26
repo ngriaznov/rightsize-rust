@@ -51,7 +51,7 @@ with a **literal tab character** in the value (a package list built with `\t\t`
 continuation). On older msb releases (0.6.x), the krun VMM builder panicked with
 `InvalidAscii` on that boot-env value before the guest ever started — reproduced with
 zero rightsize-set env vars, so this was the image's own baked value, not anything
-this module or your test adds. Docker was unaffected. On the pinned msb 0.7.1 this is
+this module or your test adds. Docker was unaffected. As of msb 0.7.1 this is
 fixed upstream: the image boots with its baked `DOCKER_PG_LLVM_DEPS` and no override
 at all. The module still overrides the variable to an empty string
 (`.with_env("DOCKER_PG_LLVM_DEPS", "")`) — a no-op for the build the image already

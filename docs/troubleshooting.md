@@ -60,7 +60,7 @@ exact measured numbers from two shipped modules that hit this).
 one official image (`postgres:*-alpine`) bakes one into its own manifest
 (`DOCKER_PG_LLVM_DEPS` with a literal tab). This happened before the guest ever
 booted, with zero rightsize-set env vars involved — it was the image, not your test.
-Fixed upstream as of the pinned msb 0.7.1: the same image boots with the baked value
+Fixed upstream as of msb 0.7.1: the same image boots with the baked value
 and no override.
 
 **Fix (older msb only):** override the offending variable to an empty string

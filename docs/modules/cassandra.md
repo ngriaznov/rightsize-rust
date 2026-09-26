@@ -47,7 +47,7 @@ with `msb logs --source system` showing the actual panic site:
 panicked at msb_krun_vmm-0.1.25/src/builder.rs:1154: ... Err value: InvalidAscii
 ```
 
-On the pinned msb 0.7.1 this is fixed upstream — the image boots with its baked
+As of msb 0.7.1 this is fixed upstream — the image boots with its baked
 `GPG_KEYS` and no override at all. `.with_env("GPG_KEYS", "")` costs nothing either
 way: `GPG_KEYS` is build-time-only in this image (used only when the image itself is
 built, to import signing keys), so overriding it has zero effect at container-run
