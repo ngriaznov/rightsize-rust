@@ -557,6 +557,20 @@ fn raw_backend_for(name: &str) -> Box<dyn SandboxBackend> {
     )
 }
 
+/// Hands a helper child the msb this process provisioned, as `MSB_PATH`. The
+/// child's scratch `RIGHTSIZE_CACHE_DIR` keeps its reaper ledger (and, for the
+/// reuse tests, its reuse registry) apart from this process's, but it is also where
+/// the provisioner looks for msb, so without `MSB_PATH` every child would download
+/// msb and libkrunfw from GitHub again. `ensure_installed` returns this process's
+/// own `MSB_PATH` when one is set. Docker children need nothing.
+fn share_parent_msb(cmd: &mut Command, backend_name: &str) {
+    if backend_name != "microsandbox" {
+        return;
+    }
+    let msb = rightsize_msb::provisioner::ensure_installed().expect("msb must be provisioned");
+    cmd.env("MSB_PATH", msb);
+}
+
 /// Sweep behavior, run through the shared contract suite so BOTH backends get
 /// equivalent coverage (the addendum's "common trap" note: msb's own coverage in
 /// `reaper_it.rs` only proves the ledger's bookkeeping is cleaned up, never docker's
@@ -664,7 +678,9 @@ async fn sweep_reaps_a_fabricated_dead_run_at_the_backend_level() {
     // and the SAME backend (the sweep only reaps a dead run whose recorded backend
     // matches its own).
     let exe = std::env::current_exe().expect("current_exe");
-    let status = Command::new(&exe)
+    let mut cmd = Command::new(&exe);
+    share_parent_msb(&mut cmd, &backend_name);
+    let status = cmd
         .args([
             "--exact",
             "helper_triggers_a_fresh_backend_resolution_for_the_sweep_contract_test",
@@ -1269,6 +1285,7 @@ fn spawn_reuse_helper(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    share_parent_msb(&mut cmd, backend_name);
     match reuse_env {
         Some(v) => {
             cmd.env("RIGHTSIZE_REUSE", v);

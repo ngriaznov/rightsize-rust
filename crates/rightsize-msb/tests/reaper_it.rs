@@ -41,6 +41,14 @@ fn msb_runtime_available() -> bool {
     MsbBackendProvider.is_supported()
 }
 
+/// The msb binary this process provisioned, handed to each helper child as
+/// `MSB_PATH`. A child's scratch `RIGHTSIZE_CACHE_DIR` keeps its ledger apart from
+/// this process's, but it is also where the provisioner looks for msb, so without
+/// `MSB_PATH` every child would download msb and libkrunfw from GitHub again.
+fn provisioned_msb() -> std::path::PathBuf {
+    rightsize_msb::provisioner::ensure_installed().expect("msb must be provisioned")
+}
+
 /// A wait strategy that's immediately satisfied — these tests only care that a
 /// sandbox reaches `Running` and gets a real ledger entry, not about any workload
 /// readiness signal.
@@ -125,6 +133,7 @@ fn sigkill_end_to_end_reaps_via_the_watchdog() {
         .env("RIGHTSIZE_HELPER_CHILD", "1")
         .env("RIGHTSIZE_IT_READY_FILE", &ready_file)
         .env("RIGHTSIZE_CACHE_DIR", &cache_dir)
+        .env("MSB_PATH", provisioned_msb())
         .env("RIGHTSIZE_REAPER", "on")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -210,7 +219,7 @@ async fn sweep_end_to_end_reaps_a_fabricated_dead_run() {
     let cache_dir = std::env::temp_dir().join(format!("rz-reaper-sweep-{}", unique_id("c")));
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    let msb_path = rightsize_msb::provisioner::ensure_installed().expect("msb must be provisioned");
+    let msb_path = provisioned_msb();
     let backend = rightsize_msb::MsbCliBackend::new(msb_path.clone());
     let name = unique_id("rz-deadbeef");
     let spec = rightsize::model::ContainerSpec {
@@ -257,6 +266,7 @@ async fn sweep_end_to_end_reaps_a_fabricated_dead_run() {
         ])
         .env("RIGHTSIZE_HELPER_CHILD", "1")
         .env("RIGHTSIZE_CACHE_DIR", &child_cache_dir)
+        .env("MSB_PATH", &msb_path)
         .env("RIGHTSIZE_REAPER", "sweep") // sweep only: no watchdog needed for this test.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
