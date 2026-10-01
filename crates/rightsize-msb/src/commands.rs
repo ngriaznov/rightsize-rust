@@ -556,6 +556,14 @@ pub fn rm(name: &str) -> Vec<String> {
     vec!["rm".to_string(), name.to_string()]
 }
 
+/// Builds the argv for `msb rm -f` (msb 0.7.3 and 0.7.6). Unlike plain [`rm`] it also
+/// removes a sandbox whose catalog row a failed boot left stuck in `Starting`, which
+/// plain `rm` refuses as still running; for an ordinary `Stopped` row the two are the
+/// same.
+pub fn rm_force(name: &str) -> Vec<String> {
+    vec!["rm".to_string(), "-f".to_string(), name.to_string()]
+}
+
 /// Builds the argv for listing sandboxes as JSON. Note: no `--json` flag exists on
 /// `ls` — it's `--format json`.
 pub fn ls() -> Vec<String> {
@@ -804,6 +812,7 @@ mod tests {
         );
         assert_eq!(stop("rz-abc-1"), vec!["stop", "rz-abc-1"]);
         assert_eq!(rm("rz-abc-1"), vec!["rm", "rz-abc-1"]);
+        assert_eq!(rm_force("rz-abc-1"), vec!["rm", "-f", "rz-abc-1"]);
         // Confirmed empirically against the real msb binary: no `--json` flag on `ls`.
         assert_eq!(ls(), vec!["ls", "--format", "json"]);
         assert_eq!(

@@ -539,6 +539,43 @@ fn is_restore_access_denied_error(e: &RightsizeError) -> bool {
     matches!(e, RightsizeError::Backend(message) if is_restore_access_denied(message))
 }
 
+/// True if `output` (a `msb run` child's, or a `msb restore` invocation's, combined
+/// stdout/stderr) is msb reporting that the sandbox's own process exited CLEANLY before
+/// the guest agent's relay ever came up. Captured on a Windows CI runner, under load,
+/// from an attached `msb run`:
+///
+/// ```text
+/// error: failed to start "rz-731fdcdc-8"
+///   → other: sandbox process exited (exit code: 0) before agent relay became available
+///   → run `msb logs --source system rz-731fdcdc-8` for full diagnostics
+/// ```
+///
+/// and, wrapped in PowerShell's own error decoration with the arrows mangled, from a
+/// brokered `msb restore`. msb builds that cause itself (`wait_for_relay` in its
+/// `sandbox/create.rs`) when its host side finds the sandbox process already gone and
+/// no `boot-error.json` left behind, so the output says nothing about why the VM
+/// stopped. It has only been seen on loaded Windows CI hosts so far.
+///
+/// Two substrings, matched independently, so nothing depends on the arrow, the
+/// `other:` or `error:` prefix, line structure or the platform: the phrase `before
+/// agent relay became available`, AND a clean-exit marker. `{status}` is Rust's
+/// `ExitStatus` Display: `exit code: N` on Windows (hex for a high-bit code such as
+/// `0xc0000409`), `exit status: N` or `signal: N (SIGABRT)` on Unix. Only status 0 is
+/// the transient, so the marker keeps its parentheses, `(exit code: 0)`, which stops a
+/// hex or multi-digit code from matching. A crash exit with the same phrase is
+/// deterministic and must not be retried — the old tab-in-env SIGABRT
+/// (`signal: 6 (SIGABRT)`, msb 0.6.x, see `docs/modules/cassandra.md`) is exactly that.
+fn is_agent_relay_exit(output: &str) -> bool {
+    output.contains("before agent relay became available")
+        && (output.contains("(exit code: 0)") || output.contains("(exit status: 0)"))
+}
+
+/// Pause between the force-remove of a boot that hit msb's clean exit before its agent
+/// relay came up (see [`is_agent_relay_exit`]) and the one retry of that boot. Longer
+/// than [`STATE_DB_RETRY_DELAY`]: the transient correlates with host load, so a retry
+/// fired straight back into the same load would more likely repeat it.
+const AGENT_RELAY_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// The marker line msb's guest agent writes to the SYSTEM log once it has actually
 /// come up — present only once a sandbox's boot genuinely reached a working guest
 /// agent, as opposed to dying before one ever existed.
@@ -1886,6 +1923,81 @@ enum PreRunningFailure {
     Other(RightsizeError),
 }
 
+/// What one raw boot attempt ([`try_run_and_await_running_once`] or
+/// [`try_restore_and_await_running_once`]) can fail with: any [`PreRunningFailure`],
+/// plus msb's clean exit before its agent relay came up (see [`is_agent_relay_exit`]).
+/// That last one is deliberately not a [`PreRunningFailure`] variant. Only
+/// [`retry_once_on_agent_relay_exit`] ever sees it — it retries the attempt and turns a
+/// second hit into a plain error — so none of [`spawn_and_await_running`]'s or
+/// [`spawn_and_await_reboot_restore`]'s own retry matches (which list every variant)
+/// can be handed one, and none needs an arm that can never run.
+#[derive(Debug)]
+enum AttemptFailure {
+    AgentRelayExit { output: String },
+    Classified(PreRunningFailure),
+}
+
+impl From<PreRunningFailure> for AttemptFailure {
+    fn from(failure: PreRunningFailure) -> Self {
+        AttemptFailure::Classified(failure)
+    }
+}
+
+/// Runs `attempt`, one boot attempt of sandbox `name` (`command` is `"run"` or
+/// `"restore"`, for the error text), and retries it ONCE if it fails with msb's clean
+/// exit before its agent relay came up (see [`is_agent_relay_exit`]). It wraps the
+/// innermost attempt functions ([`try_run_and_await_running`] and
+/// [`try_restore_and_await_running_with_launcher`]) rather than any of their callers,
+/// so every boot path gets the retry: attached run boots, reuse boots, direct and
+/// brokered restores, the checkpoint reboot, and the retry attempts the other
+/// transient arms make. A retry attempt is the same closure again, so it keeps the
+/// same name, spec and launcher (broker or direct).
+///
+/// msb leaves the failed sandbox behind: the VM process is gone and its published
+/// ports are released, but a named sandbox's catalog row stays (`Stopped`, or stuck in
+/// `Starting`) along with its directory. A plain same-name `msb run` would then
+/// restart that PERSISTED config and ignore the new flags, and a same-name `msb
+/// restore` would fail with "already exists". So between the attempts this runs `msb
+/// rm -f <name>` best-effort (its result is ignored, like the candidate walks' own
+/// `rm`), waits [`AGENT_RELAY_RETRY_DELAY`], and boots again. `-f` because it also
+/// removes a row stuck in `Starting`, which plain `rm` refuses.
+///
+/// Nothing else needs updating for a same-name retry: the first attempt never reached
+/// `Running`, so `start()` has not yet stored an attached child or added the name to
+/// `started_names` (it does both only after a boot succeeds), and the container layer
+/// put the name in the reaping ledger before the create.
+///
+/// Any other failure — on either attempt — is returned as it is: this arm does not
+/// untangle other retry policies. A second clean exit before the relay is returned as
+/// a plain error naming the sandbox and carrying both attempts' output.
+fn retry_once_on_agent_relay_exit<T>(
+    msb: &Path,
+    name: &str,
+    command: &str,
+    delay: Duration,
+    mut attempt: impl FnMut() -> std::result::Result<T, AttemptFailure>,
+) -> std::result::Result<T, PreRunningFailure> {
+    let output = match attempt() {
+        Ok(booted) => return Ok(booted),
+        Err(AttemptFailure::Classified(failure)) => return Err(failure),
+        Err(AttemptFailure::AgentRelayExit { output }) => output,
+    };
+    let _ = invoke_standalone(msb, &commands::rm_force(name), STOP_TIMEOUT);
+    std::thread::sleep(delay);
+    match attempt() {
+        Ok(booted) => Ok(booted),
+        Err(AttemptFailure::Classified(failure)) => Err(failure),
+        Err(AttemptFailure::AgentRelayExit {
+            output: retry_output,
+        }) => Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+            "msb {command} for sandbox {name}: msb's sandbox process exited before its \
+             agent relay came up on both attempts (the retry ran after `msb rm -f` of the \
+             failed sandbox and a short pause).\nfirst attempt:\n{output}\nafter \
+             retry:\n{retry_output}"
+        )))),
+    }
+}
+
 /// Runs on a blocking thread: spawns `msb run <spec's argv>` attached (no `-d`),
 /// polls `msb ls --format json` until the sandbox reaches `Running`, and returns the
 /// live child for `start()` to keep around. [`try_spawn_and_await_running`]'s
@@ -1906,6 +2018,11 @@ enum PreRunningFailure {
 /// registered cleanup state left over to double-register on the retry. A second
 /// failure (whether cache corruption again or anything else) surfaces an actionable
 /// error naming what was attempted instead of retrying further.
+///
+/// msb's clean exit before its agent relay came up (see [`is_agent_relay_exit`]) has no
+/// arm here: [`try_spawn_and_await_running`] retries it once inside the attempt itself
+/// (see [`retry_once_on_agent_relay_exit`]), so it also covers every retry attempt the
+/// arms above make, and never reaches this match.
 fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Option<Child>> {
     match try_spawn_and_await_running(msb, spec) {
         Ok(child) => Ok(child),
@@ -2097,6 +2214,11 @@ fn spawn_and_await_running(msb: &Path, spec: &ContainerSpec) -> Result<Option<Ch
 /// one's own retry policy auditable on its own, the way this module already
 /// prefers (see [`try_run_and_await_running`] vs [`try_restore_and_await_running`]
 /// for the same trade-off made elsewhere).
+///
+/// msb's clean exit before its agent relay came up (see [`is_agent_relay_exit`]) is
+/// retried once, in place and under the same name, one level down: inside
+/// [`try_restore_and_await_running_with_launcher`], through whichever `launcher` this
+/// attempt was given (see [`retry_once_on_agent_relay_exit`]). No arm here sees it.
 fn spawn_and_await_reboot_restore<L>(
     msb: &Path,
     spec: &ContainerSpec,
@@ -2392,9 +2514,12 @@ fn spawn_and_await_restore_candidates(
 /// [`spawn_and_await_reboot_restore`], never THIS dispatcher); this function (via
 /// [`spawn_and_await_running`]) is now reached for a restore spec only as that
 /// path's defensive fallback — no candidate batch was ever minted, i.e. a caller
-/// bypassing the container layer entirely. Never retries by itself —
-/// [`spawn_and_await_running`] is the only caller and owns the one-shot heal+retry
-/// policy, for either branch alike.
+/// bypassing the container layer entirely. Retries nothing by itself except msb's
+/// clean exit before its agent relay came up, which the two branches' own wrappers
+/// ([`try_run_and_await_running`], [`try_restore_and_await_running_with_launcher`])
+/// retry once — see [`retry_once_on_agent_relay_exit`]. [`spawn_and_await_running`] is
+/// the only caller and owns every other one-shot heal+retry policy, for either branch
+/// alike.
 fn try_spawn_and_await_running(
     msb: &Path,
     spec: &ContainerSpec,
@@ -2405,11 +2530,23 @@ fn try_spawn_and_await_running(
     }
 }
 
-/// The `spec.checkpoint_ref.is_none()` branch of [`try_spawn_and_await_running`]:
-/// spawns an attached `msb run` child, polls until `Running`, and returns either the
-/// live child or a classified [`PreRunningFailure`]. Byte-for-byte the same
-/// supervision this backend has always given an ordinary boot — see
-/// [`try_restore_and_await_running`] for the detached-restore counterpart, which
+/// The `spec.checkpoint_ref.is_none()` branch of [`try_spawn_and_await_running`]: one
+/// attached `msb run` boot (see [`try_run_and_await_running_once`]), retried once if
+/// msb reports its sandbox process exiting cleanly before the agent relay came up —
+/// see [`retry_once_on_agent_relay_exit`].
+fn try_run_and_await_running(
+    msb: &Path,
+    spec: &ContainerSpec,
+) -> std::result::Result<Child, PreRunningFailure> {
+    retry_once_on_agent_relay_exit(msb, &spec.name, "run", AGENT_RELAY_RETRY_DELAY, || {
+        try_run_and_await_running_once(msb, spec)
+    })
+}
+
+/// ONE attempt of [`try_run_and_await_running`]: spawns an attached `msb run` child,
+/// polls until `Running`, and returns either the live child or a classified failure.
+/// Byte-for-byte the same supervision this backend has always given an ordinary boot —
+/// see [`try_restore_and_await_running`] for the detached-restore counterpart, which
 /// this never falls back to or is called by.
 ///
 /// The tail drained here carries msb's own boot output only — registry/pull errors,
@@ -2426,10 +2563,10 @@ fn try_spawn_and_await_running(
 /// agent writes) before this falls back to today's generic "before reaching Running"
 /// error. A non-zero exit never takes this path — see that function's doc for why
 /// both signals, not just the exit code, are required.
-fn try_run_and_await_running(
+fn try_run_and_await_running_once(
     msb: &Path,
     spec: &ContainerSpec,
-) -> std::result::Result<Child, PreRunningFailure> {
+) -> std::result::Result<Child, AttemptFailure> {
     let argv = commands::run(spec);
     let mut child = spawn_msb_command(|| {
         let mut cmd = Command::new(msb);
@@ -2468,13 +2605,21 @@ fn try_run_and_await_running(
                 .collect::<Vec<_>>()
                 .join("\n");
             if is_image_cache_corruption(&output) {
-                return Err(PreRunningFailure::CacheCorruption { output });
+                return Err(PreRunningFailure::CacheCorruption { output }.into());
             }
             if is_msb_state_db_error(&output) {
-                return Err(PreRunningFailure::StateDbError { output });
+                return Err(PreRunningFailure::StateDbError { output }.into());
             }
             if is_msb_install_lock_active(&output) {
-                return Err(PreRunningFailure::InstallLockActive { output });
+                return Err(PreRunningFailure::InstallLockActive { output }.into());
+            }
+            // Before the port-bind and name-conflict checks, and independent of the
+            // exit code. If the `rm -f` before a retry did not clear the sandbox, that
+            // retry's output carries msb's "already exists; creation flags ignored"
+            // warning next to this same message, and must still read as the relay
+            // exit, not as a name collision.
+            if is_agent_relay_exit(&output) {
+                return Err(AttemptFailure::AgentRelayExit { output });
             }
             if is_port_bind_conflict(&output) {
                 return Err(PreRunningFailure::Other(RightsizeError::PortBindConflict {
@@ -2483,7 +2628,8 @@ fn try_run_and_await_running(
                         spec.name
                     ),
                     source: None,
-                }));
+                })
+                .into());
             }
             if is_name_conflict(&output) {
                 return Err(PreRunningFailure::Other(RightsizeError::NameConflict {
@@ -2493,7 +2639,8 @@ fn try_run_and_await_running(
                         spec.name
                     ),
                     source: None,
-                }));
+                })
+                .into());
             }
             // None of the known bad signatures matched. On msb 0.6.16+ a clean exit
             // here is not necessarily a failed boot — see this function's doc for why
@@ -2509,7 +2656,8 @@ fn try_run_and_await_running(
                  image entrypoint and `msb run` output below:\n{output}",
                 spec.name,
                 status.code().unwrap_or(-1)
-            ))));
+            )))
+            .into());
         }
         match running_names_via(msb) {
             Ok(names) if names.contains(&spec.name) => return Ok(child),
@@ -2532,7 +2680,8 @@ fn try_run_and_await_running(
                  a crash-looping entrypoint, or msb itself being unresponsive; last output:\n{output}",
                 spec.name,
                 FIRST_RUN_TIMEOUT.as_secs()
-            ))));
+            )))
+            .into());
         }
         std::thread::sleep(READINESS_POLL);
     }
@@ -2704,18 +2853,37 @@ fn direct_restore_launcher(msb: &Path, argv: &[String]) -> std::io::Result<Resto
 }
 
 /// The launcher-abstracted body of [`try_restore_and_await_running`] — see that
-/// function's own doc (below this one, since it now just delegates here with
-/// [`direct_restore_launcher`]) for the full three-phase behavior. `launcher`
-/// replaces phase 1's own direct spawn+wait; phases 2 and 3 (the `msb ls` poll,
-/// the workload-revival exec) are unchanged either way, since by the time phase 1
-/// returns, activation has already succeeded or failed regardless of how it was
-/// launched.
+/// function's own doc (above this one, since it just delegates here with
+/// [`direct_restore_launcher`]) for the full three-phase behavior: one restore boot
+/// (see [`try_restore_and_await_running_once`]), retried once if msb reports its
+/// sandbox process exiting cleanly before the agent relay came up — see
+/// [`retry_once_on_agent_relay_exit`]. The retry reuses `launcher`, so a brokered
+/// attempt is retried through the broker and a direct one directly.
 fn try_restore_and_await_running_with_launcher<L>(
     msb: &Path,
     spec: &ContainerSpec,
     snapshot_path: &str,
     launcher: &L,
 ) -> std::result::Result<Option<Child>, PreRunningFailure>
+where
+    L: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
+{
+    retry_once_on_agent_relay_exit(msb, &spec.name, "restore", AGENT_RELAY_RETRY_DELAY, || {
+        try_restore_and_await_running_once(msb, spec, snapshot_path, launcher)
+    })
+}
+
+/// ONE attempt of [`try_restore_and_await_running_with_launcher`]. `launcher`
+/// replaces phase 1's own direct spawn+wait; phases 2 and 3 (the `msb ls` poll,
+/// the workload-revival exec) are unchanged either way, since by the time phase 1
+/// returns, activation has already succeeded or failed regardless of how it was
+/// launched.
+fn try_restore_and_await_running_once<L>(
+    msb: &Path,
+    spec: &ContainerSpec,
+    snapshot_path: &str,
+    launcher: &L,
+) -> std::result::Result<Option<Child>, AttemptFailure>
 where
     L: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
 {
@@ -2737,7 +2905,8 @@ where
             return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
                 "failed to launch msb {}: {e}",
                 argv.join(" ")
-            ))));
+            )))
+            .into());
         }
         Ok(RestoreLaunch::TimedOut { output }) => {
             return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
@@ -2746,7 +2915,8 @@ where
                  or unresponsive; last output:\n{output}",
                 spec.name,
                 FIRST_RUN_TIMEOUT.as_secs()
-            ))));
+            )))
+            .into());
         }
         Ok(RestoreLaunch::Exited {
             success,
@@ -2757,16 +2927,22 @@ where
 
     if !status_success {
         if is_image_cache_corruption(&output) {
-            return Err(PreRunningFailure::CacheCorruption { output });
+            return Err(PreRunningFailure::CacheCorruption { output }.into());
         }
         if is_msb_state_db_error(&output) {
-            return Err(PreRunningFailure::StateDbError { output });
+            return Err(PreRunningFailure::StateDbError { output }.into());
         }
         if is_msb_install_lock_active(&output) {
-            return Err(PreRunningFailure::InstallLockActive { output });
+            return Err(PreRunningFailure::InstallLockActive { output }.into());
         }
         if is_restore_access_denied(&output) {
-            return Err(PreRunningFailure::RestoreAccessDenied { output });
+            return Err(PreRunningFailure::RestoreAccessDenied { output }.into());
+        }
+        // After the cases above and before the port-bind and name-conflict ones, and
+        // independent of the exit code. A brokered attempt's output arrives the same
+        // way (PowerShell-decorated, but this only looks for two substrings).
+        if is_agent_relay_exit(&output) {
+            return Err(AttemptFailure::AgentRelayExit { output });
         }
         if is_port_bind_conflict(&output) {
             return Err(PreRunningFailure::Other(RightsizeError::PortBindConflict {
@@ -2775,7 +2951,8 @@ where
                     spec.name
                 ),
                 source: None,
-            }));
+            })
+            .into());
         }
         if is_name_conflict(&output) {
             return Err(PreRunningFailure::Other(RightsizeError::NameConflict {
@@ -2785,14 +2962,16 @@ where
                     spec.name
                 ),
                 source: None,
-            }));
+            })
+            .into());
         }
         return Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
             "msb restore for sandbox {} exited (code {}) — the restore itself failed, so the \
              sandbox never activated; check the snapshot and `msb restore` output below:\n{output}",
             spec.name,
             status_code.unwrap_or(-1)
-        ))));
+        )))
+        .into());
     }
 
     // Phase 2: `restore` exited 0 — activation succeeded and this detached sandbox
@@ -2803,7 +2982,9 @@ where
         if let Ok(ls_result) = invoke_standalone(msb, &commands::ls(), LOGS_TIMEOUT) {
             let sandbox_status = ls_json::status_of(&ls_result.stdout, &spec.name);
             match sandbox_status.as_deref() {
-                Some("Running") => return spawn_workload_exec(msb, spec),
+                Some("Running") => {
+                    return spawn_workload_exec(msb, spec).map_err(AttemptFailure::from);
+                }
                 Some("Stopped") | None => {
                     let reason = if sandbox_status.is_none() {
                         "dropped out of `msb ls` entirely"
@@ -2815,7 +2996,8 @@ where
                          it {reason} while this backend polled `msb ls`. {}",
                         spec.name,
                         restore_boot_failure_diagnostics(msb, &spec.name),
-                    ))));
+                    )))
+                    .into());
                 }
                 Some(_still_booting) => {}
             }
@@ -2827,7 +3009,8 @@ where
                 spec.name,
                 FIRST_RUN_TIMEOUT.as_secs(),
                 restore_boot_failure_diagnostics(msb, &spec.name),
-            ))));
+            )))
+            .into());
         }
         std::thread::sleep(READINESS_POLL);
     }
@@ -9620,5 +9803,793 @@ mod tests {
         assert!(!is_restore_access_denied(
             "io error: something else (os error 13)"
         ));
+    }
+
+    // ---- msb's clean exit before its agent relay came up: `is_agent_relay_exit`,
+    // `retry_once_on_agent_relay_exit` and the boot paths that reach it ----
+
+    /// The output rightsize received from an attached `msb run` (and a direct
+    /// `msb restore`) on a Windows CI runner.
+    const AGENT_RELAY_ATTACHED_RUN_OUTPUT: &str = "error: failed to start \"rz-731fdcdc-8\"\n  \
+        → other: sandbox process exited (exit code: 0) before agent relay became available\n  \
+        → run `msb logs --source system rz-731fdcdc-8` for full diagnostics";
+
+    /// The same failure from a brokered restore on the same runner, verbatim:
+    /// PowerShell decorated the output and mangled the arrows.
+    const AGENT_RELAY_POWERSHELL_OUTPUT: &str = r##"msb.exe : error: failed to start "rz-731fdcdc-8"
+At line:1 char:1
++ & 'C:\Users\runneradmin\AppData\Local\rightsize\msb\0.7.6\bin\msb.exe ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (error: failed to start "rz-731fdcdc-8":String) [], RemoteExcept
+   ion
+    + FullyQualifiedErrorId : NativeCommandError
+
+  ΓåÆ other: sandbox process exited (exit code: 0) before agent relay became available
+  ΓåÆ run `msb logs --source system rz-731fdcdc-8` for full diagnostics"##;
+
+    /// The Unix spelling: `ExitStatus` prints `exit status: N` there, not `exit code: N`.
+    const AGENT_RELAY_UNIX_OUTPUT: &str = "error: failed to start \"rz-731fdcdc-8\"\n  \
+        → other: sandbox process exited (exit status: 0) before agent relay became available\n  \
+        → run `msb logs --source system rz-731fdcdc-8` for full diagnostics";
+
+    #[test]
+    fn is_agent_relay_exit_matches_the_attached_run_capture() {
+        assert!(is_agent_relay_exit(AGENT_RELAY_ATTACHED_RUN_OUTPUT));
+    }
+
+    #[test]
+    fn is_agent_relay_exit_matches_the_powershell_decorated_capture_verbatim() {
+        assert!(is_agent_relay_exit(AGENT_RELAY_POWERSHELL_OUTPUT));
+    }
+
+    #[test]
+    fn is_agent_relay_exit_matches_the_unix_exit_status_spelling() {
+        assert!(is_agent_relay_exit(AGENT_RELAY_UNIX_OUTPUT));
+    }
+
+    #[test]
+    fn is_agent_relay_exit_does_not_depend_on_the_arrow_prefix_or_line_structure() {
+        assert!(is_agent_relay_exit(
+            "sandbox process exited (exit code: 0) before agent relay became available"
+        ));
+        assert!(is_agent_relay_exit(
+            "error: runtime error: failed to start \"rz-abc-1\": sandbox process exited \
+             (exit status: 0) before agent relay became available; startup cleanup pending"
+        ));
+        // The two substrings are independent: either order, any line.
+        assert!(is_agent_relay_exit(
+            "(exit code: 0)\nsome other line\nbefore agent relay became available"
+        ));
+    }
+
+    #[test]
+    fn is_agent_relay_exit_ignores_crash_exits_with_the_same_phrase() {
+        // A Windows high-bit code prints as hex; the closing parenthesis in the marker
+        // keeps `0xc0000409` (and `0x0`) from matching a bare `exit code: 0`.
+        assert!(!is_agent_relay_exit(
+            "  → other: sandbox process exited (exit code: 0xc0000409) before agent relay \
+             became available"
+        ));
+        assert!(!is_agent_relay_exit(
+            "  → other: sandbox process exited (exit code: 0x0) before agent relay became \
+             available"
+        ));
+        assert!(!is_agent_relay_exit(
+            "  → other: sandbox process exited (exit code: 1) before agent relay became available"
+        ));
+        assert!(!is_agent_relay_exit(
+            "  → other: sandbox process exited (exit code: 10) before agent relay became \
+             available"
+        ));
+        assert!(!is_agent_relay_exit(
+            "  → other: sandbox process exited (exit status: 1) before agent relay became \
+             available"
+        ));
+        // The old tab-in-env panic on msb 0.6.x, see docs/modules/cassandra.md.
+        assert!(!is_agent_relay_exit(
+            "sandbox process exited (signal: 6 (SIGABRT)) before agent relay became available"
+        ));
+    }
+
+    #[test]
+    fn is_agent_relay_exit_needs_both_the_phrase_and_a_clean_exit_marker() {
+        assert!(!is_agent_relay_exit(
+            "error: failed to start \"rz-abc-1\"\n  → other: sandbox process exited (exit \
+             code: 0) before the guest came up"
+        ));
+        assert!(!is_agent_relay_exit(
+            "  → other: sandbox process exited before agent relay became available"
+        ));
+        assert!(!is_agent_relay_exit("before agent relay became available"));
+        assert!(!is_agent_relay_exit("(exit code: 0)"));
+        assert!(!is_agent_relay_exit(""));
+    }
+
+    #[test]
+    fn restore_cascade_classifies_the_relay_exit_and_leaves_crash_exits_generic() {
+        let relay = |output: &'static str| {
+            move |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+                Ok(RestoreLaunch::Exited {
+                    success: false,
+                    code: Some(1),
+                    output: output.to_string(),
+                })
+            }
+        };
+        let mut spec = ContainerSpec::new("rz-relay-cascade", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+
+        let hit = try_restore_and_await_running_once(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &relay(AGENT_RELAY_POWERSHELL_OUTPUT),
+        )
+        .expect_err("a clean exit before the relay is a failure");
+        assert!(
+            matches!(&hit, AttemptFailure::AgentRelayExit { output } if output == AGENT_RELAY_POWERSHELL_OUTPUT),
+            "{hit:?}"
+        );
+
+        let crash = try_restore_and_await_running_once(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &relay("sandbox process exited (exit code: 0xc0000409) before agent relay became available"),
+        )
+        .expect_err("a crash exit is a failure too");
+        assert!(
+            matches!(
+                &crash,
+                AttemptFailure::Classified(PreRunningFailure::Other(RightsizeError::Backend(m)))
+                    if m.contains("the restore itself failed")
+            ),
+            "a crash exit must fall through to the generic restore failure: {crash:?}"
+        );
+    }
+
+    #[test]
+    fn retry_once_on_agent_relay_exit_returns_the_second_attempts_success() {
+        let calls = RefCell::new(0u32);
+        let booted = retry_once_on_agent_relay_exit(
+            Path::new("/definitely/not/a/real/msb"),
+            "rz-relay-ok",
+            "run",
+            Duration::from_millis(1),
+            || {
+                *calls.borrow_mut() += 1;
+                if *calls.borrow() == 1 {
+                    Err(AttemptFailure::AgentRelayExit {
+                        output: AGENT_RELAY_ATTACHED_RUN_OUTPUT.to_string(),
+                    })
+                } else {
+                    Ok("booted")
+                }
+            },
+        )
+        .expect("the retry's success must be returned");
+        assert_eq!(booted, "booted");
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    #[test]
+    fn retry_once_on_agent_relay_exit_never_makes_a_third_attempt() {
+        let calls = RefCell::new(0u32);
+        let err = retry_once_on_agent_relay_exit::<()>(
+            Path::new("/definitely/not/a/real/msb"),
+            "rz-relay-twice",
+            "restore",
+            Duration::from_millis(1),
+            || {
+                let n = {
+                    let mut c = calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                Err(AttemptFailure::AgentRelayExit {
+                    output: format!("attempt {n} output"),
+                })
+            },
+        )
+        .expect_err("two clean exits before the relay must end in an error");
+        assert_eq!(*calls.borrow(), 2, "exactly one retry, never a third try");
+        let PreRunningFailure::Other(RightsizeError::Backend(message)) = err else {
+            panic!("expected a plain backend error, got {err:?}");
+        };
+        assert!(message.contains("rz-relay-twice"), "{message}");
+        assert!(message.starts_with("msb restore for sandbox"), "{message}");
+        assert!(
+            message.contains("agent relay came up on both attempts"),
+            "{message}"
+        );
+        assert!(message.contains("attempt 1 output"), "{message}");
+        assert!(message.contains("attempt 2 output"), "{message}");
+        assert!(
+            !message.to_lowercase().contains("already exists"),
+            "the reuse flow reads that phrase as a name collision: {message}"
+        );
+    }
+
+    #[test]
+    fn retry_once_on_agent_relay_exit_leaves_every_other_failure_alone() {
+        let calls = RefCell::new(0u32);
+        let err = retry_once_on_agent_relay_exit::<()>(
+            Path::new("/definitely/not/a/real/msb"),
+            "rz-relay-other",
+            "run",
+            Duration::from_millis(1),
+            || {
+                *calls.borrow_mut() += 1;
+                Err(PreRunningFailure::Other(RightsizeError::Backend("boom".to_string())).into())
+            },
+        )
+        .expect_err("a different failure is returned as it is");
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "no retry for anything but the relay exit"
+        );
+        assert!(matches!(err, PreRunningFailure::Other(_)), "{err:?}");
+
+        // A different classified failure ON the retry is not this arm's to untangle:
+        // it goes back out for the arm that owns it.
+        let calls = RefCell::new(0u32);
+        let err = retry_once_on_agent_relay_exit::<()>(
+            Path::new("/definitely/not/a/real/msb"),
+            "rz-relay-other",
+            "run",
+            Duration::from_millis(1),
+            || {
+                *calls.borrow_mut() += 1;
+                if *calls.borrow() == 1 {
+                    Err(AttemptFailure::AgentRelayExit {
+                        output: AGENT_RELAY_ATTACHED_RUN_OUTPUT.to_string(),
+                    })
+                } else {
+                    Err(PreRunningFailure::StateDbError {
+                        output: "error: database error: x".to_string(),
+                    }
+                    .into())
+                }
+            },
+        )
+        .expect_err("the retry's own failure must come back");
+        assert_eq!(*calls.borrow(), 2);
+        assert!(
+            matches!(err, PreRunningFailure::StateDbError { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_and_await_reboot_restore_retries_the_relay_exit_once_in_place_with_the_same_launcher()
+    {
+        // A brokered attempt's output (PowerShell-decorated) goes through the same
+        // launcher seam. The retry must call that launcher again for the SAME name,
+        // and a failure on the retry (an unrelated one here, so phase 2's `msb ls`
+        // poll is never reached) must be the one surfaced.
+        let argvs = RefCell::new(Vec::<Vec<String>>::new());
+        let launcher = |_msb: &Path, argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            let n = {
+                let mut seen = argvs.borrow_mut();
+                seen.push(argv.to_vec());
+                seen.len()
+            };
+            let output = if n == 1 {
+                AGENT_RELAY_POWERSHELL_OUTPUT.to_string()
+            } else {
+                "error: some unrelated, unclassified restore failure".to_string()
+            };
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output,
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-reboot-restore-relay", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        spec.command = Some(vec!["true".to_string()]);
+
+        let err = spawn_and_await_reboot_restore(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("the retry's unrelated failure must surface");
+
+        let argvs = argvs.borrow();
+        assert_eq!(argvs.len(), 2, "one retry, in place: {argvs:?}");
+        assert_eq!(argvs[0], argvs[1], "same name, same spec");
+        assert!(
+            err.to_string().contains("unrelated"),
+            "the retry's own failure must be the one surfaced: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_and_await_reboot_restore_gives_the_state_db_retry_attempt_its_own_relay_retry() {
+        // The other transients' retry attempts reach the relay retry too, since it sits
+        // inside the attempt: state-db failure, then a relay exit on the state-db
+        // retry, then (after the relay retry) an unrelated failure.
+        let calls = RefCell::new(0u32);
+        let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            let n = {
+                let mut c = calls.borrow_mut();
+                *c += 1;
+                *c
+            };
+            let output = match n {
+                1 => "error: database error: UNIQUE constraint failed".to_string(),
+                2 => AGENT_RELAY_ATTACHED_RUN_OUTPUT.to_string(),
+                _ => "error: some unrelated, unclassified restore failure".to_string(),
+            };
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output,
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-reboot-restore-nested", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        spec.command = Some(vec!["true".to_string()]);
+
+        let err = spawn_and_await_reboot_restore(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("the last, unrelated failure must surface");
+        assert_eq!(*calls.borrow(), 3, "state-db, relay exit, relay retry");
+        assert!(err.to_string().contains("unrelated"), "{err}");
+    }
+
+    /// Writes a fake `msb` for the agent-relay retry tests, then seeds its control
+    /// files. Dispatches on `$1`:
+    /// - `run` / `restore` -> appends its full argv to `<dir>/calls`; while
+    ///   `<dir>/relay-failures-remaining` is above zero it decrements it, prints
+    ///   `<dir>/failure-output` to stderr and exits 1 (the failure being tested).
+    ///   Otherwise it records the sandbox name in `<dir>/booted` and succeeds: an
+    ///   attached `run` then stays alive until `<dir>/stop-requested` appears or `dir`
+    ///   is removed, a `restore` exits 0;
+    /// - `ls` -> answers `Running` for the name in `<dir>/booted`, and an empty list
+    ///   before any boot has succeeded;
+    /// - `exec` -> the long-lived workload revival, until `stop-requested`;
+    /// - `rm` -> appends its argv to `<dir>/calls`; `stop` does too and also touches
+    ///   `<dir>/stop-requested`.
+    ///
+    /// `ls`/`exec` calls are deliberately not recorded, so `calls` holds just the
+    /// boot and cleanup commands, in order.
+    #[cfg(unix)]
+    fn write_fake_msb_for_agent_relay(dir: &Path, failure_output: &str, failures: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-agent-relay.sh");
+        let body = r#"#!/bin/sh
+dir="$(dirname "$0")"
+case "$1" in
+run|restore)
+echo "$*" >> "$dir/calls"
+if [ "$1" = run ]; then name="$3"; else name="$4"; fi
+remaining=$(cat "$dir/relay-failures-remaining" 2>/dev/null || echo 0)
+if [ "$remaining" -gt 0 ]; then
+echo $((remaining - 1)) > "$dir/relay-failures-remaining"
+cat "$dir/failure-output" 1>&2
+exit 1
+fi
+echo "$name" > "$dir/booted"
+if [ "$1" = run ]; then
+while [ -d "$dir" ] && [ ! -f "$dir/stop-requested" ]; do sleep 0.05; done
+fi
+exit 0
+;;
+ls)
+booted=$(cat "$dir/booted" 2>/dev/null || echo '')
+if [ -n "$booted" ]; then echo "[{\"name\":\"$booted\",\"status\":\"Running\"}]"; else echo '[]'; fi
+exit 0
+;;
+exec)
+while [ -d "$dir" ] && [ ! -f "$dir/stop-requested" ]; do sleep 0.05; done
+exit 0
+;;
+stop)
+echo "$*" >> "$dir/calls"
+touch "$dir/stop-requested"
+exit 0
+;;
+rm)
+echo "$*" >> "$dir/calls"
+exit 0
+;;
+esac
+exit 0
+"#;
+        std::fs::write(&script, body).expect("write fake msb agent-relay script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake msb agent-relay script");
+        std::fs::write(dir.join("relay-failures-remaining"), failures.to_string()).unwrap();
+        std::fs::write(dir.join("failure-output"), failure_output).unwrap();
+        script
+    }
+
+    /// The boot and cleanup commands the agent-relay fake saw, one argv per entry.
+    #[cfg(unix)]
+    fn agent_relay_calls(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_run_that_exits_before_the_agent_relay_once_boots_after_a_forced_rm_and_same_name_retry()
+     {
+        let dir = unique_test_dir("agent-relay-run-once");
+        let name = "rz-agent-relay-run-once";
+        let script = write_fake_msb_for_agent_relay(&dir, AGENT_RELAY_ATTACHED_RUN_OUTPUT, 1);
+        let spec = ContainerSpec::new(name, "alpine:3.19", "run-1");
+
+        let mut child = spawn_and_await_running(&script, &spec)
+            .expect("one clean exit before the agent relay, then a good boot, must succeed")
+            .expect("an attached run hands back its live child");
+
+        let calls = agent_relay_calls(&dir);
+        assert_eq!(calls.len(), 3, "run, rm -f, run: {calls:?}");
+        assert!(
+            calls[0].starts_with(&format!("run --name {name}")),
+            "{calls:?}"
+        );
+        assert_eq!(calls[1], format!("rm -f {name}"), "{calls:?}");
+        assert_eq!(
+            calls[2], calls[0],
+            "the retry must boot the same name with the same spec: {calls:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_run_that_exits_before_the_agent_relay_twice_ends_in_the_clear_error_without_a_third_try()
+     {
+        let dir = unique_test_dir("agent-relay-run-twice");
+        let name = "rz-agent-relay-run-twice";
+        let script = write_fake_msb_for_agent_relay(&dir, AGENT_RELAY_ATTACHED_RUN_OUTPUT, 99);
+        let spec = ContainerSpec::new(name, "alpine:3.19", "run-1");
+
+        let err = spawn_and_await_running(&script, &spec)
+            .expect_err("two clean exits before the agent relay must fail the boot");
+        let message = err.to_string();
+        assert!(message.contains(name), "{message}");
+        assert!(
+            message.contains("agent relay came up on both attempts"),
+            "{message}"
+        );
+        assert!(
+            message.contains("before agent relay became available"),
+            "the last attempt's output must be included: {message}"
+        );
+
+        let calls = agent_relay_calls(&dir);
+        assert_eq!(
+            calls.len(),
+            3,
+            "run, rm -f, run — never a third run: {calls:?}"
+        );
+        assert_eq!(calls[1], format!("rm -f {name}"), "{calls:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_run_with_a_crash_exit_before_the_agent_relay_is_not_retried() {
+        for (label, output) in [
+            (
+                "sigabrt",
+                "  → other: sandbox process exited (signal: 6 (SIGABRT)) before agent relay \
+                 became available",
+            ),
+            (
+                "hex",
+                "  → other: sandbox process exited (exit code: 0xc0000409) before agent relay \
+                 became available",
+            ),
+            (
+                "code1",
+                "  → other: sandbox process exited (exit code: 1) before agent relay became \
+                 available",
+            ),
+        ] {
+            let dir = unique_test_dir(&format!("agent-relay-run-crash-{label}"));
+            let name = format!("rz-agent-relay-crash-{label}");
+            let script = write_fake_msb_for_agent_relay(&dir, output, 99);
+            let spec = ContainerSpec::new(&name, "alpine:3.19", "run-1");
+
+            let err = spawn_and_await_running(&script, &spec)
+                .expect_err("a crash exit must fail the boot");
+            assert!(
+                err.to_string().contains("before reaching Running"),
+                "{label}: a crash exit keeps the generic failure: {err}"
+            );
+
+            let calls = agent_relay_calls(&dir);
+            assert_eq!(
+                calls.len(),
+                1,
+                "{label}: one run, no rm -f, no retry: {calls:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_that_exits_before_the_agent_relay_once_boots_after_a_forced_rm_and_same_name_retry()
+    {
+        let dir = unique_test_dir("agent-relay-restore-once");
+        let name = "rz-agent-relay-restore-once";
+        let script = write_fake_msb_for_agent_relay(&dir, AGENT_RELAY_ATTACHED_RUN_OUTPUT, 1);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+        spec.command = Some(vec!["true".to_string()]);
+
+        // No candidate batch: the defensive fallback `spawn_and_await_running` owns.
+        let mut child = spawn_and_await_running(&script, &spec)
+            .expect("one clean exit before the agent relay, then a good restore, must succeed")
+            .expect("phase 3 hands back the workload exec as the live child");
+
+        let calls = agent_relay_calls(&dir);
+        assert_eq!(calls.len(), 3, "restore, rm -f, restore: {calls:?}");
+        assert!(calls[0].starts_with("restore "), "{calls:?}");
+        assert!(calls[0].contains(&format!("--name {name}")), "{calls:?}");
+        assert_eq!(calls[1], format!("rm -f {name}"), "{calls:?}");
+        assert_eq!(calls[2], calls[0], "same name, same spec: {calls:?}");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_that_exits_before_the_agent_relay_twice_ends_in_the_clear_error() {
+        let dir = unique_test_dir("agent-relay-restore-twice");
+        let name = "rz-agent-relay-restore-twice";
+        let script = write_fake_msb_for_agent_relay(&dir, AGENT_RELAY_UNIX_OUTPUT, 99);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+
+        let err = spawn_and_await_running(&script, &spec)
+            .expect_err("two clean exits before the agent relay must fail the restore");
+        let message = err.to_string();
+        assert!(message.contains(name), "{message}");
+        assert!(
+            message.contains("agent relay came up on both attempts"),
+            "{message}"
+        );
+
+        let calls = agent_relay_calls(&dir);
+        assert_eq!(calls.len(), 3, "restore, rm -f, restore only: {calls:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brokered_restore_that_exits_before_the_agent_relay_once_is_retried_through_the_same_broker()
+    {
+        // The fake script stands in for `msb rm -f`/`msb ls`/`msb exec`; the restore
+        // itself goes through a broker-shaped launcher that returns the verbatim
+        // PowerShell-decorated capture once and then succeeds.
+        let dir = unique_test_dir("agent-relay-brokered-restore");
+        let name = "rz-agent-relay-brokered";
+        let script = write_fake_msb_for_agent_relay(&dir, "", 0);
+        let mut spec = ContainerSpec::new(name, "unused-image", "run-1");
+        spec.checkpoint_ref = Some(dir.join("snap_fake").display().to_string());
+        spec.command = Some(vec!["true".to_string()]);
+
+        let argvs = RefCell::new(Vec::<Vec<String>>::new());
+        let broker = |_msb: &Path, argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            let n = {
+                let mut seen = argvs.borrow_mut();
+                seen.push(argv.to_vec());
+                seen.len()
+            };
+            if n == 1 {
+                return Ok(RestoreLaunch::Exited {
+                    success: false,
+                    code: Some(1),
+                    output: AGENT_RELAY_POWERSHELL_OUTPUT.to_string(),
+                });
+            }
+            std::fs::write(dir.join("booted"), name).unwrap();
+            Ok(RestoreLaunch::Exited {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        };
+
+        let mut child = try_restore_and_await_running_with_launcher(
+            &script,
+            &spec,
+            spec.checkpoint_ref.as_ref().unwrap(),
+            &broker,
+        )
+        .expect("a brokered clean exit before the agent relay must be retried and succeed")
+        .expect("phase 3 hands back the workload exec as the live child");
+
+        let argvs = argvs.borrow();
+        assert_eq!(
+            argvs.len(),
+            2,
+            "the broker is called once per attempt: {argvs:?}"
+        );
+        assert_eq!(argvs[0], argvs[1], "same name, same spec, same launcher");
+        assert_eq!(
+            extract_restore_name(&argvs[1]),
+            Some(name),
+            "the retry must target the failed attempt's name"
+        );
+        assert_eq!(
+            agent_relay_calls(&dir),
+            vec![format!("rm -f {name}")],
+            "only the forced rm goes to msb directly; both restores went through the broker"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_restore_candidate_walk_retries_the_relay_exit_under_the_same_candidate() {
+        // `Container::from_checkpoint(...).start()`'s own walk: a relay exit on
+        // candidate 0 is retried in place after `rm -f`, never advancing to
+        // candidate 1, so no re-key is reported.
+        let dir = unique_test_dir("agent-relay-walk-direct");
+        let candidates = vec![
+            "rz-agent-relay-walk-cand-0".to_string(),
+            "rz-agent-relay-walk-cand-1".to_string(),
+        ];
+        let script = write_fake_msb_for_agent_relay(&dir, AGENT_RELAY_ATTACHED_RUN_OUTPUT, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
+        let backend = MsbCliBackend::new(script);
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            checkpoint_ref: Some(dir.join("snap_fake").display().to_string()),
+            restore_name_candidates: Some(candidates.clone()),
+            ..ContainerSpec::new(&candidates[0], "unused-image", "run-1")
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = backend.create(spec).await.expect("create must succeed");
+            backend
+                .start(handle.as_ref())
+                .await
+                .expect("a relay exit on candidate 0 must be retried and then succeed");
+            assert!(
+                backend.winning_start_handle(handle.as_ref()).is_none(),
+                "the retry stays on candidate 0, so nothing is re-keyed"
+            );
+            backend
+                .stop(handle.as_ref())
+                .await
+                .expect("stop must succeed");
+        });
+
+        let calls = agent_relay_calls(&dir);
+        assert!(
+            calls[0].contains(&format!("--name {}", candidates[0])),
+            "{calls:?}"
+        );
+        assert_eq!(calls[1], format!("rm -f {}", candidates[0]), "{calls:?}");
+        assert_eq!(calls[2], calls[0], "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.contains(&candidates[1])),
+            "candidate 1 must never be touched: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalated_brokered_candidate_retries_the_relay_exit_under_the_same_candidate() {
+        // After an access-denied on candidate 0 (direct), candidate 1 is brokered.
+        // A relay exit on that brokered attempt is retried through the broker for the
+        // SAME candidate: the walk does not advance and runs out of candidates.
+        let dir = unique_test_dir("agent-relay-walk-brokered");
+        let candidates = vec![
+            "rz-agent-relay-brokered-cand-0".to_string(),
+            "rz-agent-relay-brokered-cand-1".to_string(),
+        ];
+        let script = write_fake_msb_for_ordinary_restore_access_denied(&dir, 1);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
+        let broker_argvs: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let broker_argvs_for_closure = broker_argvs.clone();
+        let dir_for_closure = dir.clone();
+        let backend = MsbCliBackend::with_restore_broker(script, move |_msb, argv| {
+            let n = {
+                let mut seen = broker_argvs_for_closure.lock().unwrap();
+                seen.push(argv.to_vec());
+                seen.len()
+            };
+            if n == 1 {
+                return Ok(RestoreLaunch::Exited {
+                    success: false,
+                    code: Some(1),
+                    output: AGENT_RELAY_POWERSHELL_OUTPUT.to_string(),
+                });
+            }
+            let name = extract_restore_name(argv).expect("--name present");
+            std::fs::write(dir_for_closure.join("winning-name"), name).unwrap();
+            Ok(RestoreLaunch::Exited {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        });
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            checkpoint_ref: Some(dir.join("snap_fake").display().to_string()),
+            restore_name_candidates: Some(candidates.clone()),
+            ..ContainerSpec::new(&candidates[0], "unused-image", "run-1")
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = backend.create(spec).await.expect("create must succeed");
+            backend
+                .start(handle.as_ref())
+                .await
+                .expect("the brokered relay exit must be retried and then succeed");
+            let winning = backend
+                .winning_start_handle(handle.as_ref())
+                .expect("candidate 1 won, so this must report a re-key");
+            assert_eq!(winning.id(), candidates[1]);
+            backend
+                .stop(winning.as_ref())
+                .await
+                .expect("stop on the winning candidate must succeed");
+        });
+
+        let argvs = broker_argvs.lock().unwrap();
+        assert_eq!(
+            argvs.len(),
+            2,
+            "one brokered attempt plus its retry: {argvs:?}"
+        );
+        assert_eq!(argvs[0], argvs[1], "same candidate, same spec");
+        assert_eq!(
+            extract_restore_name(&argvs[1]),
+            Some(candidates[1].as_str())
+        );
+        let restore_calls: u32 = std::fs::read_to_string(dir.join("restore-calls"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            restore_calls, 1,
+            "only candidate 0's access-denied attempt went direct: {restore_calls}"
+        );
+        let stop_rm_calls = std::fs::read_to_string(dir.join("stop-rm-calls")).unwrap();
+        assert!(
+            stop_rm_calls.lines().any(|l| l == "rm -f"),
+            "the forced rm must run between the two brokered attempts: {stop_rm_calls}"
+        );
+
+        assert_fake_exec_children_gone(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
