@@ -85,15 +85,16 @@ pump — see [UDP network links on the microVM backend](./core-concepts/networki
 
 Showcased in full in [Networking](./core-concepts/networking.md), the mechanism in
 one paragraph: microsandbox microVMs share no bridge network with each other, so
-`exec --stream` is what carries a TCP link's bytes between them. So a
-network link between two containers is emulated as an `/etc/hosts` entry (the alias
-resolves to `127.0.0.1` inside the consuming guest) plus a raw, unbuffered,
-flush-per-read byte pump tunneled over `exec --stream`, backed by a respawned
-`nc -l` listener in the target's guest. The pump can't rely on the proxied socket's
-TCP close propagating (msb's port-publish proxy doesn't forward it), so
-end-of-exchange is inferred from an idle window that only starts counting *after*
-the first byte arrives — scoping it to the whole connection instead would wrongly
-truncate any target slower than the idle window to respond its first byte.
+`exec --stream` is what carries a TCP link's bytes between them. So a network link
+between two containers is emulated as an `/etc/hosts` entry (the alias resolves to
+`127.0.0.1` inside the consuming guest) plus a raw, unbuffered, flush-per-read byte
+pump tunneled over `exec --stream`, backed by a respawned `nc -l` listener in the
+consumer's guest. A target that closes after its response ends the exchange on EOF
+at once: msb's port-publish proxy has passed the guest's close on to the host client
+since msb 0.7.5, which the pin includes. A keep-alive target never closes, so
+end-of-exchange is also inferred from an idle window that only starts counting
+*after* the first byte arrives — scoping it to the whole connection instead would
+wrongly truncate any target slower than the idle window to respond its first byte.
 
 ```text
 consumer guest  --exec --stream-->  msb host process  --raw TCP-->  target's published port
@@ -103,9 +104,10 @@ consumer guest  --exec --stream-->  msb host process  --raw TCP-->  target's pub
 ```
 
 This is genuinely narrower than Docker's native bridge networking — one connection
-at a time, client-speaks-first only, `nc`/busybox required in the consumer image —
-not a temporary limitation waiting to be lifted, but a real trade against "no
-persistent daemon, hardware-isolated microVMs." See
+at a time (a single `nc -l` serves one connection, and the host side finishes that
+exchange before respawning it), client-speaks-first only, `nc`/busybox required in
+the consumer image — not a temporary limitation waiting to be lifted, but a real
+trade against "no persistent daemon, hardware-isolated microVMs." See
 [Backend differences](./backends.md#backend-differences) for the complete list.
 
 ## Binding decisions

@@ -75,11 +75,12 @@ stdout/stderr. Readiness of the sandbox itself (not the workload inside it) is
 "name shows `Running` in `msb ls --format json`"; workload logs come from `msb logs`,
 which has its own quirk (see [Backend differences](#backend-differences) below).
 
-`msb exec` blocks until stdin reaches EOF, so every child process rightsize-rust spawns
-under the hood gets a closed/null stdin — an exec call that's fed an open, never-EOF'd
-stdin (piping in a live process's output, say) hangs forever. This is the single most
-common way to accidentally wedge an `exec()` call — see
-[Troubleshooting](./troubleshooting.md).
+Every child process rightsize-rust spawns under the hood, except the network-link
+tunnel's, gets a closed/null stdin, so a guest command that reads stdin sees EOF at
+once instead of waiting on input nobody sends. The pinned msb forwards a non-terminal
+stdin to the guest command while it runs and exits as soon as the command does; before
+msb 0.7.5, `msb exec` read stdin to EOF before starting the command, so an open pipe
+hung the call. See [Troubleshooting](./troubleshooting.md).
 
 ### Cache
 

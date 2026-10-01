@@ -1,8 +1,8 @@
 //! `ExecTunnel`: one `alias:guest_port` route into a consumer sandbox, bridged over
 //! `msb exec --stream` — sandboxes share no network with each other, so exec is
 //! what carries a TCP link's bytes between them. Client-speaks-first protocols
-//! only; single connection at a time; the in-guest `nc -l` listener is respawned
-//! after every connection.
+//! only; single connection at a time, because the in-guest `nc -l` listener serves one
+//! connection and the worker finishes that exchange before it respawns the listener.
 //!
 //! **Raw, unbuffered, flush-per-read:** every pump in this module reads into a
 //! plain byte buffer and writes+flushes immediately — never through a `BufReader`.
@@ -34,16 +34,17 @@ use crate::commands;
 /// backoff.
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(200);
 
-/// **Confirmed empirically against the real msb binary, and fixed here:** msb's
-/// host-port-publish proxy (the `-p host:guest` layer) does not propagate the target's
-/// own TCP close back to this host-side socket: a plain host TCP client reading a
-/// published port past a `Connection: close` HTTP response never observes EOF, even
-/// after the guest workload has closed its own end. (This is the mirror image of the
-/// "proxy accepts before the guest listens" readiness caveat documented for wait
-/// strategies — here the proxy doesn't propagate close either.) The naive approach —
-/// ending the target-to-guest pump only on a natural `read() == 0` — therefore blocks
-/// forever on this msb build for any single-exchange protocol (every contract-suite
-/// HTTP fixture). The fix: give the
+/// **How the target-to-guest pump knows an exchange is over.** msb's host-port-publish
+/// proxy (the `-p host:guest` layer) passes the target's TCP close on to this host-side
+/// socket on the pinned msb (since 0.7.5): once the guest has closed its side and
+/// every buffered byte has been delivered, the proxy sends FIN, so a target that closes
+/// after its response (`Connection: close`, HTTP/1.0, a server that answers and hangs
+/// up) ends the exchange on `read() == 0` at once. Before 0.7.5 that close never
+/// arrived: a plain host TCP client reading a published port past a `Connection: close`
+/// HTTP response got the data and then nothing, even after the guest workload had
+/// closed its own end. A keep-alive target (any persistent HTTP/1.1 server, e.g. Spring
+/// Cloud Config answering `curl`) never closes, so ending the pump only on a natural
+/// `read() == 0` would block forever on it. The fix, still needed: give the
 /// target-side socket a read timeout and treat a timeout as "this exchange is over"
 /// exactly like EOF — safe here because this tunnel already commits to "one connection
 /// at a time, client-speaks-first", so a real mid-exchange pause longer than this
@@ -55,13 +56,13 @@ const RESPAWN_BACKOFF: Duration = Duration::from_millis(200);
 /// moment the target socket connects would also fire while the target is still working
 /// on its *first* byte — a target slower than this timeout to respond (a cold
 /// config-server request, a slow backend) would then have its response severed at zero
-/// bytes before any data arrived, which is a correctness bug of its own, not a
-/// workaround for the proxy's missing close. [`pump_with_idle_timeout`] therefore
-/// distinguishes two phases: before any data has been read, timeouts are tolerated up
-/// to the much more generous [`FIRST_BYTE_DEADLINE`]; once at least one byte has
-/// arrived, this shorter [`TARGET_IDLE_TIMEOUT`] governs — a gap this long *after* data
-/// has started flowing really does mean "no more data is coming, this exchange is
-/// over", per the tunnel's own single-exchange contract above.
+/// bytes before any data arrived, which is a correctness bug of its own.
+/// [`pump_with_idle_timeout`] therefore distinguishes two phases: before any data has
+/// been read, timeouts are tolerated up to the much more generous
+/// [`FIRST_BYTE_DEADLINE`]; once at least one byte has arrived, this shorter
+/// [`TARGET_IDLE_TIMEOUT`] governs — a gap this long *after* data has started flowing
+/// really does mean "no more data is coming, this exchange is over", per the tunnel's
+/// own single-exchange contract above.
 const TARGET_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long [`pump_with_idle_timeout`] tolerates silence from the target *before any
@@ -226,11 +227,12 @@ fn serve_one_connection(
         sock.set_nodelay(true)?;
         let mut sock_in = sock.try_clone()?;
         // Idle-timeout the target-side read (see TARGET_IDLE_TIMEOUT's doc for why
-        // this exists — msb's port-publish proxy never propagates the target's own
-        // close back to this socket, so a natural `read() == 0` never arrives). Start
-        // with the generous FIRST_BYTE_DEADLINE — `pump_with_idle_timeout` tightens
-        // this to TARGET_IDLE_TIMEOUT itself once the first byte has actually arrived
-        // (these must be two different windows, not one).
+        // this exists — a target that closes after responding ends the exchange on a
+        // natural `read() == 0`, but a keep-alive target never closes, so the idle
+        // window is its only end-of-exchange signal). Start with the generous
+        // FIRST_BYTE_DEADLINE — `pump_with_idle_timeout` tightens this to
+        // TARGET_IDLE_TIMEOUT itself once the first byte has actually arrived (these
+        // must be two different windows, not one).
         sock_in.set_read_timeout(Some(FIRST_BYTE_DEADLINE))?;
         let mut sock_out = sock;
 
@@ -261,9 +263,9 @@ fn serve_one_connection(
             pump(&mut guest_out, &mut sock_out);
         });
         // target -> guest: relay the response back into the exec child's stdin. Ends
-        // either on a natural EOF (a target that does close promptly) or on the idle
-        // timeout above (the common case on this msb build) — both are treated as
-        // "this exchange is over" by `pump_with_idle_timeout`.
+        // either on a natural EOF (a target that closes after responding; msb 0.7.5+
+        // delivers that close) or on the idle timeout above (a keep-alive target) —
+        // both are treated as "this exchange is over" by `pump_with_idle_timeout`.
         pump_with_idle_timeout(&mut sock_in, &mut guest_in);
         // The target side is done; the guest side may still be blocked reading from
         // `nc`'s stdout with nothing more coming. Give it a bounded grace period to
@@ -302,8 +304,7 @@ fn pump<R: Read, W: Write>(src: &mut R, dst: &mut W) {
 /// Same raw unbuffered relay as [`pump`], except `src` is expected to carry a read
 /// timeout and a timeout is treated exactly like a clean EOF — "no more data is coming,
 /// this exchange is over" — rather than as an error to propagate. Used specifically for
-/// the target-to-guest direction, where msb's own port-publish proxy never delivers a
-/// real EOF.
+/// the target-to-guest direction, where a keep-alive target never delivers a real EOF.
 ///
 /// Scoped in two phases (see [`TARGET_IDLE_TIMEOUT`]'s doc comment
 /// for the full rationale): the caller starts `src` with a read timeout of
@@ -367,12 +368,12 @@ mod tests {
         assert!(dst.is_empty());
     }
 
-    /// The msb-proxy-never-closes fix (see [`TARGET_IDLE_TIMEOUT`]'s doc): a real TCP
+    /// The keep-alive-target case (see [`TARGET_IDLE_TIMEOUT`]'s doc): a real TCP
     /// peer that sends data and then goes quiet WITHOUT closing its socket must still
     /// cause `pump_with_idle_timeout` to return (on the idle timeout), not hang
-    /// forever the way a plain [`pump`] would on the same input. This is exactly the
-    /// shape of msb's own port-publish proxy behavior confirmed against the real
-    /// binary during this task's IT verification.
+    /// forever the way a plain [`pump`] would on the same input. A persistent
+    /// HTTP/1.1 server has this shape, and before msb 0.7.5 every target did, since a
+    /// published port never delivered the guest's close.
     #[test]
     fn pump_with_idle_timeout_returns_when_the_peer_goes_quiet_without_closing() {
         use std::net::{TcpListener, TcpStream};
@@ -385,7 +386,7 @@ mod tests {
             conn.write_all(b"hello").unwrap();
             conn.flush().unwrap();
             // Deliberately never close `conn` — held open for the test's duration to
-            // simulate msb's proxy never propagating a close.
+            // simulate a keep-alive target.
             std::thread::sleep(Duration::from_secs(2));
         });
 

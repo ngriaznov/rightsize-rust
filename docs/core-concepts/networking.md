@@ -58,10 +58,11 @@ This is real emulation, not a shortcut, and it has real limits — see below.
   A container started before its dependency is up won't retroactively gain a link to
   it.
 - **One TCP connection at a time per tunnel.** The in-guest `nc -l` listener backing
-  a TCP link serves one connection, then gets respawned for the next. Fine for
-  config-fetch-style traffic; not fine for a long-lived cross-container consumer
-  (e.g. a Kafka consumer reading continuously from a broker on a sibling microVM).
-  UDP links don't share this limit — see the dedicated section below.
+  a TCP link serves one connection, and the host side finishes that exchange before
+  it respawns the listener for the next. Fine for config-fetch-style traffic; not
+  fine for a long-lived cross-container consumer (e.g. a Kafka consumer reading
+  continuously from a broker on a sibling microVM). UDP links don't share this
+  limit — see the dedicated section below.
 - **A TCP link's client speaks first.** The tunnel protocol assumes the connecting
   side sends the first bytes — matches HTTP requests and most RPC-style protocols; a
   server that waits silently for the client to speak needs the client end to
@@ -72,13 +73,18 @@ This is real emulation, not a shortcut, and it has real limits — see below.
   with an error naming the missing binary and suggesting `RIGHTSIZE_BACKEND=docker`
   as the workaround — verified by this crate's own integration suite using
   `mongo:8.0` as the no-`nc` counter-example.
-- **A target that never propagates TCP close can't be detected by naive EOF.** The
-  msb port-publish proxy doesn't propagate the target socket's close to the tunnel,
-  so end-of-exchange is inferred from an idle window *after* the first byte arrives
-  — not from the whole connection, which would wrongly truncate a slow-to-respond
-  target. This is an internal detail (see [How It Works](../how-it-works.md)), but it
-  explains why a connection that never sends any bytes back can hang until the idle
-  timeout rather than closing immediately.
+- **A keep-alive target ends an exchange by going quiet, not by closing.** On the
+  pinned msb (since 0.7.5) a published port passes the guest's close on to the
+  tunnel, so a target that closes after its response (`Connection: close`, HTTP/1.0,
+  a server that answers and hangs up) ends the exchange at once; before 0.7.5 that
+  close never arrived. A persistent HTTP/1.1 server, such as Spring Cloud Config
+  answering `curl`, never closes, so end-of-exchange is still inferred from an idle
+  window *after* the first byte arrives — not from the whole connection, which would
+  wrongly truncate a slow-to-respond target. This is an internal detail (see
+  [How It Works](../how-it-works.md)), but it explains why an exchange with a
+  keep-alive target takes the idle window to finish, and why a target that stays
+  open without ever sending a byte holds the connection for the first-byte deadline
+  (10 seconds).
 
 Every one of these is a real capability gap versus Docker's native bridge networking
 on this backend, not a timing quirk that will resolve itself with retries — pick

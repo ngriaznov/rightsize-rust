@@ -306,8 +306,10 @@ impl MsbCliBackend {
         }
     }
 
-    /// Spawns `msb <args>`, feeding it a closed/null stdin (`msb exec` blocks on
-    /// stdin EOF, and every msb child needs the same treatment to avoid hanging),
+    /// Spawns `msb <args>`, feeding it a closed/null stdin (since msb 0.7.5, `msb exec`
+    /// forwards a non-terminal stdin to the guest command, which then sees EOF at once
+    /// instead of waiting on input nobody sends; before 0.7.5 it read stdin to EOF
+    /// before starting the command, so an open pipe hung the call),
     /// drains stdout/stderr on threads, and waits up to `timeout`. The drain threads are
     /// joined **without a bound** after the process exits (not a fixed cap) so a
     /// large-output command's tail is never truncated by a join deadline.
@@ -2432,7 +2434,7 @@ fn try_run_and_await_running(
     let mut child = spawn_msb_command(|| {
         let mut cmd = Command::new(msb);
         cmd.args(&argv)
-            .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
+            .stdin(Stdio::null()) // every msb child gets a closed stdin (see `invoke`).
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
@@ -2665,7 +2667,7 @@ fn direct_restore_launcher(msb: &Path, argv: &[String]) -> std::io::Result<Resto
     let mut child = spawn_msb_command(|| {
         let mut cmd = Command::new(msb);
         cmd.args(argv)
-            .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
+            .stdin(Stdio::null()) // every msb child gets a closed stdin (see `invoke`).
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
@@ -3268,7 +3270,7 @@ fn spawn_workload_exec(
         let mut child = spawn_msb_command(|| {
             let mut cmd = Command::new(msb);
             cmd.args(&exec_argv)
-                .stdin(Stdio::null()) // msb exec blocks on stdin EOF; give every child a closed stdin.
+                .stdin(Stdio::null()) // every msb child gets a closed stdin (see `invoke`).
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             cmd

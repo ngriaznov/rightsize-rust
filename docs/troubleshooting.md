@@ -6,11 +6,14 @@ mechanism in [How It Works](./how-it-works.md) or the source.
 
 ## "My `exec()` call hangs forever"
 
-**Cause:** `msb exec` blocks until its stdin reaches EOF. Every child process
-rightsize-rust spawns under the hood gets a closed/null stdin for exactly this reason
-— but if you're driving `exec()` with something that pipes in a live, never-closing
-stream of your own, the underlying `msb exec --stream` call has no reason to ever
-see EOF and simply never returns.
+**Cause:** the guest command is waiting on stdin. Every child process rightsize-rust
+spawns under the hood, except the network-link tunnel's, gets a closed/null stdin, so
+the command sees EOF at once — but if you're driving `exec()` with something that
+pipes in a live, never-closing stream of your own, a command that reads stdin (`cat`
+with no arguments, say) never sees EOF and never returns. The pinned msb forwards a
+non-terminal stdin to the command while it runs and exits as soon as the command does;
+before msb 0.7.5, `msb exec` read stdin to EOF before starting the command, so any
+open pipe hung the call.
 
 **Fix:** make sure whatever's feeding stdin into an `exec` call closes cleanly.
 This only bites you if you're doing something unusual with a command's stdin
