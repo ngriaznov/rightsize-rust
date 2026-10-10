@@ -45,7 +45,7 @@
 //! - requireIsolation gating: refuses to start on a non-isolated backend, starts
 //!   normally on a hardware-isolated one: [`require_isolation_gates_start_per_backend_hardware_isolation`]
 //!
-//! Plus two checkpoint/restore behaviors:
+//! Plus three checkpoint/restore behaviors:
 //!
 //! - Both backends succeed with a well-formed, backend-specific ref:
 //!   [`checkpoint_succeeds_on_both_backends_with_a_well_formed_backend_specific_ref`]
@@ -53,6 +53,11 @@
 //!   `rightsize-msb/tests/checkpoint_it.rs`): a marker file written after boot
 //!   survives checkpoint -> stop -> restore:
 //!   [`checkpoint_restore_round_trips_a_marker_file_written_after_boot`]
+//! - A file copied in at start (`with_copy_file_to_container`) is still readable
+//!   after `checkpoint()` on both backends, a container restored without it is
+//!   refused on microsandbox (a typed error naming the guest path), and one that
+//!   adds it again reads the same content on both:
+//!   [`a_copied_file_survives_checkpoint_and_must_be_added_again_on_restore`]
 //!
 //! Plus five runtime-copy behaviors (`ContainerGuard::copy_file_to_container` /
 //! `copy_content_to_container` / `copy_file_from_container`):
@@ -1030,6 +1035,115 @@ async fn checkpoint_restore_round_trips_a_marker_file_written_after_boot() {
         .expect("stop the restored container");
     let backend = raw_backend_for("docker");
     let _ = backend.remove_checkpoint(&cp.checkpoint_ref).await;
+}
+
+/// A file copied in at start (`with_copy_file_to_container`) is a bind mount of a host
+/// file, so it is not part of a checkpoint on either backend. This pins what the
+/// caller sees:
+///
+/// 1. `checkpoint()` keeps the file. On microsandbox the reboot passes `--volume` for
+///    it, from the host file; on docker the container is never touched. The source
+///    container reads the same bytes afterward.
+/// 2. Microsandbox only: `Container::from_checkpoint(&cp).start()` without adding the
+///    file again fails with `RightsizeError::CheckpointCopiedFilesMissing`, naming the
+///    guest path (msb 0.7.8 refuses the restore). Docker cannot tell and starts the
+///    container without the file's content, so nothing is asserted there.
+/// 3. `from_checkpoint(&cp)` with the file added again at the same guest path reads
+///    the same bytes, on both backends.
+///
+/// The host file lives in a fresh temp dir and is deleted only after every container
+/// has stopped. The guest path is under `/srv`: the microsandbox guest mounts `/tmp`
+/// as tmpfs.
+#[tokio::test]
+async fn a_copied_file_survives_checkpoint_and_must_be_added_again_on_restore() {
+    require_backend!();
+    let backend_name = rightsize::backends::active_name();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "rightsize-copied-checkpoint-{}-{nanos:x}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let host_file = dir.join("copied.txt");
+    let payload = format!("rightsize-copied-checkpoint-payload-{nanos:x}\n");
+    std::fs::write(&host_file, &payload).unwrap();
+    let guest_path = "/srv/copied.txt";
+    let copied = || MountableFile::for_host_path(host_file.to_str().unwrap());
+    let wait = || Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(60));
+
+    // (1) The source container reads the file before and after checkpoint().
+    let source = Container::new("alpine:3.19")
+        .with_copy_file_to_container(copied(), guest_path)
+        .with_command(&["sleep", "120"])
+        .waiting_for(wait());
+    let source_guard = source.start().await.expect("source must start");
+    let before = source_guard.exec(&["cat", guest_path]).await.unwrap();
+    assert_eq!(before.exit_code, 0, "{}", before.stderr);
+    assert_eq!(before.stdout, payload);
+
+    let cp = source_guard
+        .checkpoint()
+        .await
+        .expect("checkpoint must succeed with a copied file whose host file exists");
+    let after = source_guard.exec(&["cat", guest_path]).await.unwrap();
+    assert_eq!(after.exit_code, 0, "{}", after.stderr);
+    assert_eq!(
+        after.stdout, payload,
+        "checkpoint() must keep the copied file's content in the source container"
+    );
+
+    // (2) microsandbox refuses a restore that does not add the file again.
+    if backend_name != "docker" {
+        let err = match Container::from_checkpoint(&cp)
+            .waiting_for(wait())
+            .start()
+            .await
+        {
+            Ok(guard) => {
+                guard.stop().await.unwrap();
+                panic!("a restore without the copied file must be refused on microsandbox");
+            }
+            Err(e) => e,
+        };
+        match &err {
+            rightsize::RightsizeError::CheckpointCopiedFilesMissing {
+                guest_paths,
+                msb_output,
+                ..
+            } => assert!(
+                guest_paths.iter().any(|p| p == guest_path),
+                "the refusal must name {guest_path}: {guest_paths:?}\n{msb_output}"
+            ),
+            other => panic!("expected CheckpointCopiedFilesMissing, got: {other}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains(guest_path), "{msg}");
+        assert!(msg.contains("with_copy_file_to_container"), "{msg}");
+    }
+
+    // (3) Adding the file again restores the same content.
+    let restored_guard = Container::from_checkpoint(&cp)
+        .with_copy_file_to_container(copied(), guest_path)
+        .waiting_for(wait())
+        .start()
+        .await
+        .expect("a restore that adds the copied file again must start");
+    let restored = restored_guard.exec(&["cat", guest_path]).await.unwrap();
+    assert_eq!(restored.exit_code, 0, "{}", restored.stderr);
+    assert_eq!(
+        restored.stdout, payload,
+        "the restored container must read the re-added file's content"
+    );
+
+    restored_guard.stop().await.unwrap();
+    source_guard.stop().await.unwrap();
+    let backend = raw_backend_for(&backend_name);
+    let _ = backend.remove_checkpoint(&cp.checkpoint_ref).await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ================================ runtime copy =====================================

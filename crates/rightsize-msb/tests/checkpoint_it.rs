@@ -26,7 +26,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use rightsize::backend::BackendProvider;
-use rightsize::{Container, Wait};
+use rightsize::{Container, MountableFile, RightsizeError, Wait};
 use rightsize_msb::MsbBackendProvider;
 
 static REGISTER: Once = Once::new();
@@ -266,4 +266,126 @@ async fn checkpoint_restarts_the_sandbox_and_restore_recovers_the_marker_file() 
 
     // `_snapshot_cleanup` fires on drop, whether we reach here normally or unwound
     // through a panic above.
+}
+
+/// Two files copied in at start, under different guest directories (msb 0.6.2 dropped
+/// one of two `--mount-file` targets that shared a parent, so these stay apart):
+/// `checkpoint()` keeps both, a restore that adds neither is refused with
+/// `RightsizeError::CheckpointCopiedFilesMissing` naming both guest paths, and a
+/// restore that adds both again reads both files. This is the live two-entry sample of
+/// msb's refusal that `restore_missing_binding_paths` is read against: if the
+/// `guest_paths` assertion fails, the failure message carries msb's own output.
+///
+/// The host files live in a fresh temp dir and are deleted only after every container
+/// has stopped. Guest paths are outside `/tmp` (the microsandbox guest mounts it as
+/// tmpfs).
+#[tokio::test]
+async fn a_checkpoint_of_two_copied_files_is_refused_until_both_are_added_again() {
+    require_msb!();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "rightsize-two-copied-checkpoint-{}-{nanos:x}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = [
+        (
+            dir.join("one.txt"),
+            "/mnt-a/one.txt",
+            format!("one-{nanos:x}\n"),
+        ),
+        (
+            dir.join("two.txt"),
+            "/mnt-b/two.txt",
+            format!("two-{nanos:x}\n"),
+        ),
+    ];
+    for (host, _, payload) in &files {
+        std::fs::write(host, payload).unwrap();
+    }
+    let wait = || Wait::for_log_message(".*", 0).with_startup_timeout(Duration::from_secs(60));
+    let add_copied = |mut c: Container| {
+        for (host, guest, _) in &files {
+            c = c.with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                guest,
+            );
+        }
+        c
+    };
+
+    let source_guard = add_copied(Container::new("alpine:3.19"))
+        .with_command(&["sleep", "120"])
+        .waiting_for(wait())
+        .start()
+        .await
+        .expect("source must start");
+    let cp = source_guard
+        .checkpoint()
+        .await
+        .expect("checkpoint must succeed with copied files whose host files exist");
+    let _snapshot_cleanup = SnapshotCleanup {
+        snapshot_ref: cp.checkpoint_ref.clone(),
+    };
+    for (_, guest, payload) in &files {
+        let read = source_guard.exec(&["cat", guest]).await.unwrap();
+        assert_eq!(read.exit_code, 0, "{guest}: {}", read.stderr);
+        assert_eq!(
+            &read.stdout, payload,
+            "checkpoint() must keep {guest} in the source container"
+        );
+    }
+
+    let err = match Container::from_checkpoint(&cp)
+        .waiting_for(wait())
+        .start()
+        .await
+    {
+        Ok(guard) => {
+            guard.stop().await.unwrap();
+            panic!("a restore that adds no copied file must be refused");
+        }
+        Err(e) => e,
+    };
+    match &err {
+        RightsizeError::CheckpointCopiedFilesMissing {
+            guest_paths,
+            msb_output,
+            ..
+        } => {
+            for (_, guest, _) in &files {
+                assert!(
+                    guest_paths.iter().any(|p| p == guest),
+                    "the refusal must name {guest}: {guest_paths:?}\nmsb said:\n{msb_output}"
+                );
+            }
+        }
+        other => panic!("expected CheckpointCopiedFilesMissing, got: {other}"),
+    }
+    let msg = err.to_string();
+    for (_, guest, _) in &files {
+        assert!(msg.contains(guest), "{msg}");
+    }
+
+    let restored_guard = add_copied(Container::from_checkpoint(&cp))
+        .waiting_for(wait())
+        .start()
+        .await
+        .expect("a restore that adds both copied files again must start");
+    for (_, guest, payload) in &files {
+        let read = restored_guard.exec(&["cat", guest]).await.unwrap();
+        assert_eq!(read.exit_code, 0, "{guest}: {}", read.stderr);
+        assert_eq!(
+            &read.stdout, payload,
+            "the restored container reads {guest}"
+        );
+    }
+
+    restored_guard.stop().await.unwrap();
+    source_guard.stop().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

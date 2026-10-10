@@ -21,6 +21,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
   own `MSB_HOME`, or upgrade the older one. The same applies to `MSB_PATH` pointed at a
   binary older than 0.7.8.
 
+- **Starting a container from a checkpoint now fails clearly when the checkpoint's
+  source had copied files.** Files added with `with_copy_file_to_container` are mounted
+  from the host and are not part of a checkpoint, on either backend; add them again on
+  the container you start with `Container::from_checkpoint(...)`. On microsandbox, a
+  checkpoint taken by this release refuses to start without them, with an error that
+  names the missing paths; checkpoints taken with older releases still start, with those
+  files empty. On Docker the paths stay empty.
+
+### Fixed
+
+- **`checkpoint()` no longer empties files copied in at start.** On microsandbox,
+  `checkpoint()` reboots the container from its snapshot, and the snapshot does not hold
+  files added with `with_copy_file_to_container`. The reboot now mounts them again from
+  their host files, so the container sees them with their content (before, they came back
+  empty, and msb 0.7.8 refuses that reboot outright). `checkpoint()` checks that those host
+  files still exist before it stops anything.
+
 ## [0.7.14] - 2026-10-02
 
 ### Changed

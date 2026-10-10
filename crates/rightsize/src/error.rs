@@ -136,6 +136,56 @@ pub enum RightsizeError {
     )]
     TmpfsRootCheckpoint,
 
+    /// `ContainerGuard::checkpoint()`/`checkpoint_named()` was called on a
+    /// microsandbox container with a file added through
+    /// `Container::with_copy_file_to_container` whose host file no longer exists.
+    /// A copied file is a start-time mount of a host file, not part of the
+    /// snapshot, and microsandbox's checkpoint reboots the container with every
+    /// mount supplied again from its host file — so the reboot would fail after the
+    /// source sandbox was already stopped and removed. Raised before the guest is
+    /// stopped, before the snapshot is taken, and (for a named checkpoint) before an
+    /// existing checkpoint of the same name is replaced. Docker's checkpoint never
+    /// reboots the container, so it has no such check.
+    #[error(
+        "{}",
+        format_checkpoint_copied_file_host_missing(guest_path, host_path)
+    )]
+    CheckpointCopiedFileHostMissing {
+        /// The guest path the copied file is mounted at.
+        guest_path: String,
+        /// The host file that no longer exists.
+        host_path: std::path::PathBuf,
+    },
+
+    /// `Container::from_checkpoint(...).start()` on microsandbox was refused by msb
+    /// because the checkpoint was taken from a container that had files copied in
+    /// at start (`Container::with_copy_file_to_container`) and this container did
+    /// not add them again. A copied file is a start-time mount of a host file, not
+    /// part of the snapshot; msb 0.7.8 records the mounts in the snapshots it
+    /// creates and refuses to restore one without them. Not retried: no other
+    /// sandbox name or attempt changes the outcome. `guest_paths` are the paths msb
+    /// listed (best-effort parse, possibly empty); `msb_output` is msb's own
+    /// output, verbatim.
+    ///
+    /// Only microsandbox raises it, and only for checkpoints taken with msb 0.7.8
+    /// or later. Older checkpoints restore with the file empty, and Docker starts
+    /// the container without the file's content.
+    #[error(
+        "{}",
+        format_checkpoint_copied_files_missing(sandbox, checkpoint_ref, guest_paths, msb_output)
+    )]
+    CheckpointCopiedFilesMissing {
+        /// The sandbox that was being restored.
+        sandbox: String,
+        /// The checkpoint ref it was restored from.
+        checkpoint_ref: String,
+        /// The guest paths msb reported as missing a host file (best-effort
+        /// parse of msb's output; empty when none could be read out of it).
+        guest_paths: Vec<String>,
+        /// msb's own output for the refused restore, verbatim.
+        msb_output: String,
+    },
+
     /// `.require_isolation(true)` was set on a `Container` but the active backend's
     /// `capabilities().hardware_isolated` is `false` — e.g. the docker backend, which
     /// shares the host kernel. Raised in `Container::start()`, before any
@@ -307,6 +357,45 @@ fn format_malformed_archive(path: &std::path::Path, reason: &str) -> String {
     )
 }
 
+/// Renders `CheckpointCopiedFileHostMissing`'s message: what can't be kept, why,
+/// and how microsandbox's checkpoint treats copied files.
+fn format_checkpoint_copied_file_host_missing(
+    guest_path: &str,
+    host_path: &std::path::Path,
+) -> String {
+    format!(
+        "checkpoint() can't keep the copied file at {guest_path}: its host file {} no longer \
+         exists. Copied files are not part of a checkpoint; on microsandbox, checkpoint() \
+         mounts them again from their host files when it reboots the container.",
+        host_path.display()
+    )
+}
+
+/// Renders `CheckpointCopiedFilesMissing`'s message: which sandbox and checkpoint,
+/// why msb refused, what to do about it, then msb's own output. Kept
+/// call-site-neutral (it says nothing about whether the sandbox existed before) since
+/// the same classifier also sees a checkpoint's own reboot.
+fn format_checkpoint_copied_files_missing(
+    sandbox: &str,
+    checkpoint_ref: &str,
+    guest_paths: &[String],
+    msb_output: &str,
+) -> String {
+    let needs = if guest_paths.is_empty() {
+        "msb needs them to restore.".to_string()
+    } else {
+        format!("msb needs them at {} to restore.", guest_paths.join(", "))
+    };
+    format!(
+        "sandbox {sandbox} can't be restored from checkpoint {checkpoint_ref}: the checkpointed \
+         container had files added with with_copy_file_to_container, and copied files are not \
+         part of a checkpoint. {needs} Add the same files again with \
+         with_copy_file_to_container, at the same guest paths, on the container you start from \
+         the checkpoint.\nmsb said:\n{}",
+        msb_output.trim()
+    )
+}
+
 /// Renders `IncompatibleImage`'s message: the same fact-em-dash-remedy grammar as
 /// [`format_unsupported`] — names the supplied repository, the expected one, and how
 /// to override.
@@ -437,6 +526,83 @@ mod tests {
         assert!(msg.contains("docker"), "{msg}");
         assert!(msg.contains("microsandbox"), "{msg}");
         assert!(msg.contains("RIGHTSIZE_BACKEND=microsandbox"), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_copied_file_host_missing_names_both_paths_and_the_microsandbox_rule() {
+        let e = RightsizeError::CheckpointCopiedFileHostMissing {
+            guest_path: "/etc/app/b.conf".to_string(),
+            host_path: std::path::PathBuf::from("/tmp/gone/b.conf"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "checkpoint() can't keep the copied file at /etc/app/b.conf: its host file \
+             /tmp/gone/b.conf no longer exists. Copied files are not part of a checkpoint; on \
+             microsandbox, checkpoint() mounts them again from their host files when it reboots \
+             the container."
+        );
+    }
+
+    #[test]
+    fn checkpoint_copied_files_missing_names_sandbox_ref_paths_remedy_and_msbs_output() {
+        let e = RightsizeError::CheckpointCopiedFilesMissing {
+            sandbox: "rz-abc-1".to_string(),
+            checkpoint_ref: "/cache/checkpoints/src/snap_deadbeef".to_string(),
+            guest_paths: vec!["/etc/app/a.conf".to_string(), "/etc/app/b.conf".to_string()],
+            msb_output: "error: invalid config: restore requires destination bindings for: \
+                         mount /etc/app/a.conf, mount /etc/app/b.conf; provide a destination \
+                         mount for each path\n"
+                .to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("rz-abc-1"), "{msg}");
+        assert!(
+            msg.contains("/cache/checkpoints/src/snap_deadbeef"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("/etc/app/a.conf, /etc/app/b.conf"),
+            "every missing guest path is named: {msg}"
+        );
+        assert!(msg.contains("not part of a checkpoint"), "{msg}");
+        assert!(msg.contains("with_copy_file_to_container"), "{msg}");
+        assert!(
+            msg.contains("restore requires destination bindings for"),
+            "msb's own output rides along: {msg}"
+        );
+        assert!(
+            !msg.contains("was removed"),
+            "a plain from_checkpoint start removed nothing: {msg}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_copied_files_missing_without_parsed_paths_still_reads_as_a_sentence() {
+        let e = RightsizeError::CheckpointCopiedFilesMissing {
+            sandbox: "rz-abc-1".to_string(),
+            checkpoint_ref: "ref".to_string(),
+            guest_paths: Vec::new(),
+            msb_output: "restore requires destination bindings for: something odd".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("msb needs them to restore."), "{msg}");
+        assert!(msg.contains("something odd"), "{msg}");
+    }
+
+    #[test]
+    fn checkpoint_copied_files_missing_avoids_the_phrases_other_classifiers_retry_on() {
+        // `Container::start()` retries on "address already in use"/"already allocated"
+        // and the reuse flow re-adopts on "already exists" anywhere in the message.
+        let e = RightsizeError::CheckpointCopiedFilesMissing {
+            sandbox: "rz-abc-1".to_string(),
+            checkpoint_ref: "ref".to_string(),
+            guest_paths: vec!["/mnt/f.txt".to_string()],
+            msb_output: String::new(),
+        };
+        let msg = e.to_string().to_lowercase();
+        assert!(!msg.contains("address already in use"), "{msg}");
+        assert!(!msg.contains("already allocated"), "{msg}");
+        assert!(!msg.contains("already exists"), "{msg}");
     }
 
     #[test]

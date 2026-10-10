@@ -194,10 +194,15 @@ impl Container {
     /// respect too: a fresh name, fresh host ports, normal reaping, normal `stop()`.
     ///
     /// Deliberately does NOT carry over the checkpoint's `mounts`, `network_id`, or
-    /// `aliases` — the checkpoint already has whatever those mounts wrote, baked
-    /// directly into its filesystem (see [`Checkpoint`]'s own doc for the
-    /// "filesystem capture, not memory" semantics), and network topology has no
-    /// well-defined meaning to carry across a restore.
+    /// `aliases`; network topology has no well-defined meaning to carry across a
+    /// restore. Files copied in at start ([`Container::with_copy_file_to_container`])
+    /// are mounts of host files, not part of a checkpoint on either backend, so the
+    /// container this returns must add them again, at the same guest paths. On
+    /// microsandbox, a checkpoint taken with msb 0.7.8 or later refuses to restore
+    /// without them: `start()` fails with
+    /// [`RightsizeError::CheckpointCopiedFilesMissing`], which names the guest paths
+    /// and is not retried. A checkpoint taken with an older msb restores with the
+    /// file empty, and on Docker the path is left empty.
     ///
     /// Sets both `image` and [`crate::model::ContainerSpec::checkpoint_ref`] to
     /// `cp.ref` — docker ignores the latter (the ref already is a normal image tag,
@@ -363,6 +368,13 @@ impl Container {
     /// its staging directory — so a guest write reaches the host file itself, on both
     /// backends. A mount built with [`FileMount::read_only`] blocks guest writes
     /// (`Read-only file system`), enforced by both backends.
+    ///
+    /// **A copied file is not part of a checkpoint**, on either backend: it is a
+    /// start-time bind mount, and a snapshot or image commit does not capture the
+    /// content behind it. On microsandbox, [`ContainerGuard::checkpoint`] keeps the
+    /// file by mounting it again from its host file when it reboots the container
+    /// (the host file must still exist), and a container started from a checkpoint
+    /// must add the file again with this method — see [`Container::from_checkpoint`].
     pub fn with_copy_file_to_container(mut self, file: MountableFile, guest_path: &str) -> Self {
         self.mounts.push(FileMount::new(file.path(), guest_path));
         self
@@ -2103,10 +2115,19 @@ impl ContainerGuard {
     /// returning, so a caller never gets back a false-ready or unreachable-by-alias
     /// container. Docker's image commit leaves the container undisturbed, so
     /// neither re-installation nor re-wait runs there.
+    ///
+    /// Files copied in at start ([`Container::with_copy_file_to_container`]) are
+    /// mounts of host files and are not part of a checkpoint. On microsandbox the
+    /// reboot mounts each one again from its host file, so a copied file whose host
+    /// file no longer exists is refused with
+    /// [`RightsizeError::CheckpointCopiedFileHostMissing`] before the guest is
+    /// stopped. Docker's commit never reboots the container and leaves its bind
+    /// mounts as they are.
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
         self.ensure_checkpoint_capable()?;
         let handle = self.require_handle()?;
         self.ensure_checkpoint_target_survives_a_stop(&handle)?;
+        self.ensure_checkpoint_copied_files_exist(&handle)?;
         let nonce = checkpoint::generate_ref_nonce();
         let (checkpoint_ref, spec) = self.checkpoint_core(&handle, &nonce).await?;
         Ok(Checkpoint {
@@ -2155,12 +2176,16 @@ impl ContainerGuard {
     /// that replace-removal work — a tmpfs-root re-checkpoint that were instead
     /// refused only once it reached the backend's own `create_checkpoint` would
     /// have already best-effort destroyed the previous same-name entry above,
-    /// for nothing.
+    /// for nothing. So does the copied-file check (see
+    /// `Self::ensure_checkpoint_copied_files_exist`): a re-checkpoint whose reboot
+    /// could not mount a copied file again must not cost the existing checkpoint of
+    /// that name.
     pub async fn checkpoint_named(&self, name: &str) -> Result<Checkpoint> {
         checkpoint::validate_name(name)?;
         self.ensure_checkpoint_capable()?;
         let handle = self.require_handle()?;
         self.ensure_checkpoint_target_survives_a_stop(&handle)?;
+        self.ensure_checkpoint_copied_files_exist(&handle)?;
 
         let cache_dir = self
             .checkpoint_cache_dir_override
@@ -2233,6 +2258,41 @@ impl ContainerGuard {
             return Err(RightsizeError::TmpfsRootCheckpoint);
         }
         Ok(())
+    }
+
+    /// Refuses a microsandbox checkpoint whose reboot could not mount a copied file
+    /// again, BEFORE any of [`Self::checkpoint`]/[`Self::checkpoint_named`]'s own
+    /// remove/registry/backend work — same placement, and the same reason, as
+    /// [`Self::ensure_checkpoint_target_survives_a_stop`].
+    ///
+    /// A file added through [`Container::with_copy_file_to_container`] is a
+    /// start-time bind mount of a host file, so a snapshot does not hold its
+    /// content. microsandbox's checkpoint stops the guest, snapshots and removes
+    /// it, then reboots it from the snapshot with `--volume <host file>:<guest
+    /// path>` for each mount. A host file the caller deleted since `start()` would
+    /// fail that reboot after the source sandbox was already gone, and, for
+    /// `checkpoint_named`, after the previous same-name checkpoint was already
+    /// removed. The check reads `handle.spec().mounts`, which is what the backend
+    /// reboots from (a spec customizer may have changed the builder's list).
+    /// Docker's commit never reboots the container, so nothing is at risk there and
+    /// this only fires for microsandbox. `rightsize-msb`'s own `create_checkpoint`
+    /// makes the same check as a backstop.
+    fn ensure_checkpoint_copied_files_exist(&self, handle: &dyn SandboxHandle) -> Result<()> {
+        if self.backend.name() != "microsandbox" {
+            return Ok(());
+        }
+        match handle
+            .spec()
+            .mounts
+            .iter()
+            .find(|mount| !mount.host_path.exists())
+        {
+            Some(missing) => Err(RightsizeError::CheckpointCopiedFileHostMissing {
+                guest_path: missing.guest_path.clone(),
+                host_path: missing.host_path.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Mints the ref this guard's ACTIVE backend expects to receive for
@@ -4468,9 +4528,9 @@ mod tests {
     // Replaying the checkpoint's OWN captured env unchanged on the microsandbox
     // backend must start cleanly — msb's `restore` never sees it (no `-e` flag),
     // but the workload already has it baked into the captured disk, so there is
-    // nothing lossy about the drop. Mirrors `restore_command_never_carries_env_
-    // mounts_or_root_disk_flags` in `rightsize-msb`'s own `commands` tests, one
-    // layer up.
+    // nothing lossy about the drop. Mirrors `restore_command_never_carries_env_net_
+    // root_disk_disk_only_or_allow_missing_flags` in `rightsize-msb`'s own
+    // `commands` tests, one layer up.
     #[tokio::test]
     async fn from_checkpoint_replaying_captured_env_unchanged_on_microsandbox_starts_cleanly() {
         let source_backend = FakeBackend::named("microsandbox");
@@ -4852,6 +4912,217 @@ mod tests {
         );
 
         guard.stop().await.unwrap();
+    }
+
+    // ---- copied files: pre-flight over the mounts' host files, and re-adding them ----
+
+    /// A host file with `content`, in a fresh temp dir the test owns (and does not
+    /// delete before it ends).
+    fn temp_host_file(label: &str, content: &str) -> std::path::PathBuf {
+        let path = temp_cache_dir(label).join("copied.conf");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    // microsandbox's checkpoint reboots the container from its mounts' host files, so
+    // a deleted one must be refused before the previous same-name checkpoint is
+    // removed (see `ContainerGuard::ensure_checkpoint_copied_files_exist`).
+    #[tokio::test]
+    async fn checkpoint_named_refuses_a_deleted_copied_file_before_removing_the_previous_entry() {
+        let backend = FakeBackend::named("microsandbox");
+        let cache_dir = temp_cache_dir("checkpoint-named-copied-file-gone");
+        checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .write_atomic(&sample_named_entry(
+                "seeded-db",
+                "previous-ref",
+                "microsandbox",
+            ))
+            .unwrap();
+        let host = temp_host_file("copied-file-gone-named", "payload");
+
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                "/etc/app/b.conf",
+            )
+            .with_checkpoint_cache_dir_override(cache_dir.clone());
+        let guard = c.start().await.unwrap();
+        std::fs::remove_file(&host).unwrap();
+
+        let err = guard
+            .checkpoint_named("seeded-db")
+            .await
+            .expect_err("a copied file with no host file left must be refused");
+        match &err {
+            RightsizeError::CheckpointCopiedFileHostMissing {
+                guest_path,
+                host_path,
+            } => {
+                assert_eq!(guest_path, "/etc/app/b.conf");
+                assert_eq!(host_path, &host);
+            }
+            other => panic!("expected CheckpointCopiedFileHostMissing, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("/etc/app/b.conf"), "{msg}");
+        assert!(msg.contains("no longer exists"), "{msg}");
+
+        assert!(
+            backend.state.lock().unwrap().removed_checkpoints.is_empty(),
+            "the previous same-name checkpoint must never be removed once this gate refuses"
+        );
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "create_checkpoint must never be reached"
+        );
+        let entry = checkpoint::Registry::new(&cache_dir, "seeded-db")
+            .read()
+            .expect("the previous registry entry must survive the refused re-checkpoint");
+        assert_eq!(entry.checkpoint_ref, "previous-ref");
+
+        guard.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_refuses_a_deleted_copied_file_before_any_backend_call() {
+        let backend = FakeBackend::named("microsandbox");
+        let present = temp_host_file("copied-file-present", "kept");
+        let gone = temp_host_file("copied-file-gone", "deleted");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(present.to_str().unwrap()),
+                "/etc/app/a.conf",
+            )
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(gone.to_str().unwrap()),
+                "/etc/app/b.conf",
+            );
+        let guard = c.start().await.unwrap();
+        std::fs::remove_file(&gone).unwrap();
+
+        let err = guard
+            .checkpoint()
+            .await
+            .expect_err("a copied file with no host file left must be refused");
+        assert!(
+            matches!(
+                &err,
+                RightsizeError::CheckpointCopiedFileHostMissing { guest_path, .. }
+                    if guest_path == "/etc/app/b.conf"
+            ),
+            "the missing file, not the present one, is named: {err}"
+        );
+        assert!(
+            backend.state.lock().unwrap().committed.is_empty(),
+            "create_checkpoint must never be reached once this gate refuses"
+        );
+
+        guard.stop().await.unwrap();
+    }
+
+    // Docker's commit never reboots the container and the bind mount stays live, so a
+    // deleted host file costs nothing there and the check does not run.
+    #[tokio::test]
+    async fn checkpoint_does_not_check_copied_files_on_a_backend_that_never_reboots() {
+        let backend = FakeBackend::checkpoint_capable();
+        let host = temp_host_file("copied-file-gone-docker-shaped", "payload");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                "/etc/app/b.conf",
+            );
+        let guard = c.start().await.unwrap();
+        std::fs::remove_file(&host).unwrap();
+
+        guard
+            .checkpoint()
+            .await
+            .expect("a backend that never reboots has nothing to re-mount");
+
+        guard.stop().await.unwrap();
+    }
+
+    // With the host file present the checkpoint goes ahead, and the `Checkpoint` it
+    // returns still carries the source spec's mounts (in this process; a registry
+    // entry never stores them).
+    #[tokio::test]
+    async fn checkpoint_with_the_host_file_present_succeeds_and_keeps_the_mount_in_the_spec() {
+        let backend = FakeBackend::named("microsandbox");
+        let host = temp_host_file("copied-file-present-msb", "payload");
+        let c = container_on(&backend)
+            .with_exposed_ports(&[6379])
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                "/etc/app/b.conf",
+            );
+        let guard = c.start().await.unwrap();
+
+        let cp = guard.checkpoint().await.expect("the host file exists");
+        assert_eq!(
+            cp.spec.mounts,
+            vec![FileMount::new(host.clone(), "/etc/app/b.conf")]
+        );
+        assert_eq!(backend.state.lock().unwrap().committed.len(), 1);
+
+        guard.stop().await.unwrap();
+    }
+
+    // The remedy for a refused restore is re-adding the file on the `from_checkpoint`
+    // container: it must reach the backend's spec, and nothing refuses it (the way an
+    // env override on microsandbox is refused).
+    #[tokio::test]
+    async fn from_checkpoint_with_a_re_added_copied_file_hands_the_mount_to_the_backend() {
+        let source_backend = FakeBackend::named("microsandbox");
+        let host = temp_host_file("copied-file-re-added", "payload");
+        let source = container_on(&source_backend)
+            .with_exposed_ports(&[6379])
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                "/etc/app/b.conf",
+            );
+        let source_guard = source.start().await.unwrap();
+        let cp = source_guard.checkpoint().await.unwrap();
+        source_guard.stop().await.unwrap();
+
+        // Re-added: the mount is on the spec the backend creates the restore from.
+        let restore_backend = FakeBackend::named("microsandbox");
+        let restored = Container::from_checkpoint(&cp)
+            .with_backend(restore_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                "/etc/app/b.conf",
+            );
+        let restored_guard = restored
+            .start()
+            .await
+            .expect("re-adding a copied file must never be refused");
+        let created = restore_backend.state.lock().unwrap().created[0].clone();
+        assert_eq!(created.checkpoint_ref, Some(cp.checkpoint_ref.clone()));
+        assert_eq!(
+            created.mounts,
+            vec![FileMount::new(host.clone(), "/etc/app/b.conf")]
+        );
+        restored_guard.stop().await.unwrap();
+
+        // Not re-added: nothing is carried over from the checkpoint's own spec.
+        let bare_backend = FakeBackend::named("microsandbox");
+        let bare_guard = Container::from_checkpoint(&cp)
+            .with_backend(bare_backend.clone())
+            .waiting_for(ReadyImmediately)
+            .start()
+            .await
+            .expect("this fake backend cannot tell; the msb backend is what refuses");
+        assert!(
+            bare_backend.state.lock().unwrap().created[0]
+                .mounts
+                .is_empty(),
+            "from_checkpoint never copies the source's mounts over"
+        );
+        bare_guard.stop().await.unwrap();
     }
 
     // ---- override seam: microsandbox_checkpoint_ref/mint_microsandbox_checkpoint_ref ----
@@ -7773,6 +8044,62 @@ mod tests {
             );
             assert!(state.find_running_calls >= 1);
         }
+        guard.stop().await.unwrap();
+    }
+
+    // A reuse container's adopted handle must carry the builder's mounts: the msb
+    // checkpoint reboots from the handle's own spec, and an adopted handle that lost
+    // its mounts would reboot without the copied files (msb 0.7.8 refuses that after
+    // the source sandbox is already gone). The mounts are part of the reuse identity
+    // (guest path plus content hash), so the builder's list is the adopted
+    // sandbox's list.
+    #[tokio::test]
+    async fn adopted_reuse_handle_carries_the_builders_mounts() {
+        let backend = ReuseFakeBackend::new();
+        let cache_dir = temp_cache_dir("adopt-keeps-mounts");
+        let host = cache_dir.join("copied.conf");
+        std::fs::write(&host, "payload").unwrap();
+        let mounts = vec![FileMount::new(host.clone(), "/etc/app/copied.conf")];
+        let identity = crate::reuse::compute_identity(
+            "redis:7-alpine",
+            &[],
+            &None,
+            &[6379],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            &mounts,
+        )
+        .unwrap();
+        backend.mark_running(&identity.name);
+        crate::reuse::Registry::new(&cache_dir, &identity.hash_hex)
+            .write_atomic(&sample_registry_entry(&identity, 40321))
+            .unwrap();
+
+        let guard = Container::new("redis:7-alpine")
+            .with_backend(backend.clone())
+            .with_cache_dir_override(cache_dir)
+            .with_reuse_env_override(true)
+            .with_exposed_ports(&[6379])
+            .with_copy_file_to_container(
+                MountableFile::for_host_path(host.to_str().unwrap()),
+                "/etc/app/copied.conf",
+            )
+            .waiting_for(ReadyImmediately)
+            .reuse(true)
+            .start()
+            .await
+            .expect("adopt must succeed");
+
+        assert_eq!(guard.name(), identity.name, "this must be an adopt");
+        assert!(backend.state.lock().unwrap().created.is_empty());
+        assert_eq!(
+            guard.require_handle().unwrap().spec().mounts,
+            mounts,
+            "the adopted handle's spec must carry the container's mounts"
+        );
         guard.stop().await.unwrap();
     }
 

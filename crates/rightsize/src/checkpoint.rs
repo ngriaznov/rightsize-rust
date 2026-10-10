@@ -13,6 +13,16 @@
 //! every process restarts from scratch. True microVM memory snapshots need upstream
 //! microsandbox support and stay on the roadmap (see `docs/roadmap.md`).
 //!
+//! **Copied files are not part of a checkpoint.** A file added with
+//! `Container::with_copy_file_to_container` is a start-time bind mount of a host
+//! file, and neither a snapshot nor an image commit captures the content behind it.
+//! microsandbox's `checkpoint()` keeps such files by mounting them again from their
+//! host files when it reboots the container (the host files must still exist). A
+//! container started from a checkpoint must add them again with the same builder
+//! method; on microsandbox, a checkpoint taken with msb 0.7.8 or later refuses to
+//! restore without them (`RightsizeError::CheckpointCopiedFilesMissing`), older
+//! checkpoints restore with the file empty, and on Docker the path is left empty.
+//!
 //! **Named checkpoints** extend this with durable identity: an UNNAMED
 //! `checkpoint()` behaves exactly as above (random ref, no registry entry,
 //! ephemeral). A NAMED `checkpoint_named(name)` additionally writes
@@ -62,8 +72,10 @@ pub struct Checkpoint {
     /// The source container's spec at the moment it was checkpointed — env,
     /// command, exposed ports, memory limit. `Container::from_checkpoint` reads
     /// exactly those four from this; it deliberately does NOT re-apply `mounts`
-    /// (the checkpoint already has whatever those mounts wrote, baked in) or
-    /// `network_id`/`aliases` (network topology never survives a restore).
+    /// (files copied in at start are mounts of host files, not part of a
+    /// checkpoint: add them again with `Container::with_copy_file_to_container` on
+    /// the container you restore) or `network_id`/`aliases` (network topology never
+    /// survives a restore).
     ///
     /// This is the FULL original `ContainerSpec` only when the `Checkpoint` came
     /// directly back from [`crate::ContainerGuard::checkpoint`] or

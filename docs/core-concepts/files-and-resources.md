@@ -39,6 +39,13 @@ guest write reaches the host file itself. If the host copy must not be modified,
 write fails with `Read-only file system`). `.read_write()` is the explicit spelling
 of the default.
 
+A mount is not part of a [checkpoint](../checkpoints.md) on either backend, because
+a snapshot does not capture the content behind it. microsandbox's `checkpoint()`
+mounts each copied file again from its host file when it reboots the container
+(the host file must still exist), and a container started from a checkpoint must
+add the same files again with `with_copy_file_to_container` — see
+[Files copied in at start](../checkpoints.md#files-copied-in-at-start).
+
 ## Memory limits — when and why
 
 `Container::with_memory_limit(megabytes)` caps the container's guest memory. Leaving

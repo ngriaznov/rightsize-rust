@@ -62,6 +62,11 @@ pub struct PortBinding {
 }
 
 /// A host file or directory exposed inside the guest at `guest_path`.
+///
+/// A mount is a start-time bind mount of the host file, so its content is not part of
+/// a checkpoint on either backend. On microsandbox, `checkpoint()` mounts it again
+/// from the host file when it reboots the container; a container started from a
+/// checkpoint must add it again (see `Container::from_checkpoint`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileMount {
     /// The host-side path being mounted in.
@@ -155,9 +160,10 @@ pub struct ContainerSpec {
     /// instead of its normal image boot (msb 0.7.1 replaced `run --from-snapshot`
     /// with this dedicated `restore` command, never carrying `--disk-only` — msb
     /// rejects that flag against the disk-scope snapshots this backend creates —
-    /// and otherwise carrying over only name/ports/memory — see the
-    /// `rightsize-msb` crate's own `commands::restore` for the full list of what
-    /// it does and doesn't carry over from this spec). Deliberately NOT part of the reuse identity hash — reuse and
+    /// and otherwise carrying over only name/ports/memory and the mounts, which
+    /// `restore` takes as `--volume` — see the `rightsize-msb` crate's own
+    /// `commands::restore` for the full list of what it does and doesn't carry
+    /// over from this spec). Deliberately NOT part of the reuse identity hash — reuse and
     /// `from_checkpoint` are not a supported combination (see
     /// `RightsizeError::ReuseCheckpointConflict`). Defaults to `None`.
     pub checkpoint_ref: Option<String>,

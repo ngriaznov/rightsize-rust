@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use rightsize::model::{ContainerSpec, Protocol};
+use rightsize::model::{ContainerSpec, FileMount, Protocol};
 
 /// Builds the argv for `msb run`, in the pinned order: name, memory (if set),
 /// root-disk (if a disk limit or tmpfs root is set), net (if network is disabled),
@@ -81,33 +81,12 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
         argv.push(format!("{k}={v}"));
     }
 
-    // The option block is always spelled out, never left to msb's defaults, for two
-    // reasons on top of each other.
-    //
-    // The access token (`ro`/`rw`) carries `FileMount::read_only`, which msb enforces
-    // as a genuine guest-side write block — and it keeps OUR spec parseable on
-    // Windows. msb stages each mount into a temp directory and canonicalizes it,
-    // which there yields the extended-length `\\?\C:\...` form; its splitter skips a
-    // drive prefix only for a bare drive letter, so with no trailing option block it
-    // splits at the drive's colon and rejects the rest of the path as options.
-    //
-    // `nodev` exists because msb then rebuilds an INTERNAL `tag:staged_path[:opts]`
-    // spec for the same mount, carrying over only the non-default option tokens —
-    // `rw` is its default and is dropped, which on Windows strips the internal spec's
-    // option block and re-creates the exact same drive-colon misparse one layer down
-    // (captured: `--mount "fm_…:\\?\C:\…": expected flag or key=value option`).
-    // `nodev` always survives the carry-over, and for a single-file mount it is
-    // meaningless (no device nodes to block): verified against a real msb 0.6.8 —
-    // `rw,nodev` mounts `rw,nodev` and accepts an in-guest write, `ro,nodev` rejects
-    // one with `Read-only file system`.
+    // Each mount is one `--mount-file` flag; `mount_spec` spells the value (and holds
+    // the reasons it is shaped that way). `restore` re-supplies the same mounts with
+    // `--volume` and the same value, so the two cannot drift apart.
     for mount in &spec.mounts {
         argv.push("--mount-file".to_string());
-        argv.push(format!(
-            "{}:{}:{},nodev",
-            mount.host_path.display(),
-            mount.guest_path,
-            if mount.read_only { "ro" } else { "rw" }
-        ));
+        argv.push(mount_spec(mount));
     }
 
     argv.push(spec.image.clone());
@@ -144,8 +123,9 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 /// the captured disk already, the same semantics `run --from-snapshot` and the
 /// old, now-removed `--disk-only` flag both used to spell out explicitly.
 ///
-/// Carries over `-p` port mappings and `-m` memory (if set), matching [`run`].
-/// Deliberately does NOT carry over:
+/// Carries over `-p` port mappings and `-m` memory (if set), matching [`run`], and
+/// re-supplies every `spec.mounts` entry as `--volume HOST:GUEST:ro|rw,nodev` (see
+/// below). Deliberately does NOT carry over:
 /// - **env** — `restore` itself has no `-e`/`--env` flag at all, so `spec.env`
 ///   never reaches THIS argv. That no longer means the restored workload never
 ///   sees it, though: `restore` only brings the guest agent up (verified live —
@@ -159,13 +139,6 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 ///   `RightsizeError::UnsupportedByBackend` — that gate is about `restore`'s own
 ///   disk-scope replay having no way to honor a CHANGED env, not about env
 ///   reaching the workload at all.
-/// - **mounts** — `--mount-file` has no restore equivalent; restore's `-v`/
-///   `--volume` is a different, unrelated concept (selecting a captured private
-///   disk, or binding an external source), not this backend's host-file bind
-///   mount. `Container::from_checkpoint` never carries a checkpoint's own mounts
-///   over in the first place (they're already baked into the captured disk), and
-///   no caller-added mount on a restored container was ever exercised by a test
-///   before this migration.
 /// - **`--net private`** — restore has no equivalent "profile" flag; `run`'s
 ///   `--net private` and restore's `--no-net` are different policies (see
 ///   `Container::with_network_disabled`'s doc), and `network_disabled` is not one
@@ -176,7 +149,24 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 ///   layer (see `Container::with_disk_limit`/`with_tmpfs_root`'s docs), so this
 ///   was never a combination a caller could rely on either.
 ///
-/// DOES carry `spec.host_udp_egress_ports`, unlike every field above — but as a
+/// **Mounts are re-supplied.** A copied file
+/// (`Container::with_copy_file_to_container`) is a start-time bind mount of a host
+/// file, so a snapshot does not capture its content. msb 0.7.8 records the mounts
+/// in the snapshots it creates and refuses to restore one unless each is given a
+/// destination again (`restore requires destination bindings for: mount
+/// /guest/path`, which `crate::backend` turns into
+/// `RightsizeError::CheckpointCopiedFilesMissing`); msb 0.7.6 restored the same
+/// snapshot with the file empty. `restore` takes the long flag `--volume`, not
+/// `--mount-file`, and parses its value like `--mount-file`'s, so the value is
+/// exactly what [`run`] emits (`mount_spec`). A `--volume` for a guest path the
+/// snapshot never had is accepted too (verified on 0.7.6 and 0.7.8), which is what
+/// lets a container started from a checkpoint add new copied files. The checkpoint
+/// reboot passes the source container's own mounts; an ordinary
+/// `Container::from_checkpoint` restore passes whatever mounts the new container
+/// added. `--allow-missing-resources` is never passed: it would let a missing file
+/// come back empty without a word.
+///
+/// DOES carry `spec.host_udp_egress_ports`, unlike the fields above — but as a
 /// full replacement `--net-default`/`--net-rule` policy rather than `run`'s
 /// additive `--net-rule`, since `restore` has no `--net` profile flag and its
 /// own `--net-rule` only parses alongside `--net-default`/`--no-net`. See the
@@ -198,6 +188,14 @@ pub fn restore(spec: &ContainerSpec, snapshot_path: &str) -> Vec<String> {
     for port in &spec.ports {
         argv.push("-p".to_string());
         argv.push(port_flag_value(port));
+    }
+
+    // One `--volume` per mount, in spec order, with the value `run` gives
+    // `--mount-file` — see `restore`'s doc for why a restore has to name each copied
+    // file again.
+    for mount in &spec.mounts {
+        argv.push("--volume".to_string());
+        argv.push(mount_spec(mount));
     }
 
     // `restore` does not carry a CLI-given `run` policy into the restored
@@ -237,6 +235,41 @@ fn port_flag_value(port: &rightsize::model::PortBinding) -> String {
         Protocol::Tcp => format!("{}:{}", port.host_port, port.guest_port),
         Protocol::Udp => format!("{}:{}/udp", port.host_port, port.guest_port),
     }
+}
+
+/// Formats one mount's value for [`run`]'s `--mount-file` and [`restore`]'s
+/// `--volume`: `HOST:GUEST:ro|rw,nodev`. msb splits both flags' values the same way
+/// (at the colon before the absolute guest path, skipping a Windows drive colon), and
+/// both callers use this function, so the spelling cannot drift between the first
+/// boot and a checkpoint restore. The host path goes in as `Path::display` prints it,
+/// with no conversion (a Windows path keeps its drive letter and backslashes).
+///
+/// The option block is always spelled out, never left to msb's defaults, for two
+/// reasons on top of each other.
+///
+/// The access token (`ro`/`rw`) carries `FileMount::read_only`, which msb enforces
+/// as a genuine guest-side write block — and it keeps OUR spec parseable on
+/// Windows. msb stages each mount into a temp directory and canonicalizes it,
+/// which there yields the extended-length `\\?\C:\...` form; its splitter skips a
+/// drive prefix only for a bare drive letter, so with no trailing option block it
+/// splits at the drive's colon and rejects the rest of the path as options.
+///
+/// `nodev` exists because msb then rebuilds an INTERNAL `tag:staged_path[:opts]`
+/// spec for the same mount, carrying over only the non-default option tokens —
+/// `rw` is its default and is dropped, which on Windows strips the internal spec's
+/// option block and re-creates the exact same drive-colon misparse one layer down
+/// (captured: `--mount "fm_…:\\?\C:\…": expected flag or key=value option`).
+/// `nodev` always survives the carry-over, and for a single-file mount it is
+/// meaningless (no device nodes to block): verified against a real msb 0.6.8 —
+/// `rw,nodev` mounts `rw,nodev` and accepts an in-guest write, `ro,nodev` rejects
+/// one with `Read-only file system`.
+fn mount_spec(mount: &FileMount) -> String {
+    format!(
+        "{}:{}:{},nodev",
+        mount.host_path.display(),
+        mount.guest_path,
+        if mount.read_only { "ro" } else { "rw" }
+    )
 }
 
 /// Builds the argv for `msb copy <src> <name>:<dst>` — copying a host file or
@@ -852,6 +885,8 @@ mod tests {
                 "1024M",
                 "-p",
                 "12345:6379",
+                "--volume",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
             ]
         );
     }
@@ -860,16 +895,19 @@ mod tests {
     fn restore_command_omits_dash_m_when_memory_limit_is_unset() {
         let cmd = restore(&full_spec(), "/cache/checkpoints/rz-ckpt-deadbeefcafe");
         assert!(!cmd.contains(&"-m".to_string()));
-        assert_eq!(cmd.last().unwrap(), "12345:6379");
+        assert_eq!(cmd[cmd.len() - 4], "-p");
+        assert_eq!(cmd[cmd.len() - 3], "12345:6379");
     }
 
     #[test]
-    fn restore_command_never_carries_env_mounts_net_root_disk_or_disk_only_flags() {
-        // `full_spec()` sets env, a mount, and a command — none of them have a
-        // restore equivalent (see `restore`'s own doc), and none may leak through.
-        // `--disk-only` is checked here too: msb 0.7.1 rejects it outright against
-        // the disk-scope snapshots this backend creates (verified live), so it must
-        // never come back.
+    fn restore_command_never_carries_env_net_root_disk_disk_only_or_allow_missing_flags() {
+        // `full_spec()` sets env, a mount, and a command — env and the command have
+        // no restore equivalent (see `restore`'s own doc), and neither may leak
+        // through. `--disk-only` is checked here too: msb 0.7.1 rejects it outright
+        // against the disk-scope snapshots this backend creates (verified live), so
+        // it must never come back. `--mount-file` is run's spelling of a mount;
+        // restore says `--volume`. `--allow-missing-resources` would let a missing
+        // copied file come back empty without a word, so it must never appear.
         let mut spec = full_spec();
         spec.network_disabled = true;
         spec.disk_limit_mb = Some(2048);
@@ -881,6 +919,7 @@ mod tests {
             "--net",
             "--root-disk",
             "--disk-only",
+            "--allow-missing-resources",
             "--",
         ] {
             assert!(
@@ -888,6 +927,116 @@ mod tests {
                 "restore argv must never contain {forbidden:?}: {cmd:?}"
             );
         }
+        assert!(cmd.contains(&"--volume".to_string()), "{cmd:?}");
+    }
+
+    #[test]
+    fn restore_command_emits_one_volume_flag_per_mount_after_the_ports() {
+        let mut spec = full_spec();
+        spec.memory_limit_mb = Some(1024);
+        spec.mounts = vec![FileMount::new(
+            PathBuf::from("/host/app.conf"),
+            "/etc/app/app.conf".to_string(),
+        )];
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert_eq!(
+            cmd,
+            vec![
+                "restore",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "--name",
+                "rz-abc-1",
+                "-m",
+                "1024M",
+                "-p",
+                "12345:6379",
+                "--volume",
+                "/host/app.conf:/etc/app/app.conf:rw,nodev",
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_command_emits_two_mounts_in_spec_order_with_their_own_access_token() {
+        let mut spec = full_spec();
+        spec.mounts = vec![
+            FileMount::new(PathBuf::from("/host/b.conf"), "/etc/app/b.conf".to_string())
+                .read_only(),
+            FileMount::new(PathBuf::from("/host/a.conf"), "/etc/app/a.conf".to_string()),
+        ];
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert_eq!(
+            cmd,
+            vec![
+                "restore",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "--name",
+                "rz-abc-1",
+                "-p",
+                "12345:6379",
+                "--volume",
+                "/host/b.conf:/etc/app/b.conf:ro,nodev",
+                "--volume",
+                "/host/a.conf:/etc/app/a.conf:rw,nodev",
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_command_with_no_mounts_emits_no_volume_flag() {
+        let mut spec = full_spec();
+        spec.mounts = Vec::new();
+        let cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        assert!(!cmd.contains(&"--volume".to_string()), "{cmd:?}");
+    }
+
+    #[test]
+    fn restore_command_passes_a_windows_style_host_path_through_unchanged() {
+        // No path conversion anywhere: the drive letter and backslashes reach msb as
+        // the caller wrote them, and the always-present option block is what keeps
+        // msb's splitter from reading the drive colon as the separator.
+        let mut spec = full_spec();
+        spec.mounts = vec![FileMount::new(
+            PathBuf::from(r"C:\Users\dev\fixtures\b.conf"),
+            "/etc/app/b.conf".to_string(),
+        )];
+        let restore_cmd = restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe");
+        let expected = r"C:\Users\dev\fixtures\b.conf:/etc/app/b.conf:rw,nodev";
+        let at = restore_cmd
+            .iter()
+            .position(|a| a == "--volume")
+            .expect("expected a --volume flag");
+        assert_eq!(restore_cmd[at + 1], expected);
+
+        // And `run` spells the very same mount the very same way.
+        let run_cmd = run(&spec);
+        let at = run_cmd
+            .iter()
+            .position(|a| a == "--mount-file")
+            .expect("expected a --mount-file flag");
+        assert_eq!(run_cmd[at + 1], expected);
+    }
+
+    #[test]
+    fn restore_and_run_share_one_spelling_for_every_mount() {
+        let mut spec = full_spec();
+        spec.mounts = vec![
+            FileMount::new(PathBuf::from("/host/rw.conf"), "/etc/rw.conf".to_string()),
+            FileMount::new(PathBuf::from("/host/ro.conf"), "/etc/ro.conf".to_string()).read_only(),
+        ];
+        let after = |cmd: &[String], flag: &str| -> Vec<String> {
+            cmd.windows(2)
+                .filter(|w| w[0] == flag)
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        assert_eq!(
+            after(&run(&spec), "--mount-file"),
+            after(
+                &restore(&spec, "/cache/checkpoints/rz-ckpt-deadbeefcafe"),
+                "--volume"
+            )
+        );
     }
 
     #[test]
@@ -1030,6 +1179,8 @@ mod tests {
                 "rz-abc-1",
                 "-p",
                 "12345:6379",
+                "--volume",
+                "/tmp/f.conf:/etc/f.conf:rw,nodev",
                 "--net-default",
                 "deny",
                 "--net-rule",

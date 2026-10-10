@@ -86,6 +86,22 @@ file behind it. See
 call — but remember the write lands on the host file itself; if that's not wanted,
 mount a copy instead.
 
+## "`from_checkpoint(...).start()` fails with `CheckpointCopiedFilesMissing`" (or `checkpoint()` with `CheckpointCopiedFileHostMissing`)
+
+**Cause:** a file added with `with_copy_file_to_container` is a mount of a host
+file, not part of a checkpoint. microsandbox (msb 0.7.8) refuses to restore a
+checkpoint whose copied files are not given again, and the error names the guest
+paths it needs. `CheckpointCopiedFileHostMissing` is the other half: on
+microsandbox `checkpoint()` mounts each copied file again from its host file when
+it reboots the container, and one of those host files was deleted after `start()`.
+
+**Fix:** for `CheckpointCopiedFilesMissing`, call `with_copy_file_to_container` on
+the `Container::from_checkpoint(...)` builder with the same guest path for each file
+named in the error. For
+`CheckpointCopiedFileHostMissing`, keep the host file in place until the container
+has been checkpointed. Nothing was stopped or replaced when it fires. See
+[Files copied in at start](./checkpoints.md#files-copied-in-at-start).
+
 ## "A no-`nc` image fails to join a network, citing Docker"
 
 **Cause:** microsandbox's network-alias emulation is implemented as a shelled-out

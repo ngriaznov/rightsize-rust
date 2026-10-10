@@ -8,7 +8,9 @@ container's life.
 `Container::with_copy_file_to_container` (covered in
 [Files & Resources](./core-concepts/files-and-resources.md)) configures a mount
 **before boot** — it's part of the spec the container starts from, and it never
-changes again for that container's lifetime.
+changes again for that container's lifetime. A start-time mount is a view of the
+host file, so it is not part of a [checkpoint](./checkpoints.md#files-copied-in-at-start)
+on either backend.
 
 The operations on this page run **after** `start()`, against an already-running
 container — useful when the file to copy doesn't exist yet at boot time (a

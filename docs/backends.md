@@ -165,7 +165,12 @@ but a few edges are real, not just timing quirks:
   staging directory), so a guest write reaches the host file itself. A mount built
   with `FileMount::read_only` blocks guest writes with `Read-only file system` —
   enforced in-guest on both backends, where earlier releases documented msb's `ro`
-  as advisory-only.
+  as advisory-only. Neither backend puts a mount's content in a
+  [checkpoint](./checkpoints.md#files-copied-in-at-start): microsandbox's
+  `checkpoint()` mounts the file again from its host file on the reboot, a
+  container started from a checkpoint adds it again, and microsandbox refuses to
+  restore a checkpoint taken by msb 0.7.8 without it, where Docker leaves the path
+  empty.
 - **`follow_output`'s tail-flush on microsandbox is a watchdog, not a stream close.**
   `msb logs -f` never exits on its own once its sandbox stops, so this backend polls
   in the background and replays only the not-yet-delivered tail

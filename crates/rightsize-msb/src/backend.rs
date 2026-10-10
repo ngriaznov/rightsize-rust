@@ -570,6 +570,72 @@ fn is_agent_relay_exit(output: &str) -> bool {
         && (output.contains("(exit code: 0)") || output.contains("(exit status: 0)"))
 }
 
+/// The stable core of msb's refusal to restore a snapshot whose mounts have no
+/// destination: matched as a bare substring, never together with the `invalid config:`
+/// prefix, the hint lines, the arrows or the line structure.
+const RESTORE_MISSING_BINDINGS: &str = "restore requires destination bindings for";
+
+/// True if `output` (a `msb restore` invocation's combined stdout/stderr) is msb
+/// refusing to restore a snapshot because the files that were copied into the
+/// snapshotted container at start (`Container::with_copy_file_to_container`, a
+/// start-time bind mount of a host file) were not given a destination again. A
+/// snapshot does not capture a bind-mounted file's content, so msb 0.7.8 records the
+/// mounts in the snapshots it creates and refuses a plain restore of one. Captured
+/// verbatim from msb 0.7.8:
+///
+/// ```text
+/// error: invalid config: restore requires destination bindings for: mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources
+///   → map each path with -v SOURCE:GUEST or --mount-disk SOURCE:GUEST
+///   → or pass --allow-missing-resources to start without them
+/// ```
+///
+/// msb 0.7.6 has the same `restore requires destination bindings for: ` sentence with
+/// a different tail (`; provide --volume mappings, select captured disks with --volume
+/// GUEST, or explicitly use --allow-missing-resources`) for other restore shapes, and
+/// 0.7.8 has a second tail for disk entries, so only the sentence is matched. It never
+/// depends on `invalid config:`, the hints, the `→` arrows (PowerShell mangles them in
+/// a brokered capture) or where the lines break, the same reasoning as
+/// [`is_agent_relay_exit`].
+///
+/// This is not a transient: no other sandbox name or later attempt changes the
+/// outcome, so the caller turns it straight into
+/// [`RightsizeError::CheckpointCopiedFilesMissing`] with no retry. msb's own advice to
+/// pass `--allow-missing-resources` is never followed — the file would come back
+/// empty without a word.
+fn is_restore_missing_bindings(output: &str) -> bool {
+    output.contains(RESTORE_MISSING_BINDINGS)
+}
+
+/// Reads the guest paths out of msb's missing-bindings refusal (see
+/// [`is_restore_missing_bindings`]): the entries listed between `bindings for:` and
+/// the first `;`, split on commas, each reduced to its absolute path (so `mount
+/// /etc/app/b.conf` and a disk entry both yield the path). msb does not allow `;` or
+/// `,` in a guest mount path, so the cuts are safe. An entry with no `/` is dropped;
+/// a refusal this cannot read yields an empty list, and the error still carries msb's
+/// whole output, so nothing depends on this parse being complete.
+fn restore_missing_binding_paths(output: &str) -> Vec<String> {
+    let Some(at) = output.find(RESTORE_MISSING_BINDINGS) else {
+        return Vec::new();
+    };
+    let rest = output[at + RESTORE_MISSING_BINDINGS.len()..].trim_start();
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    let listed = match rest.find(';') {
+        Some(end) => &rest[..end],
+        None => rest.lines().next().unwrap_or(""),
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for entry in listed.split(',') {
+        let Some(slash) = entry.find('/') else {
+            continue;
+        };
+        let path = entry[slash..].trim();
+        if !path.is_empty() && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
 /// Pause between the force-remove of a boot that hit msb's clean exit before its agent
 /// relay came up (see [`is_agent_relay_exit`]) and the one retry of that boot. Longer
 /// than [`STATE_DB_RETRY_DELAY`]: the transient correlates with host load, so a retry
@@ -652,6 +718,25 @@ fn is_agent_endpoint_not_ready(stderr: &str) -> bool {
 /// probe failure must never masquerade as "not there."
 fn is_snapshot_not_found(output: &str) -> bool {
     output.to_lowercase().contains("snapshot not found")
+}
+
+/// Refuses a checkpoint whose reboot could not mount a copied file again: every
+/// `spec.mounts` host file must still exist, checked in spec order. The reboot
+/// restores the container with `--volume <host file>:<guest path>` for each mount (a
+/// copied file is a bind mount of a host file, and a snapshot does not hold its
+/// content), so a host file the caller deleted would fail the reboot after the source
+/// sandbox was already stopped, snapshotted and removed. This runs before any of
+/// that. `rightsize::ContainerGuard::checkpoint`/`checkpoint_named` carry the same
+/// check ahead of their own replace-removal of a previous checkpoint; this one stays
+/// as a backstop for a caller that reaches the SPI directly.
+fn ensure_mount_host_files_exist(spec: &ContainerSpec) -> Result<()> {
+    match spec.mounts.iter().find(|m| !m.host_path.exists()) {
+        Some(missing) => Err(RightsizeError::CheckpointCopiedFileHostMissing {
+            guest_path: missing.guest_path.clone(),
+            host_path: missing.host_path.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Mints an absolute checkpoint ref for `nonce_or_name`: a path under
@@ -1344,7 +1429,10 @@ impl SandboxBackend for MsbCliBackend {
     /// platform. See the "job-free restore broker" module section for the
     /// broker's own mechanics.
     ///
-    /// Same ports/memory/env as before either way (msb 0.7.1 replaced `run
+    /// Same ports/memory as before either way, and the same copied files: each
+    /// mount is passed to `restore` again as `--volume`, since a snapshot does not
+    /// hold a bind-mounted file's content and msb 0.7.8 refuses to restore one
+    /// without them (msb 0.7.1 replaced `run
     /// --from-snapshot` with this dedicated `restore` command, and no longer
     /// takes `--disk-only` for a disk-scope snapshot — see `commands::restore`'s
     /// own doc for what changed and why) — see `msb_checkpoint_cycle`/
@@ -1403,6 +1491,13 @@ impl SandboxBackend for MsbCliBackend {
     /// left to snapshot. (`rightsize::ContainerGuard::checkpoint`/`checkpoint_named`
     /// carry an identical check of their own, run BEFORE any registry work — this
     /// one stays as a defense-in-depth backstop.)
+    ///
+    /// Copied files ([`ContainerSpec::mounts`]) are start-time bind mounts, so the
+    /// snapshot does not hold their content: the reboot below restores with
+    /// `--volume` for each one, from its host file. A container whose mount's host
+    /// file no longer exists is refused with
+    /// [`RightsizeError::CheckpointCopiedFileHostMissing`] before the sandbox is
+    /// stopped (see `ensure_mount_host_files_exist`).
     async fn create_checkpoint(
         &self,
         handle: &dyn SandboxHandle,
@@ -1412,6 +1507,7 @@ impl SandboxBackend for MsbCliBackend {
         if handle.spec().tmpfs_root_mb.is_some() {
             return Err(RightsizeError::TmpfsRootCheckpoint);
         }
+        ensure_mount_host_files_exist(handle.spec())?;
         assert!(
             !fresh_names.is_empty(),
             "rightsize::ContainerGuard::checkpoint_core always mints at least one candidate"
@@ -2926,6 +3022,22 @@ where
     };
 
     if !status_success {
+        // First, so no transient classifier below can swallow it, and `Other` so no
+        // retry arm in `spawn_and_await_running`/`spawn_and_await_reboot_restore`
+        // (and no agent-relay retry) touches it: a copied file nobody re-added is not
+        // fixed by another attempt or another sandbox name. The brokered launcher's
+        // output reaches this same check, since both end in `RestoreLaunch::Exited`.
+        if is_restore_missing_bindings(&output) {
+            return Err(
+                PreRunningFailure::Other(RightsizeError::CheckpointCopiedFilesMissing {
+                    sandbox: spec.name.clone(),
+                    checkpoint_ref: snapshot_path.to_string(),
+                    guest_paths: restore_missing_binding_paths(&output),
+                    msb_output: output,
+                })
+                .into(),
+            );
+        }
         if is_image_cache_corruption(&output) {
             return Err(PreRunningFailure::CacheCorruption { output }.into());
         }
@@ -3966,7 +4078,22 @@ fn msb_checkpoint_cycle_inner<T>(
         name,
         reboot_retry_budget,
         reboot_retry_delay,
-    )?;
+    )
+    .map_err(|e| match e {
+        // `reboot_with_already_exists_retry` hands this one back unchanged for the
+        // ordinary-restore walk's sake. Here the source sandbox has already been
+        // removed, so say so, the same way its own catch-all does. The mounts come
+        // from the container's own spec, so this should not happen; if it ever does
+        // the text stays accurate.
+        e @ RightsizeError::CheckpointCopiedFilesMissing { .. } => {
+            RightsizeError::Backend(format!(
+                "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
+                 sandbox was removed but its state is preserved in checkpoint {checkpoint_ref}, \
+                 restorable via Container::from_checkpoint(...)"
+            ))
+        }
+        other => other,
+    })?;
 
     Ok((checkpoint_ref, rebooted, captured_cmdline))
 }
@@ -4000,7 +4127,11 @@ fn msb_checkpoint_cycle_inner<T>(
 /// why. Any OTHER error `reboot` returns (on the first attempt or a later one)
 /// surfaces immediately, the same as it always has; retrying a genuinely
 /// unclassified failure on this budget would just delay reporting a real
-/// problem.
+/// problem. The one exception is [`RightsizeError::CheckpointCopiedFilesMissing`]
+/// (msb refusing a restore that does not re-supply a copied file): it is returned as
+/// it is, not re-worded, because this loop also drives an ordinary
+/// `Container::from_checkpoint(...).start()`, where no sandbox was removed, and the
+/// caller needs the typed error.
 ///
 /// **This function itself still only ever retries the SAME call to `reboot`
 /// — it has no notion of "candidates" at all.** `MsbCliBackend::create_checkpoint`'s
@@ -4029,6 +4160,10 @@ fn reboot_with_already_exists_retry<T>(
         Ok(rebooted) => return Ok(rebooted),
         Err(RightsizeError::NameConflict { message, .. }) => message,
         Err(RightsizeError::Backend(message)) if is_restore_access_denied(&message) => message,
+        // Not re-worded: an ordinary `from_checkpoint(...).start()` walks this loop too,
+        // and nothing was removed there. `msb_checkpoint_cycle_inner` adds the "sandbox
+        // was removed" note for its own caller.
+        Err(e @ RightsizeError::CheckpointCopiedFilesMissing { .. }) => return Err(e),
         Err(e) => {
             return Err(RightsizeError::Backend(format!(
                 "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) — the \
@@ -4062,6 +4197,7 @@ fn reboot_with_already_exists_retry<T>(
             Err(RightsizeError::Backend(message)) if is_restore_access_denied(&message) => {
                 last_message = message;
             }
+            Err(e @ RightsizeError::CheckpointCopiedFilesMissing { .. }) => return Err(e),
             Err(e) => {
                 return Err(RightsizeError::Backend(format!(
                     "re-booting sandbox {name} from checkpoint {checkpoint_ref} failed ({e}) \
@@ -10590,6 +10726,765 @@ exit 0
         );
 
         assert_fake_exec_children_gone(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- copied files across a checkpoint: msb's missing-bindings refusal
+    // (`is_restore_missing_bindings`), the reboot's `--volume` re-supply, and the
+    // pre-flight over the mounts' host files ----
+
+    /// Verbatim from msb 0.7.8 (three lines, two arrow hints).
+    const RESTORE_REFUSAL_0_7_8: &str = "error: invalid config: restore requires destination bindings for: mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources\n  → map each path with -v SOURCE:GUEST or --mount-disk SOURCE:GUEST\n  → or pass --allow-missing-resources to start without them";
+
+    /// msb 0.7.6's tail on the same sentence, used for other restore shapes.
+    const RESTORE_REFUSAL_0_7_6_TAIL: &str = "error: restore requires destination bindings for: mount /etc/app/b.conf; provide --volume mappings, select captured disks with --volume GUEST, or explicitly use --allow-missing-resources";
+
+    /// The same refusal as a brokered restore delivers it on Windows: PowerShell
+    /// decorated the output, wrapped a line and mangled the arrows.
+    const RESTORE_REFUSAL_POWERSHELL: &str = r##"msb.exe : error: invalid config: restore requires destination bindings for: mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources
+At line:1 char:1
++ & 'C:\Users\runneradmin\AppData\Local\rightsize\msb\0.7.8\bin\msb.exe ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (error: invalid ...:String) [], RemoteExcept
+   ion
+    + FullyQualifiedErrorId : NativeCommandError
+
+  ΓåÆ map each path with -v SOURCE:GUEST or --mount-disk SOURCE:GUEST
+  ΓåÆ or pass --allow-missing-resources to start without them"##;
+
+    #[test]
+    fn is_restore_missing_bindings_matches_the_msb_0_7_8_refusal_verbatim() {
+        assert!(is_restore_missing_bindings(RESTORE_REFUSAL_0_7_8));
+    }
+
+    #[test]
+    fn is_restore_missing_bindings_matches_the_msb_0_7_6_tail_variant() {
+        assert!(is_restore_missing_bindings(RESTORE_REFUSAL_0_7_6_TAIL));
+    }
+
+    #[test]
+    fn is_restore_missing_bindings_matches_the_powershell_decorated_capture() {
+        assert!(is_restore_missing_bindings(RESTORE_REFUSAL_POWERSHELL));
+    }
+
+    #[test]
+    fn is_restore_missing_bindings_does_not_depend_on_the_prefix_hints_or_line_structure() {
+        assert!(is_restore_missing_bindings(
+            "restore requires destination bindings for: mount /mnt/f.txt"
+        ));
+        assert!(is_restore_missing_bindings(
+            "something: restore requires destination bindings for\nmount /mnt/f.txt"
+        ));
+    }
+
+    #[test]
+    fn is_restore_missing_bindings_negative_cases_do_not_match() {
+        assert!(!is_restore_missing_bindings(""));
+        // Other restore failures, each of which has its own classifier or the generic
+        // branch.
+        assert!(!is_restore_missing_bindings(
+            "error: snapshot corrupt: bad magic bytes"
+        ));
+        assert!(!is_restore_missing_bindings(
+            "error: io error: Access is denied. (os error 5)"
+        ));
+        assert!(!is_restore_missing_bindings(
+            "error: database error: Execution Error: index idx already exists"
+        ));
+        assert!(!is_restore_missing_bindings(
+            "error: sandbox already exists"
+        ));
+        assert!(!is_restore_missing_bindings(
+            AGENT_RELAY_ATTACHED_RUN_OUTPUT
+        ));
+        assert!(!is_restore_missing_bindings(AGENT_RELAY_POWERSHELL_OUTPUT));
+        // The flag name on its own is not the refusal.
+        assert!(!is_restore_missing_bindings(
+            "error: unexpected argument '--allow-missing-resources' found"
+        ));
+    }
+
+    #[test]
+    fn restore_missing_binding_paths_reads_the_one_path_out_of_the_0_7_8_refusal() {
+        assert_eq!(
+            restore_missing_binding_paths(RESTORE_REFUSAL_0_7_8),
+            vec!["/etc/app/b.conf".to_string()]
+        );
+        assert_eq!(
+            restore_missing_binding_paths(RESTORE_REFUSAL_0_7_6_TAIL),
+            vec!["/etc/app/b.conf".to_string()]
+        );
+        assert_eq!(
+            restore_missing_binding_paths(RESTORE_REFUSAL_POWERSHELL),
+            vec!["/etc/app/b.conf".to_string()]
+        );
+    }
+
+    #[test]
+    fn restore_missing_binding_paths_reads_several_comma_separated_entries_and_disk_entries() {
+        assert_eq!(
+            restore_missing_binding_paths(
+                "error: invalid config: restore requires destination bindings for: mount \
+                 /etc/app/a.conf, mount /etc/app/b.conf, disk /srv/data; provide a destination \
+                 mount or select a captured disk for each path, or explicitly allow missing \
+                 resources"
+            ),
+            vec![
+                "/etc/app/a.conf".to_string(),
+                "/etc/app/b.conf".to_string(),
+                "/srv/data".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_missing_binding_paths_is_empty_when_nothing_readable_follows_the_sentence() {
+        assert!(restore_missing_binding_paths("").is_empty());
+        assert!(restore_missing_binding_paths("error: something else entirely").is_empty());
+        assert!(
+            restore_missing_binding_paths("restore requires destination bindings for: ; tail")
+                .is_empty()
+        );
+        // An entry with no absolute path is dropped, not guessed at.
+        assert!(
+            restore_missing_binding_paths(
+                "restore requires destination bindings for: something odd; tail"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_missing_binding_paths_keeps_a_path_that_contains_a_space_and_drops_repeats() {
+        assert_eq!(
+            restore_missing_binding_paths(
+                "restore requires destination bindings for: mount /srv/my app/f.txt, mount \
+                 /srv/my app/f.txt; tail"
+            ),
+            vec!["/srv/my app/f.txt".to_string()]
+        );
+    }
+
+    /// A fake `msb` whose `restore` refuses with the contents of `<dir>/refusal.txt`
+    /// (so the text needs no shell quoting) and exits 1. `access_denied_first`
+    /// restores that many leading calls with msb's Windows access-denied wording
+    /// instead, to push a candidate walk onto its broker. Every restore argv is
+    /// appended to `restore-argv` and counted in `restore-calls`; `ls` and `stop`/`rm`
+    /// calls are logged too, so a test can prove none happened.
+    #[cfg(unix)]
+    fn write_fake_msb_for_restore_refusal(
+        dir: &Path,
+        refusal: &str,
+        access_denied_first: u32,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("refusal.txt"), refusal).expect("write refusal text");
+        let script = dir.join("fake-msb-restore-refusal.sh");
+        let body = format!(
+            "#!/bin/sh\n\
+             dir=\"$(dirname \"$0\")\"\n\
+             case \"$1\" in\n\
+             restore)\n\
+             echo \"$*\" >> \"$dir/restore-argv\"\n\
+             n=$(cat \"$dir/restore-calls\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$dir/restore-calls\"\n\
+             if [ \"$n\" -lt {access_denied_first} ]; then\n\
+             echo 'error: io error: Access is denied. (os error 5)' 1>&2\n\
+             exit 1\n\
+             fi\n\
+             cat \"$dir/refusal.txt\" 1>&2\n\
+             exit 1\n\
+             ;;\n\
+             ls)\n\
+             echo \"$*\" >> \"$dir/ls-argv\"\n\
+             echo '[]'\n\
+             exit 0\n\
+             ;;\n\
+             stop|rm)\n\
+             echo \"$1 $2\" >> \"$dir/stop-rm-calls\"\n\
+             exit 0\n\
+             ;;\n\
+             esac\n\
+             exit 0\n"
+        );
+        std::fs::write(&script, body).expect("write fake msb restore-refusal script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake msb restore-refusal script");
+        script
+    }
+
+    #[cfg(unix)]
+    fn restore_calls_in(dir: &Path) -> u32 {
+        std::fs::read_to_string(dir.join("restore-calls"))
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    fn assert_is_the_copied_files_error(err: &RightsizeError, sandbox: &str, checkpoint_ref: &str) {
+        match err {
+            RightsizeError::CheckpointCopiedFilesMissing {
+                sandbox: s,
+                checkpoint_ref: r,
+                guest_paths,
+                msb_output,
+            } => {
+                assert_eq!(s, sandbox);
+                assert_eq!(r, checkpoint_ref);
+                assert_eq!(guest_paths, &vec!["/etc/app/b.conf".to_string()]);
+                assert!(
+                    msb_output.contains("restore requires destination bindings for"),
+                    "msb's own output must ride along: {msb_output}"
+                );
+            }
+            other => panic!("expected CheckpointCopiedFilesMissing, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains(sandbox), "{msg}");
+        assert!(msg.contains(checkpoint_ref), "{msg}");
+        assert!(msg.contains("with_copy_file_to_container"), "{msg}");
+        assert!(msg.contains("/etc/app/b.conf"), "{msg}");
+        assert!(
+            !msg.contains("was removed") && !msg.contains("re-booting sandbox"),
+            "a plain from_checkpoint start removed nothing: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_restore_and_await_running_turns_the_msb_refusal_into_the_typed_error() {
+        let dir = unique_test_dir("restore-refusal-typed");
+        let script = write_fake_msb_for_restore_refusal(&dir, RESTORE_REFUSAL_0_7_8, 0);
+        let snapshot = dir.join("snap_fake").display().to_string();
+        let mut spec = ContainerSpec::new("rz-restore-refusal", "unused-image", "run-1");
+        spec.checkpoint_ref = Some(snapshot.clone());
+
+        let err = try_restore_and_await_running(&script, &spec, &snapshot)
+            .expect_err("the refusal is a failed restore");
+        let PreRunningFailure::Other(err) = err else {
+            panic!("expected the typed error inside `Other`, got {err:?}");
+        };
+        assert_is_the_copied_files_error(&err, "rz-restore-refusal", &snapshot);
+        assert_eq!(restore_calls_in(&dir), 1, "one restore call, no retry");
+        assert!(
+            !dir.join("ls-argv").exists(),
+            "a refused restore never reaches the `Running` poll"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_brokered_powershell_decorated_refusal_classifies_as_the_same_typed_error() {
+        let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output: RESTORE_REFUSAL_POWERSHELL.to_string(),
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-brokered-refusal", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        let err = try_restore_and_await_running_with_launcher(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("a brokered refusal is a failed restore");
+        let PreRunningFailure::Other(err) = err else {
+            panic!("expected the typed error inside `Other`, got {err:?}");
+        };
+        assert_is_the_copied_files_error(&err, "rz-brokered-refusal", "/fake/snap");
+    }
+
+    #[test]
+    fn the_refusal_wins_over_a_transient_signature_in_the_same_output() {
+        // First in the cascade, so nothing in the output can send it down a retry arm.
+        let output = format!("error: database error: x\n{RESTORE_REFUSAL_0_7_8}");
+        let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output: output.clone(),
+            })
+        };
+        let mut spec = ContainerSpec::new("rz-refusal-first", "unused-image", "run-1");
+        spec.checkpoint_ref = Some("/fake/snap".to_string());
+        let err = try_restore_and_await_running_with_launcher(
+            Path::new("/definitely/not/a/real/msb"),
+            &spec,
+            "/fake/snap",
+            &launcher,
+        )
+        .expect_err("a refusal is a failed restore");
+        assert!(
+            matches!(
+                err,
+                PreRunningFailure::Other(RightsizeError::CheckpointCopiedFilesMissing { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_msb_refusal_is_never_retried_by_the_reboot_restore_policies() {
+        // Each launcher call is counted: the agent-relay retry, the state-db retry, the
+        // access-denied handling and the install-lock poll must all leave it alone.
+        for refusal in [
+            RESTORE_REFUSAL_0_7_8,
+            RESTORE_REFUSAL_0_7_6_TAIL,
+            RESTORE_REFUSAL_POWERSHELL,
+        ] {
+            let calls = RefCell::new(0u32);
+            let launcher = |_msb: &Path, _argv: &[String]| -> std::io::Result<RestoreLaunch> {
+                *calls.borrow_mut() += 1;
+                Ok(RestoreLaunch::Exited {
+                    success: false,
+                    code: Some(1),
+                    output: refusal.to_string(),
+                })
+            };
+            let mut spec = ContainerSpec::new("rz-reboot-refusal", "unused-image", "run-1");
+            spec.checkpoint_ref = Some("/fake/snap".to_string());
+            spec.command = Some(vec!["true".to_string()]);
+
+            let err = spawn_and_await_reboot_restore(
+                Path::new("/definitely/not/a/real/msb"),
+                &spec,
+                "/fake/snap",
+                &launcher,
+            )
+            .expect_err("a refusal is a failed restore");
+            assert_eq!(*calls.borrow(), 1, "exactly one launch: {refusal}");
+            assert!(
+                matches!(err, RightsizeError::CheckpointCopiedFilesMissing { .. }),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_and_await_running_does_not_retry_the_msb_refusal_either() {
+        // The defensive fallback for a restore spec that has no candidate batch.
+        let dir = unique_test_dir("restore-refusal-fallback");
+        let script = write_fake_msb_for_restore_refusal(&dir, RESTORE_REFUSAL_0_7_8, 0);
+        let snapshot = dir.join("snap_fake").display().to_string();
+        let mut spec = ContainerSpec::new("rz-refusal-fallback", "unused-image", "run-1");
+        spec.checkpoint_ref = Some(snapshot.clone());
+
+        let err = spawn_and_await_running(&script, &spec)
+            .expect_err("a refused restore must surface as an Err");
+        assert_is_the_copied_files_error(&err, "rz-refusal-fallback", &snapshot);
+        assert_eq!(restore_calls_in(&dir), 1, "no retry of any kind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_checkpoint_start_ends_in_the_typed_error_after_exactly_one_restore_call() {
+        // `MsbCliBackend::start` for a `from_checkpoint` spec with a candidate batch:
+        // no fresh-name walk, no `Running` poll, no per-candidate cleanup, and the
+        // text claims no sandbox was removed.
+        let dir = unique_test_dir("from-checkpoint-refusal");
+        let candidates = vec![
+            "rz-refusal-cand-0".to_string(),
+            "rz-refusal-cand-1".to_string(),
+            "rz-refusal-cand-2".to_string(),
+        ];
+        let script = write_fake_msb_for_restore_refusal(&dir, RESTORE_REFUSAL_0_7_8, 0);
+        let backend = MsbCliBackend::new(script);
+        let snapshot = dir.join("snap_fake").display().to_string();
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            checkpoint_ref: Some(snapshot.clone()),
+            restore_name_candidates: Some(candidates.clone()),
+            ..ContainerSpec::new(&candidates[0], "unused-image", "run-1")
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = backend.create(spec).await.expect("create must succeed");
+            let err = backend
+                .start(handle.as_ref())
+                .await
+                .expect_err("a refused restore must fail start()");
+            assert_is_the_copied_files_error(&err, &candidates[0], &snapshot);
+            assert!(
+                backend.winning_start_handle(handle.as_ref()).is_none(),
+                "no candidate won"
+            );
+        });
+
+        assert_eq!(
+            restore_calls_in(&dir),
+            1,
+            "no fresh-name walk past candidate 0"
+        );
+        let restore_argv = std::fs::read_to_string(dir.join("restore-argv")).unwrap();
+        assert!(
+            restore_argv.contains(&format!("--name {}", candidates[0])),
+            "{restore_argv}"
+        );
+        assert!(
+            !restore_argv.contains("allow-missing-resources"),
+            "that flag is never passed: {restore_argv}"
+        );
+        assert!(!dir.join("ls-argv").exists(), "no `ls` polling");
+        assert!(
+            !dir.join("stop-rm-calls").exists(),
+            "no best-effort rm of a next candidate: nothing advanced"
+        );
+        assert!(
+            backend.started_names.lock().unwrap().is_empty(),
+            "a failed start registers nothing for close() to sweep"
+        );
+        assert!(
+            backend
+                .handles
+                .lock()
+                .unwrap()
+                .get(&candidates[0])
+                .is_none_or(|state| state.attached.is_none()),
+            "no attached child is held"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_brokered_candidate_attempt_that_is_refused_ends_the_walk_with_the_typed_error() {
+        // Candidate 0 hits the access-denied class on the direct path, so the walk
+        // escalates candidate 1 to the broker; the broker returns the PowerShell
+        // decorated refusal. The walk must stop there: candidate 2 is never tried.
+        let dir = unique_test_dir("from-checkpoint-brokered-refusal");
+        let candidates = vec![
+            "rz-brokered-refusal-cand-0".to_string(),
+            "rz-brokered-refusal-cand-1".to_string(),
+            "rz-brokered-refusal-cand-2".to_string(),
+        ];
+        let script = write_fake_msb_for_restore_refusal(&dir, RESTORE_REFUSAL_0_7_8, 1);
+        let broker_calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let broker_calls_for_closure = broker_calls.clone();
+        let backend = MsbCliBackend::with_restore_broker(script, move |_msb, argv| {
+            broker_calls_for_closure.lock().unwrap().push(argv.to_vec());
+            Ok(RestoreLaunch::Exited {
+                success: false,
+                code: Some(1),
+                output: RESTORE_REFUSAL_POWERSHELL.to_string(),
+            })
+        });
+        let snapshot = dir.join("snap_fake").display().to_string();
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            checkpoint_ref: Some(snapshot.clone()),
+            restore_name_candidates: Some(candidates.clone()),
+            ..ContainerSpec::new(&candidates[0], "unused-image", "run-1")
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = backend.create(spec).await.expect("create must succeed");
+            let err = backend
+                .start(handle.as_ref())
+                .await
+                .expect_err("a refused brokered restore must fail start()");
+            assert_is_the_copied_files_error(&err, &candidates[1], &snapshot);
+        });
+
+        assert_eq!(
+            restore_calls_in(&dir),
+            1,
+            "only candidate 0's access-denied attempt went direct"
+        );
+        let calls = broker_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one brokered attempt, no more: {calls:?}");
+        assert_eq!(
+            extract_restore_name(&calls[0]),
+            Some(candidates[1].as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reboot_with_already_exists_retry_returns_the_copied_files_error_unwrapped() {
+        let typed = || RightsizeError::CheckpointCopiedFilesMissing {
+            sandbox: "rz-abc-2".to_string(),
+            checkpoint_ref: "/fake/checkpoints/rz-ckpt-1".to_string(),
+            guest_paths: vec!["/etc/app/b.conf".to_string()],
+            msb_output: RESTORE_REFUSAL_0_7_8.to_string(),
+        };
+
+        // On the first attempt.
+        let calls = RefCell::new(0u32);
+        let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+            *calls.borrow_mut() += 1;
+            Err(typed())
+        };
+        let err = reboot_with_already_exists_retry(
+            &mut reboot,
+            "/fake/checkpoints/rz-ckpt-1",
+            None,
+            "rz-abc-1",
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+        )
+        .expect_err("the refusal is final");
+        assert_eq!(*calls.borrow(), 1, "never retried");
+        assert!(
+            matches!(err, RightsizeError::CheckpointCopiedFilesMissing { .. }),
+            "{err:?}"
+        );
+        assert!(
+            !err.to_string().contains("was removed"),
+            "nothing was removed on an ordinary start: {err}"
+        );
+
+        // After an earlier name-collision retry.
+        let calls = RefCell::new(0u32);
+        let mut reboot = |_: &str, _: Option<&[String]>| -> Result<()> {
+            let n = {
+                let mut c = calls.borrow_mut();
+                *c += 1;
+                *c
+            };
+            if n == 1 {
+                return Err(RightsizeError::NameConflict {
+                    message: "sandbox already exists".to_string(),
+                    source: None,
+                });
+            }
+            Err(typed())
+        };
+        let err = reboot_with_already_exists_retry(
+            &mut reboot,
+            "/fake/checkpoints/rz-ckpt-1",
+            None,
+            "rz-abc-1",
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+        )
+        .expect_err("the refusal is final");
+        assert_eq!(*calls.borrow(), 2);
+        assert!(
+            matches!(err, RightsizeError::CheckpointCopiedFilesMissing { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn msb_checkpoint_cycle_says_the_sandbox_was_removed_if_its_own_reboot_is_ever_refused() {
+        // The checkpoint reboot supplies the container's own mounts, so msb should never
+        // refuse it. If it does, the source sandbox is already gone and the text must
+        // say so, while still carrying the typed error's message.
+        let dest_dir_buf = std::env::temp_dir().join("rz-msb-checkpoint-cycle-refused-reboot");
+        let dest_dir = dest_dir_buf.as_path();
+        let result = {
+            let mut invoke = |args: &[String]| {
+                if args == commands::ls() {
+                    return Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: fake_snapshot_create_stdout(dest_dir, "rz-abc-1"),
+                    stderr: String::new(),
+                })
+            };
+            let mut reboot = |real_ref: &str, _: Option<&[String]>| -> Result<()> {
+                Err(RightsizeError::CheckpointCopiedFilesMissing {
+                    sandbox: "rz-abc-2".to_string(),
+                    checkpoint_ref: real_ref.to_string(),
+                    guest_paths: vec!["/etc/app/b.conf".to_string()],
+                    msb_output: RESTORE_REFUSAL_0_7_8.to_string(),
+                })
+            };
+            msb_checkpoint_cycle(
+                &mut invoke,
+                &mut reboot,
+                "rz-abc-1",
+                "rz-ckpt-deadbeefcafe",
+                dest_dir,
+                false,
+            )
+        };
+        let msg = result
+            .expect_err("a refused reboot must surface")
+            .to_string();
+        assert!(msg.contains("the sandbox was removed"), "{msg}");
+        assert!(msg.contains("/etc/app/b.conf"), "{msg}");
+        assert!(msg.contains("with_copy_file_to_container"), "{msg}");
+        assert!(msg.contains("Container::from_checkpoint"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_checkpoint_reboot_re_supplies_every_copied_file_with_volume() {
+        let dir = unique_test_dir("checkpoint-reboot-volumes");
+        let old_name = "rz-checkpoint-volumes-old";
+        let candidates = vec!["rz-checkpoint-volumes-fresh".to_string()];
+        let rw_host = dir.join("a.conf");
+        let ro_host = dir.join("b.conf");
+        std::fs::write(&rw_host, "a").unwrap();
+        std::fs::write(&ro_host, "b").unwrap();
+        let script = write_fake_msb_for_checkpoint_reboot(&dir, 0);
+        let _fake_execs = ReleaseFakeExecsOnDrop(dir.clone());
+        let backend = MsbCliBackend::new(script);
+        let spec = ContainerSpec {
+            command: Some(vec!["redis-server".to_string()]),
+            ports: vec![rightsize::model::PortBinding {
+                host_port: 15998,
+                guest_port: 80,
+                protocol: Protocol::Tcp,
+            }],
+            mounts: vec![
+                rightsize::model::FileMount::new(rw_host.clone(), "/etc/app/a.conf"),
+                rightsize::model::FileMount::new(ro_host.clone(), "/etc/app/b.conf").read_only(),
+            ],
+            ..ContainerSpec::new(old_name, "unused-image", "run-1")
+        };
+        let handle = backend.create(spec).await.expect("create must succeed");
+        let checkpoint_hint = dir
+            .join("checkpoints")
+            .join("rz-ckpt-test")
+            .display()
+            .to_string();
+
+        let (_checkpoint_ref, new_handle) = backend
+            .create_checkpoint(handle.as_ref(), &checkpoint_hint, &candidates)
+            .await
+            .expect("checkpoint must succeed");
+
+        let restore_argv = std::fs::read_to_string(dir.join("restore-argv")).unwrap();
+        assert_eq!(restore_argv.lines().count(), 1, "{restore_argv}");
+        let line = restore_argv.lines().next().unwrap();
+        let expected_tail = format!(
+            "-p 15998:80 --volume {}:/etc/app/a.conf:rw,nodev --volume {}:/etc/app/b.conf:ro,nodev",
+            rw_host.display(),
+            ro_host.display()
+        );
+        assert!(
+            line.ends_with(&expected_tail),
+            "the reboot must re-supply both copied files in spec order, after the ports: {line}"
+        );
+        assert!(
+            !line.contains("--mount-file") && !line.contains("allow-missing-resources"),
+            "{line}"
+        );
+
+        backend
+            .stop(new_handle.as_ref())
+            .await
+            .expect("stop on the adopted handle must succeed");
+        assert_fake_exec_children_gone(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_mount_host_files_exist_accepts_no_mounts_and_existing_files() {
+        let dir = unique_test_dir("mount-host-files-exist");
+        let present = dir.join("present.conf");
+        std::fs::write(&present, "x").unwrap();
+
+        let none = ContainerSpec::new("rz-abc-1", "alpine:3.19", "abc");
+        ensure_mount_host_files_exist(&none).expect("no mounts, nothing to check");
+
+        let mut spec = none.clone();
+        spec.mounts = vec![rightsize::model::FileMount::new(
+            present.clone(),
+            "/etc/present.conf",
+        )];
+        ensure_mount_host_files_exist(&spec).expect("an existing host file passes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_mount_host_files_exist_names_the_first_missing_file_in_spec_order() {
+        let dir = unique_test_dir("mount-host-files-missing");
+        let present = dir.join("present.conf");
+        std::fs::write(&present, "x").unwrap();
+        let gone_a = dir.join("gone-a.conf");
+        let gone_b = dir.join("gone-b.conf");
+        let mut spec = ContainerSpec::new("rz-abc-1", "alpine:3.19", "abc");
+        spec.mounts = vec![
+            rightsize::model::FileMount::new(present, "/etc/present.conf"),
+            rightsize::model::FileMount::new(gone_a.clone(), "/etc/a.conf"),
+            rightsize::model::FileMount::new(gone_b, "/etc/b.conf"),
+        ];
+
+        let err = ensure_mount_host_files_exist(&spec).expect_err("a host file is gone");
+        match err {
+            RightsizeError::CheckpointCopiedFileHostMissing {
+                guest_path,
+                host_path,
+            } => {
+                assert_eq!(guest_path, "/etc/a.conf");
+                assert_eq!(host_path, gone_a);
+            }
+            other => panic!("expected CheckpointCopiedFileHostMissing, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_checkpoint_refuses_a_missing_copied_file_before_any_msb_call() {
+        let dir = unique_test_dir("checkpoint-missing-copied-file");
+        let script = write_argv_logging_stub(&dir);
+        let backend = MsbCliBackend::new(script);
+        let gone = dir.join("deleted.conf");
+        let handle = Handle {
+            spec: ContainerSpec {
+                command: Some(vec!["true".to_string()]),
+                mounts: vec![rightsize::model::FileMount::new(
+                    gone.clone(),
+                    "/etc/app/deleted.conf",
+                )],
+                ..ContainerSpec::new("rz-abc-1", "alpine:3.19", "abc")
+            },
+        };
+
+        let err = backend
+            .create_checkpoint(
+                &handle,
+                &dir.join("checkpoints")
+                    .join("rz-ckpt-x")
+                    .display()
+                    .to_string(),
+                &["rz-abc-2".to_string()],
+            )
+            .await
+            .err()
+            .expect("a missing host file must refuse the checkpoint");
+        match &err {
+            RightsizeError::CheckpointCopiedFileHostMissing {
+                guest_path,
+                host_path,
+            } => {
+                assert_eq!(guest_path, "/etc/app/deleted.conf");
+                assert_eq!(host_path, &gone);
+            }
+            other => panic!("expected CheckpointCopiedFileHostMissing, got {other:?}"),
+        }
+        assert!(
+            !dir.join("calls.log").exists(),
+            "not one msb call (stop, snapshot, rm) may happen before the refusal: {:?}",
+            std::fs::read_to_string(dir.join("calls.log"))
+        );
+        assert!(
+            !dir.join("checkpoints").exists(),
+            "not even the checkpoint directory is created"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

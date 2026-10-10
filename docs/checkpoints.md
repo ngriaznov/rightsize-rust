@@ -14,7 +14,10 @@ written files via `exec`, run `sync` in the guest before checkpointing — an un
 write is exactly the kind of in-memory state a checkpoint does not capture. State on RAM-backed
 mounts is not captured either: the microsandbox guest mounts `/tmp` as tmpfs, so a
 file written there never enters a checkpoint — write anything you need restored to
-a rootfs path such as `/srv` or `/var`.
+a rootfs path such as `/srv` or `/var`. Files added with
+`with_copy_file_to_container` are not captured on either backend: they are
+start-time mounts of host files, and a container started from a checkpoint adds
+them again — see ["Files copied in at start"](#files-copied-in-at-start).
 
 That's enough for the common case: boot a database, run migrations and seed data,
 checkpoint it, and every later `Container::from_checkpoint(&cp)` restores a
@@ -34,7 +37,9 @@ connection) — that needs true memory snapshotting, which stays on the
 On microsandbox, the guest reboot also drops any emulated network links (see
 ["Networking is emulated, not native"](./backends.md#networking-is-emulated-not-native)),
 so `checkpoint()` re-installs them, with the same links this container started
-with, before the wait-strategy re-run above.
+with, before the wait-strategy re-run above. It mounts the container's copied
+files again from their host files too (see
+["Files copied in at start"](#files-copied-in-at-start)).
 
 `capabilities().checkpoint` is `true` on both:
 
@@ -79,8 +84,10 @@ refuses outright: its root disk is RAM-backed and gone the moment the guest
 stops, so `checkpoint()`/`checkpoint_named()` return
 `RightsizeError::TmpfsRootCheckpoint` before touching anything — before the
 guest is even stopped, and, for a named checkpoint that would have replaced an
-existing one, before that existing checkpoint is touched either. On success it
-returns a `Checkpoint`:
+existing one, before that existing checkpoint is touched either. On microsandbox, a
+copied file whose host file no longer exists is refused the same way, with
+`RightsizeError::CheckpointCopiedFileHostMissing`. On success it returns a
+`Checkpoint`:
 
 ```rust,ignore
 pub struct Checkpoint {
@@ -114,14 +121,59 @@ let restored = Container::from_checkpoint(&checkpoint)
 ```
 
 Deliberately **not** carried over from the checkpoint's spec: mounted files, network
-membership, and aliases. A checkpoint already has whatever those mounts wrote baked
-directly into its filesystem, and network topology has no well-defined meaning to
-replay across a restore.
+membership, and aliases. Network topology has no well-defined meaning to replay
+across a restore, and copied files are not part of a checkpoint, so the restoring
+container adds them again (see
+["Files copied in at start"](#files-copied-in-at-start) below).
 
 On microsandbox, the restore also carries the checkpoint's own root disk as-is —
 the snapshot pins it — so `with_disk_limit`/`with_tmpfs_root` on the restoring
 `Container` are not valid here; msb rejects a root-disk setting on a
 `from_checkpoint` restore before boot.
+
+## Files copied in at start
+
+A file added with `with_copy_file_to_container` is a bind mount of a host file, made
+when the container starts. A snapshot or image commit does not capture the content
+behind a mount, so **copied files are not part of a checkpoint, on either backend**.
+
+- **`checkpoint()` keeps them on microsandbox.** The checkpoint reboots the
+  container, and the reboot mounts each copied file again from its host file, so the
+  source container reads the same content afterward. The host files must still
+  exist: if one was deleted, `checkpoint()` fails with
+  `RightsizeError::CheckpointCopiedFileHostMissing` before the guest is stopped,
+  and a named checkpoint it would have replaced is left alone. Docker's commit never
+  reboots the container, so its bind mounts stay as they were.
+- **A container started from a checkpoint adds them again.** Call
+  `with_copy_file_to_container` on the `Container::from_checkpoint(...)` builder,
+  with the same guest path:
+
+  ```rust,ignore
+  let seed = Container::new("alpine:3.19")
+      .with_copy_file_to_container(MountableFile::for_host_path("/data/seed.sql"), "/srv/seed.sql")
+      .with_command(&["sleep", "3600"])
+      .start()
+      .await?;
+  let checkpoint = seed.checkpoint().await?;
+
+  let restored = Container::from_checkpoint(&checkpoint)
+      .with_copy_file_to_container(MountableFile::for_host_path("/data/seed.sql"), "/srv/seed.sql")
+      .start()
+      .await?;
+  ```
+
+- **Leaving one out fails loudly on microsandbox.** A checkpoint taken by this
+  release (msb 0.7.8) records its copied files, and msb refuses to restore it
+  without them. `start()` then fails with
+  `RightsizeError::CheckpointCopiedFilesMissing`, which names the sandbox, the
+  checkpoint and the guest paths, and includes msb's own output. It is not
+  retried: another sandbox name would be refused the same way. This holds for a
+  named checkpoint rediscovered in a later process too, since the refusal comes
+  from msb, not from anything rightsize stores.
+- **Older checkpoints and Docker restore with the file empty.** A checkpoint taken
+  with an older msb has no record of its copied files, so it restores without
+  complaint and the file comes back empty. On Docker the path is left empty too,
+  and rightsize cannot tell that a file was left out.
 
 ## Ref formats
 

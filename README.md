@@ -155,7 +155,9 @@ backend-specific rather than behavioral divergences:
 - **File mounts are read-write by default and behave identically on both
   backends.** The mount is a view of the host file — a guest write reaches the
   host file itself. Call `.read_only()` on a `FileMount` to block guest writes;
-  both backends enforce it (`Read-only file system` in-guest).
+  both backends enforce it (`Read-only file system` in-guest). A mount is not part
+  of a checkpoint: add the same files again on a `Container::from_checkpoint`
+  container (see [Checkpoint / Restore](docs/checkpoints.md#files-copied-in-at-start)).
 - **`follow_output` delivers the same ordered, no-duplicate log stream on both
   backends**, but on microsandbox the final tail can arrive shortly after the
   sandbox reports stopped, rather than exactly at stream EOF (`msb logs -f`
