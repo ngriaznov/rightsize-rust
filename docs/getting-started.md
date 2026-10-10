@@ -5,8 +5,8 @@
 ```toml
 # Cargo.toml
 [dev-dependencies]
-rightsize = "0.7.14"
-rightsize-modules = "0.7.14"
+rightsize = "0.7.15"
+rightsize-modules = "0.7.15"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
