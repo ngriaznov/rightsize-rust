@@ -556,7 +556,7 @@ pub fn rm(name: &str) -> Vec<String> {
     vec!["rm".to_string(), name.to_string()]
 }
 
-/// Builds the argv for `msb rm -f` (msb 0.7.3 and 0.7.6). Unlike plain [`rm`] it also
+/// Builds the argv for `msb rm -f` (msb 0.7.3 and later). Unlike plain [`rm`] it also
 /// removes a sandbox whose catalog row a failed boot left stuck in `Starting`, which
 /// plain `rm` refuses as still running; for an ordinary `Stopped` row the two are the
 /// same.
