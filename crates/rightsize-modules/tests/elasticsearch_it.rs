@@ -41,7 +41,15 @@ async fn index_with_refresh_then_search_returns_the_indexed_document() {
     // Elasticsearch's near-real-time indexing could leave the very next search a
     // beat behind the write, an avoidable race for a smoke test that only cares
     // about the round trip, not indexing latency.
-    let index = agent
+    //
+    // This first write also creates the index. On a loaded CI runner creating it,
+    // allocating its shard and refreshing can outlast the shared agent's 5 s budget
+    // (seen twice on the msb Linux lane), so this one request gets 60 s.
+    let first_write_agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .into();
+    let index = first_write_agent
         .put(format!("{rest_url}/books/_doc/1?refresh=true"))
         .header("Content-Type", "application/json")
         .send(r#"{"title":"Snow Crash","author":"Neal Stephenson"}"#)
