@@ -89,7 +89,7 @@ mount a copy instead.
 ## "`from_checkpoint(...).start()` fails with `CheckpointCopiedFilesMissing`" (or `checkpoint()` with `CheckpointCopiedFileHostMissing`)
 
 **Cause:** a file added with `with_copy_file_to_container` is a mount of a host
-file, not part of a checkpoint. microsandbox (msb 0.7.8) refuses to restore a
+file, not part of a checkpoint. microsandbox (msb 0.7.8 and later) refuses to restore a
 checkpoint whose copied files are not given again, and the error names the guest
 paths it needs. `CheckpointCopiedFileHostMissing` is the other half: on
 microsandbox `checkpoint()` mounts each copied file again from its host file when

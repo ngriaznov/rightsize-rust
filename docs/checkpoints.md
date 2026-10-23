@@ -163,7 +163,7 @@ behind a mount, so **copied files are not part of a checkpoint, on either backen
   ```
 
 - **Leaving one out fails loudly on microsandbox.** A checkpoint taken by this
-  release (msb 0.7.8) records its copied files, and msb refuses to restore it
+  release (msb 0.7.8 or later) records its copied files, and msb refuses to restore it
   without them. `start()` then fails with
   `RightsizeError::CheckpointCopiedFilesMissing`, which names the sandbox, the
   checkpoint and the guest paths, and includes msb's own output. It is not

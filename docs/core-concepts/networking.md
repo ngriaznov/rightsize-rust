@@ -137,7 +137,9 @@ let sandboxed = Container::new("untrusted/plugin-runner:latest")
 
 On microsandbox, published ports keep serving inbound connections and outbound
 connections to private (RFC 1918) address ranges keep working — only outbound
-connections to the public internet fail.
+connections to the public internet are blocked. Most fail outright; a plain HTTP
+request on port 80 instead gets an HTTP 403 with a JSON body, answered by
+microsandbox itself (msb 0.7.9 and later). Nothing leaves the sandbox either way.
 
 Mutually exclusive with `.with_network(&net)` — a network-disabled container has
 nothing to join a network with, so `start()` returns
