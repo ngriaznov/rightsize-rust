@@ -19,6 +19,17 @@ Nothing yet.
   it in the sandbox's own directory and removes it when the sandbox exits. Directories
   left by earlier msb versions are not cleaned up.
 
+### Fixed
+
+- **A Docker image pull that fails partway is now reported, and retried once.** Docker
+  answers a pull that dies partway (registry 5xx, rate limit, dropped connection) with
+  HTTP 200 and puts the error in the progress stream. The Docker backend checked only the
+  status, so it took the pull for a success and the start then failed with a misleading
+  "No such image" from container create. It now reads the stream. An error there, or a
+  daemon 5xx, gets one retry after 2 seconds; a 4xx (for example, a repository that does
+  not exist) fails at once. The final error names the image, carries Docker's own message,
+  and says whether the pull was retried.
+
 ## [0.7.16] - 2026-10-23
 
 ### Changed

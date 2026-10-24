@@ -20,7 +20,7 @@ use rightsize::backend::{Capabilities, FollowHandle, SandboxBackend, SandboxHand
 use rightsize::error::{Result, RightsizeError};
 use rightsize::model::{ContainerSpec, ExecResult};
 
-use crate::client::DockerClient;
+use crate::client::{DockerClient, Response};
 use crate::frames::{BodyReader, LineAssembler, StreamType, demux_into, read_frame};
 use crate::json::{
     ConnectNetworkBody, CreateContainerBody, CreateExecBody, CreateNetworkBody, EmptyObject,
@@ -31,6 +31,11 @@ use crate::json::{
 /// How long `POST /containers/{id}/stop` gives the entrypoint to exit before the
 /// daemon SIGKILLs it.
 const STOP_TIMEOUT_SECS: u64 = 10;
+
+/// The pause before the one retry of a failed image pull. Registry 5xx answers, rate
+/// limits and dropped connections are usually gone a moment later; the pause keeps
+/// the retry from landing in the same blip.
+const PULL_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
 /// The label every non-`keep_alive` container this backend creates carries, so
 /// `close()`/the reaper can find exactly this run's containers without touching
@@ -68,6 +73,9 @@ pub struct DockerBackend {
     /// on which daemon-side network a given `rightsize` network id maps to, without a
     /// list-by-name round trip on every call.
     network_ids: Mutex<HashMap<String, String>>,
+    /// How long `pull_if_missing` waits before retrying a failed pull. Always
+    /// [`PULL_RETRY_PAUSE`] outside tests (see [`Self::with_pull_retry_pause`]).
+    pull_retry_pause: Duration,
 }
 
 impl DockerBackend {
@@ -80,7 +88,17 @@ impl DockerBackend {
         DockerBackend {
             client,
             network_ids: Mutex::new(HashMap::new()),
+            pull_retry_pause: PULL_RETRY_PAUSE,
         }
+    }
+
+    /// Test-only: shortens (or lengthens) the pause before a failed pull's retry so the
+    /// retry tests don't wait out the real [`PULL_RETRY_PAUSE`]. Unix-only, same reason
+    /// as the socket fixtures that use it.
+    #[cfg(all(test, unix))]
+    fn with_pull_retry_pause(mut self, pause: Duration) -> Self {
+        self.pull_retry_pause = pause;
+        self
     }
 
     /// Builds a backend pointed at the daemon `DOCKER_HOST` (or the default socket)
@@ -100,11 +118,18 @@ impl DockerBackend {
     }
 
     /// `GET /images/{name}/json` to check presence, `POST /images/create` to pull if
-    /// a 404 says it's missing. The pull response is a stream of progress JSON lines
-    /// this backend doesn't parse — it drains the body to completion (the daemon
-    /// itself decides when the pull is done; a stream that closes IS "pull finished
-    /// or failed") and doesn't fail loudly on inspect trouble, only reacts to
-    /// affirmatively-absent.
+    /// a 404 says it's missing. The pull response is a stream of progress JSON lines;
+    /// this backend drains the body to completion (the daemon itself decides when the
+    /// pull is done; a stream that closes IS "pull finished or failed") and reads it
+    /// only to find a failure. Docker answers a pull that dies partway (registry 5xx,
+    /// rate limit, dropped connection) with `200` and puts the failure in the stream as
+    /// an object with an `error` string, so the status code alone can't tell success
+    /// from failure — see [`pull_failure`].
+    ///
+    /// A failed pull is retried once after [`PULL_RETRY_PAUSE`] when the failure is an
+    /// in-stream error or an HTTP 5xx; a 4xx (repository doesn't exist, unauthorized)
+    /// fails at once, since asking again gets the same answer. Doesn't fail loudly on
+    /// inspect trouble, only reacts to affirmatively-absent.
     async fn pull_if_missing(&self, image: &str) -> Result<()> {
         let inspect_path = format!("/images/{}/json", encode_path_segment(image));
         let inspect = self.client.request("GET", &inspect_path, None).await?;
@@ -118,14 +143,18 @@ impl DockerBackend {
             encode_query_value(&tag)
         );
         let resp = self.client.request("POST", &pull_path, None).await?;
-        if resp.status >= 400 {
-            return Err(RightsizeError::Backend(format!(
-                "docker could not pull image '{image}' (HTTP {}): {}",
-                resp.status,
-                String::from_utf8_lossy(&resp.body)
-            )));
+        let Some(failure) = pull_failure(&resp) else {
+            return Ok(());
+        };
+        if !failure.is_retryable() {
+            return Err(failure.into_error(image, false));
         }
-        Ok(())
+        tokio::time::sleep(self.pull_retry_pause).await;
+        let resp = self.client.request("POST", &pull_path, None).await?;
+        match pull_failure(&resp) {
+            None => Ok(()),
+            Some(failure) => Err(failure.into_error(image, true)),
+        }
     }
 
     /// `POST /networks/{id}/connect` with the aliases this container should be
@@ -372,6 +401,80 @@ fn encode_query_value(s: &str) -> String {
         }
     }
     out
+}
+
+/// Why one `POST /images/create` attempt failed.
+#[derive(Debug, PartialEq, Eq)]
+enum PullFailure {
+    /// The daemon answered HTTP 400 or above.
+    Http { status: u16, body: String },
+    /// The daemon answered 200 but the progress stream carried an error object;
+    /// `message` is Docker's own text.
+    Stream { message: String },
+}
+
+impl PullFailure {
+    /// True for the failures worth one more try: an error object in the stream, or an
+    /// HTTP 5xx. A 4xx is the daemon (or the registry behind it) saying the request
+    /// itself is wrong, which a retry won't change.
+    fn is_retryable(&self) -> bool {
+        match self {
+            PullFailure::Http { status, .. } => *status >= 500,
+            PullFailure::Stream { .. } => true,
+        }
+    }
+
+    /// The error `pull_if_missing` returns for this failure. `retried` adds the note
+    /// that this was the second attempt.
+    fn into_error(self, image: &str, retried: bool) -> RightsizeError {
+        let retried = if retried { ", retried once" } else { "" };
+        RightsizeError::Backend(match self {
+            PullFailure::Http { status, body } => {
+                format!("docker could not pull image '{image}' (HTTP {status}{retried}): {body}")
+            }
+            PullFailure::Stream { message } => format!(
+                "docker could not pull image '{image}' (error in the pull stream{retried}): \
+                 {message}"
+            ),
+        })
+    }
+}
+
+/// Reads one `POST /images/create` response and reports how it failed, or `None` if it
+/// succeeded: HTTP 400 or above, or any line of the drained body that is a JSON object
+/// with a non-empty `error` string or an `errorDetail.message` string. Lines that
+/// aren't valid JSON (or aren't objects) are ignored, so a progress line this backend
+/// has never seen can't turn a good pull into a failure.
+fn pull_failure(resp: &Response) -> Option<PullFailure> {
+    if resp.status >= 400 {
+        return Some(PullFailure::Http {
+            status: resp.status,
+            body: String::from_utf8_lossy(&resp.body).into_owned(),
+        });
+    }
+    String::from_utf8_lossy(&resp.body)
+        .lines()
+        .find_map(pull_stream_error)
+        .map(|message| PullFailure::Stream { message })
+}
+
+/// The error text of one pull-stream line, if the line is a JSON object carrying one:
+/// the `error` string, else `errorDetail.message`. Empty strings count as absent.
+fn pull_stream_error(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    let non_empty = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    non_empty(object.get("error")).or_else(|| {
+        non_empty(
+            object
+                .get("errorDetail")
+                .and_then(|detail| detail.get("message")),
+        )
+    })
 }
 
 /// Splits `image` into `(repository, tag)` for `POST /images/create?fromImage=&tag=`.
@@ -1849,6 +1952,368 @@ mod tests {
             matches!(err, rightsize::error::RightsizeError::NameConflict { .. }),
             "{err}"
         );
+    }
+
+    /// A canned response with `status_line` (`"200 OK"`) and `body` as a
+    /// `Content-Length` body.
+    #[cfg(unix)]
+    fn canned_response(status_line: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// The `404` that `GET /images/{name}/json` answers for an image that isn't local,
+    /// which sends `pull_if_missing` on to `POST /images/create`.
+    #[cfg(unix)]
+    fn image_absent_response() -> Vec<u8> {
+        canned_response(
+            "404 Not Found",
+            r#"{"message":"No such image: redis:7-alpine"}"#,
+        )
+    }
+
+    /// A `200` pull answer whose progress stream ends in the error object Docker writes
+    /// when a pull dies partway.
+    #[cfg(unix)]
+    fn pull_stream_error_response(message: &str) -> Vec<u8> {
+        let body = format!(
+            "{{\"status\":\"Pulling from library/redis\",\"id\":\"7-alpine\"}}\n\
+             {{\"errorDetail\":{{\"message\":\"{message}\"}},\"error\":\"{message}\"}}\n"
+        );
+        canned_response("200 OK", &body)
+    }
+
+    /// A `200` pull answer for a pull that finished: progress lines only.
+    #[cfg(unix)]
+    fn pull_ok_response() -> Vec<u8> {
+        canned_response(
+            "200 OK",
+            "{\"status\":\"Pulling from library/redis\",\"id\":\"7-alpine\"}\n\
+             {\"status\":\"Downloading\",\"progressDetail\":{\"current\":1,\"total\":9},\"id\":\"a1\"}\n\
+             {\"status\":\"Status: Downloaded newer image for redis:7-alpine\"}\n",
+        )
+    }
+
+    /// The `201` that `POST /containers/create` answers once the image is in place.
+    #[cfg(unix)]
+    fn container_created_response() -> Vec<u8> {
+        canned_response("201 Created", r#"{"Id":"daemon-c-1"}"#)
+    }
+
+    /// How many of the requests the fixture recorded were `POST /images/create`.
+    #[cfg(unix)]
+    fn pull_request_count(requests: &[String]) -> usize {
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /images/create?fromImage=redis&tag=7-alpine "))
+            .count()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn create_retries_a_pull_whose_stream_carried_an_error_once_and_goes_on_to_create() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            image_absent_response(),
+            pull_stream_error_response("received unexpected HTTP status: 502 Bad Gateway"),
+            pull_ok_response(),
+            container_created_response(),
+        ])
+        .await;
+        let pause = Duration::from_millis(150);
+        let backend = DockerBackend::new(client).with_pull_retry_pause(pause);
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let started = std::time::Instant::now();
+        let handle = backend
+            .create(spec)
+            .await
+            .expect("the second pull succeeds, so create goes on");
+        assert!(
+            started.elapsed() >= pause,
+            "the retry must wait out the pause: took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(handle.id(), "daemon-c-1");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(pull_request_count(&requests), 2, "{requests:?}");
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert!(
+            requests[3].starts_with("POST /containers/create?name="),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn create_fails_naming_the_image_and_docker_s_message_when_the_stream_errors_twice() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            image_absent_response(),
+            pull_stream_error_response("received unexpected HTTP status: 502 Bad Gateway"),
+            pull_stream_error_response("toomanyrequests: rate limit exceeded"),
+        ])
+        .await;
+        let backend = DockerBackend::new(client).with_pull_retry_pause(Duration::from_millis(10));
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let err = match backend.create(spec).await {
+            Ok(_) => panic!("two failed pulls must fail the create"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("docker could not pull image 'redis:7-alpine'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("toomanyrequests: rate limit exceeded"),
+            "the error carries the second failure's message: {message}"
+        );
+        assert!(message.contains("retried once"), "{message}");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(pull_request_count(&requests), 2, "{requests:?}");
+        assert_eq!(requests.len(), 3, "{requests:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn create_retries_a_pull_that_answered_http_500_once() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            image_absent_response(),
+            canned_response(
+                "500 Internal Server Error",
+                r#"{"message":"registry hiccup"}"#,
+            ),
+            pull_ok_response(),
+            container_created_response(),
+        ])
+        .await;
+        let backend = DockerBackend::new(client).with_pull_retry_pause(Duration::from_millis(10));
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        backend
+            .create(spec)
+            .await
+            .expect("the second pull succeeds, so create goes on");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(pull_request_count(&requests), 2, "{requests:?}");
+        assert_eq!(requests.len(), 4, "{requests:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn create_fails_after_one_retry_when_the_pull_answers_http_500_twice() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            image_absent_response(),
+            canned_response(
+                "500 Internal Server Error",
+                r#"{"message":"registry hiccup"}"#,
+            ),
+            canned_response("503 Service Unavailable", r#"{"message":"registry down"}"#),
+        ])
+        .await;
+        let backend = DockerBackend::new(client).with_pull_retry_pause(Duration::from_millis(10));
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let err = match backend.create(spec).await {
+            Ok(_) => panic!("two failed pulls must fail the create"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message
+                .contains("docker could not pull image 'redis:7-alpine' (HTTP 503, retried once)"),
+            "{message}"
+        );
+        assert!(message.contains("registry down"), "{message}");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(pull_request_count(&requests), 2, "{requests:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn create_does_not_retry_a_pull_that_answers_http_404() {
+        let (client, _dir, received) = multi_request_fixture(vec![
+            image_absent_response(),
+            canned_response(
+                "404 Not Found",
+                r#"{"message":"pull access denied for redis, repository does not exist"}"#,
+            ),
+        ])
+        .await;
+        // A pause long enough that a retry would show up as a slow test.
+        let pause = Duration::from_secs(5);
+        let backend = DockerBackend::new(client).with_pull_retry_pause(pause);
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let started = std::time::Instant::now();
+        let err = match backend.create(spec).await {
+            Ok(_) => panic!("a 404 pull must fail the create"),
+            Err(e) => e,
+        };
+        assert!(
+            started.elapsed() < pause,
+            "a 4xx must fail at once, took {:?}",
+            started.elapsed()
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("docker could not pull image 'redis:7-alpine' (HTTP 404): "),
+            "{message}"
+        );
+        assert!(message.contains("repository does not exist"), "{message}");
+        assert!(!message.contains("retried"), "{message}");
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(pull_request_count(&requests), 1, "{requests:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn create_pulls_once_without_pausing_when_the_stream_is_progress_lines_only() {
+        let progress_with_a_non_json_line = canned_response(
+            "200 OK",
+            "{\"status\":\"Pulling from library/redis\",\"id\":\"7-alpine\"}\n\
+             this line is not json\n\
+             {\"status\":\"Downloading\",\"progressDetail\":{\"current\":1,\"total\":9},\"id\":\"a1\"}\n\
+             {\"status\":\"Status: Downloaded newer image for redis:7-alpine\"}\n",
+        );
+        let (client, _dir, received) = multi_request_fixture(vec![
+            image_absent_response(),
+            progress_with_a_non_json_line,
+            container_created_response(),
+        ])
+        .await;
+        let pause = Duration::from_secs(5);
+        let backend = DockerBackend::new(client).with_pull_retry_pause(pause);
+        let spec = ContainerSpec::new("rz-reuse-799aad5a3338", "redis:7-alpine", "deadbeef");
+
+        let started = std::time::Instant::now();
+        backend
+            .create(spec)
+            .await
+            .expect("a clean pull goes straight on to create");
+        assert!(
+            started.elapsed() < pause,
+            "a clean pull must not pause, took {:?}",
+            started.elapsed()
+        );
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(pull_request_count(&requests), 1, "{requests:?}");
+        assert_eq!(requests.len(), 3, "{requests:?}");
+    }
+
+    #[test]
+    fn pull_retry_pause_is_two_seconds_by_default() {
+        assert_eq!(PULL_RETRY_PAUSE, Duration::from_secs(2));
+        assert_eq!(
+            DockerBackend::connecting_to_env().pull_retry_pause,
+            PULL_RETRY_PAUSE
+        );
+    }
+
+    fn pull_response_with(status: u16, body: &str) -> Response {
+        Response {
+            status,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn pull_failure_finds_an_error_string_anywhere_in_the_stream() {
+        let resp = pull_response_with(
+            200,
+            "{\"status\":\"Pulling from keycloak/keycloak\",\"id\":\"latest\"}\n\
+             {\"errorDetail\":{\"message\":\"received unexpected HTTP status: 502 Bad Gateway\"},\
+             \"error\":\"received unexpected HTTP status: 502 Bad Gateway\"}\n",
+        );
+        assert_eq!(
+            pull_failure(&resp),
+            Some(PullFailure::Stream {
+                message: "received unexpected HTTP status: 502 Bad Gateway".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn pull_failure_falls_back_to_error_detail_when_there_is_no_error_string() {
+        let resp = pull_response_with(
+            200,
+            "{\"errorDetail\":{\"message\":\"manifest unknown\"}}\n",
+        );
+        assert_eq!(
+            pull_failure(&resp),
+            Some(PullFailure::Stream {
+                message: "manifest unknown".to_string()
+            })
+        );
+        // An empty `error` doesn't count; the detail message still does.
+        let resp = pull_response_with(
+            200,
+            "{\"error\":\"\",\"errorDetail\":{\"message\":\"manifest unknown\"}}\n",
+        );
+        assert_eq!(
+            pull_failure(&resp),
+            Some(PullFailure::Stream {
+                message: "manifest unknown".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn pull_failure_ignores_lines_that_are_not_json_objects_with_an_error() {
+        let body = "not json\n\
+                    \n\
+                    [\"error\", null]\n\
+                    \"error\"\n\
+                    42\n\
+                    {\"error\":\"\"}\n\
+                    {\"error\":7}\n\
+                    {\"errorDetail\":{}}\n\
+                    {\"errorDetail\":\"oops\"}\n\
+                    {\"status\":\"Download complete\",\"id\":\"a1\"}\n";
+        assert_eq!(pull_failure(&pull_response_with(200, body)), None);
+        assert_eq!(pull_failure(&pull_response_with(200, "")), None);
+    }
+
+    #[test]
+    fn pull_failure_reports_a_status_of_400_or_above_with_the_body() {
+        let resp = pull_response_with(404, "{\"message\":\"repository does not exist\"}");
+        assert_eq!(
+            pull_failure(&resp),
+            Some(PullFailure::Http {
+                status: 404,
+                body: "{\"message\":\"repository does not exist\"}".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn pull_failure_retries_stream_errors_and_5xx_but_not_4xx() {
+        let http = |status| PullFailure::Http {
+            status,
+            body: String::new(),
+        };
+        assert!(
+            PullFailure::Stream {
+                message: "boom".to_string()
+            }
+            .is_retryable()
+        );
+        assert!(http(500).is_retryable());
+        assert!(http(502).is_retryable());
+        assert!(http(599).is_retryable());
+        assert!(!http(400).is_retryable());
+        assert!(!http(401).is_retryable());
+        assert!(!http(404).is_retryable());
+        assert!(!http(429).is_retryable());
     }
 
     #[tokio::test]
