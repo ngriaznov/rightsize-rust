@@ -28,7 +28,7 @@ Nothing yet.
   "No such image" from container create. It now reads the stream. An error there, or a
   daemon 5xx, gets one retry after 2 seconds; a 4xx (for example, a repository that does
   not exist) fails at once. The final error names the image, carries Docker's own message,
-  and says whether the pull was retried.
+  and says so when the pull was retried.
 
 ## [0.7.16] - 2026-10-23
 

@@ -2240,6 +2240,19 @@ mod tests {
                 message: "received unexpected HTTP status: 502 Bad Gateway".to_string()
             })
         );
+        // Not only the last line: an error with more progress lines after it still counts.
+        let resp = pull_response_with(
+            200,
+            "{\"status\":\"Pulling from keycloak/keycloak\",\"id\":\"latest\"}\n\
+             {\"error\":\"toomanyrequests: rate limit\"}\n\
+             {\"status\":\"Download complete\",\"id\":\"a1\"}\n",
+        );
+        assert_eq!(
+            pull_failure(&resp),
+            Some(PullFailure::Stream {
+                message: "toomanyrequests: rate limit".to_string()
+            })
+        );
     }
 
     #[test]
@@ -2293,6 +2306,15 @@ mod tests {
                 body: "{\"message\":\"repository does not exist\"}".to_string()
             })
         );
+        let resp = pull_response_with(400, "{\"message\":\"invalid reference format\"}");
+        assert_eq!(
+            pull_failure(&resp),
+            Some(PullFailure::Http {
+                status: 400,
+                body: "{\"message\":\"invalid reference format\"}".to_string()
+            })
+        );
+        assert_eq!(pull_failure(&pull_response_with(399, "")), None);
     }
 
     #[test]
