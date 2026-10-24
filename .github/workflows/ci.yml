@@ -1,7 +1,8 @@
 name: ci
 on:
   push:
-    branches: [main]
+    # docker-pull-retry: temporary, for this branch's own CI signal; drop before merging to main.
+    branches: [main, docker-pull-retry]
   pull_request:
   workflow_dispatch:
   # Weekly run: integration tests pin real upstream artifacts (the msb release,
