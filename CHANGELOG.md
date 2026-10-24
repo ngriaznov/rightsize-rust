@@ -6,7 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **The msb agent-relay boot retry now leaves evidence.** When msb's sandbox process exits
+  before its agent relay comes up and the backend retries the boot, it first reads the
+  failed sandbox's `msb logs --source system` output (before `msb rm -f` deletes it) and
+  writes the last 200 lines to stderr, with `rm -f`'s exit code. It then writes the outcome:
+  `booted on attempt 2`, or `giving up` followed by the second attempt's system log. Every
+  line starts with `rightsize: agent-relay retry:`. The lines go straight to stderr, so
+  `cargo test` shows them even for a passing test. The log text never goes into an error
+  message. Each msb CI job now reports how often the retry fired and how it ended. The retry
+  itself is unchanged.
 
 ## [0.7.17] - 2026-10-24
 

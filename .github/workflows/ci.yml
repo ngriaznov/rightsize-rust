@@ -67,6 +67,17 @@ jobs:
           key: rightsize-msb-install-${{ runner.os }}-${{ hashFiles('crates/rightsize-msb/src/provisioner.rs') }}
       - run: RIGHTSIZE_BACKEND=microsandbox cargo test --workspace --features sandbox-it 2>&1 | tee /tmp/it-output.log
         shell: bash
+      # Counts the agent-relay retry notes the backend writes to stderr (see the
+      # "Boot-failure retries" row in docs/parity.md), so a run shows how often the
+      # retry fires and how often it works even when every test passed. One annotation
+      # per run, zeros included. A grep that finds nothing exits 1, hence the `|| true`:
+      # this step must never fail the job.
+      - name: Count agent-relay retries
+        if: always()
+        shell: bash
+        run: |
+          count() { grep 'agent-relay retry:' /tmp/it-output.log 2>/dev/null | grep -c -F -- "$1" || true; }
+          echo "::notice title=agent-relay retry::fired $(count '(attempt 1 of 2)'), booted on attempt 2 $(count 'booted on attempt 2'), gave up $(count '(attempt 2 of 2); giving up')"
       # A pull interrupted mid-write can leave the image cache's index pointing at
       # layer files that don't exist; msb then hard-errors on that image forever.
       # Purge before saving so a corrupted cache is never banked for future runs —
@@ -192,6 +203,13 @@ jobs:
       # greps.
       - run: RIGHTSIZE_BACKEND=microsandbox cargo test -p rightsize-modules --no-default-features --features backend-msb,sandbox-it --test contract -- --test-threads=1 2>&1 | tee -a /tmp/it-output.log
         shell: bash
+      # Same retry count as msb-linux, over both IT steps' output.
+      - name: Count agent-relay retries
+        if: always()
+        shell: bash
+        run: |
+          count() { grep 'agent-relay retry:' /tmp/it-output.log 2>/dev/null | grep -c -F -- "$1" || true; }
+          echo "::notice title=agent-relay retry::fired $(count '(attempt 1 of 2)'), booted on attempt 2 $(count 'booted on attempt 2'), gave up $(count '(attempt 2 of 2); giving up')"
       # Same guard as msb-linux: never bank a cache a run observed corrupted, so the
       # next run re-pulls clean instead of restoring the poisoned entry. `shell: bash`
       # above (and here) matters on Windows runners, whose default shell is pwsh.

@@ -642,6 +642,17 @@ fn restore_missing_binding_paths(output: &str) -> Vec<String> {
 /// fired straight back into the same load would more likely repeat it.
 const AGENT_RELAY_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// Timeout for the system-log capture that precedes that retry's `msb rm -f` (and the
+/// one after a second failure). The capture sits on the retry's critical path, so it is
+/// shorter than [`LOGS_TIMEOUT`].
+const AGENT_RELAY_LOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many trailing lines of a captured system log are written to stderr.
+const AGENT_RELAY_LOG_TAIL_LINES: usize = 200;
+
+/// Start of every line [`retry_once_on_agent_relay_exit`] writes to stderr.
+const AGENT_RELAY_NOTE_PREFIX: &str = "rightsize: agent-relay retry: ";
+
 /// The marker line msb's guest agent writes to the SYSTEM log once it has actually
 /// come up — present only once a sandbox's boot genuinely reached a working guest
 /// agent, as opposed to dying before one ever existed.
@@ -2054,9 +2065,21 @@ impl From<PreRunningFailure> for AttemptFailure {
 /// `Starting`) along with its directory. A plain same-name `msb run` would then
 /// restart that PERSISTED config and ignore the new flags, and a same-name `msb
 /// restore` would fail with "already exists". So between the attempts this runs `msb
-/// rm -f <name>` best-effort (its result is ignored, like the candidate walks' own
-/// `rm`), waits [`AGENT_RELAY_RETRY_DELAY`], and boots again. `-f` because it also
+/// rm -f <name>` best-effort (a failure does not stop the retry; its exit code is only
+/// reported), waits [`AGENT_RELAY_RETRY_DELAY`], and boots again. `-f` because it also
 /// removes a row stuck in `Starting`, which plain `rm` refuses.
+///
+/// `msb rm -f` deletes the sandbox directory, and with it the `kernel.log` and
+/// `runtime.log` that `msb logs <name> --source system` merges — the only record of why
+/// msb's runtime exited before the guest reported ready. So the system log is captured
+/// BEFORE the `rm` and written to stderr through `note` along with the `rm` result and
+/// the retry's outcome; after a second failure the log is captured again, before the
+/// error leaves this function and the container layer removes the sandbox. Each capture
+/// gets `log_timeout` (production: [`AGENT_RELAY_LOG_TIMEOUT`]), a parameter like `delay`
+/// so a test can shorten it. `note` takes one block of text per call; production passes
+/// [`write_agent_relay_note`]. The log goes to `note` only, never into an error: the
+/// container layer string-matches error messages (a guest line saying "address already
+/// in use" would start its port-conflict rename loop).
 ///
 /// Nothing else needs updating for a same-name retry: the first attempt never reached
 /// `Running`, so `start()` has not yet stored an attached child or added the name to
@@ -2071,6 +2094,8 @@ fn retry_once_on_agent_relay_exit<T>(
     name: &str,
     command: &str,
     delay: Duration,
+    log_timeout: Duration,
+    note: impl Fn(&str),
     mut attempt: impl FnMut() -> std::result::Result<T, AttemptFailure>,
 ) -> std::result::Result<T, PreRunningFailure> {
     let output = match attempt() {
@@ -2078,20 +2103,136 @@ fn retry_once_on_agent_relay_exit<T>(
         Err(AttemptFailure::Classified(failure)) => return Err(failure),
         Err(AttemptFailure::AgentRelayExit { output }) => output,
     };
-    let _ = invoke_standalone(msb, &commands::rm_force(name), STOP_TIMEOUT);
+    let first_log = capture_agent_relay_system_log(msb, name, log_timeout);
+    let rm = match invoke_standalone(msb, &commands::rm_force(name), STOP_TIMEOUT) {
+        Ok(result) => result.exit_code.to_string(),
+        Err(e) => format!("without finishing ({e})"),
+    };
+    note(&format!(
+        "{AGENT_RELAY_NOTE_PREFIX}msb {command} for sandbox {name} exited before its agent \
+         relay came up (attempt 1 of 2); 'msb rm -f {name}' exited {rm}; retrying in {}\n{}",
+        describe_retry_delay(delay),
+        agent_relay_log_block(name, 1, &first_log),
+    ));
     std::thread::sleep(delay);
     match attempt() {
-        Ok(booted) => Ok(booted),
-        Err(AttemptFailure::Classified(failure)) => Err(failure),
+        Ok(booted) => {
+            note(&format!(
+                "{AGENT_RELAY_NOTE_PREFIX}msb {command} for sandbox {name} booted on attempt 2\n"
+            ));
+            Ok(booted)
+        }
+        Err(AttemptFailure::Classified(failure)) => {
+            note(&format!(
+                "{AGENT_RELAY_NOTE_PREFIX}msb {command} for sandbox {name} failed on attempt 2 \
+                 with a different error\n"
+            ));
+            Err(failure)
+        }
         Err(AttemptFailure::AgentRelayExit {
             output: retry_output,
-        }) => Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
-            "msb {command} for sandbox {name}: msb's sandbox process exited before its \
-             agent relay came up on both attempts (the retry ran after `msb rm -f` of the \
-             failed sandbox and a short pause).\nfirst attempt:\n{output}\nafter \
-             retry:\n{retry_output}"
-        )))),
+        }) => {
+            let second_log = capture_agent_relay_system_log(msb, name, log_timeout);
+            note(&format!(
+                "{AGENT_RELAY_NOTE_PREFIX}msb {command} for sandbox {name} exited before its \
+                 agent relay came up again (attempt 2 of 2); giving up\n{}",
+                agent_relay_log_block(name, 2, &second_log),
+            ));
+            Err(PreRunningFailure::Other(RightsizeError::Backend(format!(
+                "msb {command} for sandbox {name}: msb's sandbox process exited before its \
+                 agent relay came up on both attempts (the retry ran after `msb rm -f` of the \
+                 failed sandbox and a short pause). msb's system log for each attempt was \
+                 written to stderr.\nfirst attempt:\n{output}\nafter retry:\n{retry_output}"
+            ))))
+        }
     }
+}
+
+/// Best-effort `msb logs <name> --source system` for [`retry_once_on_agent_relay_exit`]:
+/// the merged text on success, or the reason it could not be read (a spawn failure, the
+/// timeout, a nonzero exit). Never an error — a broken capture must not block the retry.
+fn capture_agent_relay_system_log(
+    msb: &Path,
+    name: &str,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
+    match invoke_standalone(msb, &commands::logs_system(name), timeout) {
+        Ok(result) if result.exit_code == 0 => Ok(format!("{}{}", result.stdout, result.stderr)),
+        Ok(result) => {
+            let detail = result
+                .stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| format!(": {line}"))
+                .unwrap_or_default();
+            Err(format!("exit code {}{detail}", result.exit_code))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The log part of an agent-relay retry note: `capture` as a header line plus the last
+/// [`AGENT_RELAY_LOG_TAIL_LINES`] lines, each indented two spaces. A capture with no
+/// text, or one that failed, is just the header line. `attempt` is 1 or 2.
+fn agent_relay_log_block(
+    name: &str,
+    attempt: u32,
+    capture: &std::result::Result<String, String>,
+) -> String {
+    let header = format!(
+        "{AGENT_RELAY_NOTE_PREFIX}'msb logs {name} --source system' after attempt {attempt}"
+    );
+    match capture {
+        Err(reason) => format!("{header} could not be read ({reason})\n"),
+        Ok(text) if text.trim().is_empty() => format!("{header} produced no output\n"),
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let shown = lines.len().min(AGENT_RELAY_LOG_TAIL_LINES);
+            let mut block = format!("{header} (last {shown} of {} lines):\n", lines.len());
+            for line in &lines[lines.len() - shown..] {
+                block.push_str("  ");
+                block.push_str(line);
+                block.push('\n');
+            }
+            block
+        }
+    }
+}
+
+/// A retry delay for a note: whole seconds as `2 s`, anything else in milliseconds
+/// (`150 ms`).
+fn describe_retry_delay(delay: Duration) -> String {
+    if delay.subsec_nanos() == 0 && delay.as_secs() > 0 {
+        format!("{} s", delay.as_secs())
+    } else {
+        format!("{} ms", delay.as_millis())
+    }
+}
+
+/// Writes one agent-relay retry note to the process's stderr in a single `write_all`,
+/// so other output cannot interleave with it. This goes through `std::io::stderr()`
+/// rather than `eprintln!` on purpose: libtest captures `eprintln!` output from a
+/// passing test, which would hide a successful retry's note from CI logs. A failed
+/// write is ignored.
+///
+/// The crate's own unit-test build has a captured twin, below. The CI step that counts
+/// retries reads the same `cargo test` output as the `sandbox-it` runs, and the lib unit
+/// tests drive the full flows against a fake msb; their notes are not real retries.
+/// The `tests/*_it.rs` and `rightsize-modules` binaries link this crate without
+/// `cfg(test)`, so they keep the uncaptured writer.
+#[cfg(not(test))]
+fn write_agent_relay_note(text: &str) {
+    use std::io::Write as _;
+    let _ = std::io::stderr().lock().write_all(text.as_bytes());
+}
+
+/// [`write_agent_relay_note`] for this crate's own unit tests: `eprint!`, which libtest
+/// captures from a passing test, so the notes of fake-msb runs stay out of the output
+/// CI counts retries in.
+#[cfg(test)]
+fn write_agent_relay_note(text: &str) {
+    eprint!("{text}");
 }
 
 /// Runs on a blocking thread: spawns `msb run <spec's argv>` attached (no `-d`),
@@ -2634,9 +2775,15 @@ fn try_run_and_await_running(
     msb: &Path,
     spec: &ContainerSpec,
 ) -> std::result::Result<Child, PreRunningFailure> {
-    retry_once_on_agent_relay_exit(msb, &spec.name, "run", AGENT_RELAY_RETRY_DELAY, || {
-        try_run_and_await_running_once(msb, spec)
-    })
+    retry_once_on_agent_relay_exit(
+        msb,
+        &spec.name,
+        "run",
+        AGENT_RELAY_RETRY_DELAY,
+        AGENT_RELAY_LOG_TIMEOUT,
+        write_agent_relay_note,
+        || try_run_and_await_running_once(msb, spec),
+    )
 }
 
 /// ONE attempt of [`try_run_and_await_running`]: spawns an attached `msb run` child,
@@ -2964,9 +3111,15 @@ fn try_restore_and_await_running_with_launcher<L>(
 where
     L: Fn(&Path, &[String]) -> std::io::Result<RestoreLaunch> + ?Sized,
 {
-    retry_once_on_agent_relay_exit(msb, &spec.name, "restore", AGENT_RELAY_RETRY_DELAY, || {
-        try_restore_and_await_running_once(msb, spec, snapshot_path, launcher)
-    })
+    retry_once_on_agent_relay_exit(
+        msb,
+        &spec.name,
+        "restore",
+        AGENT_RELAY_RETRY_DELAY,
+        AGENT_RELAY_LOG_TIMEOUT,
+        write_agent_relay_note,
+        || try_restore_and_await_running_once(msb, spec, snapshot_path, launcher),
+    )
 }
 
 /// ONE attempt of [`try_restore_and_await_running_with_launcher`]. `launcher`
@@ -10092,6 +10245,8 @@ At line:1 char:1
             "rz-relay-ok",
             "run",
             Duration::from_millis(1),
+            AGENT_RELAY_LOG_TIMEOUT,
+            |_: &str| {},
             || {
                 *calls.borrow_mut() += 1;
                 if *calls.borrow() == 1 {
@@ -10116,6 +10271,8 @@ At line:1 char:1
             "rz-relay-twice",
             "restore",
             Duration::from_millis(1),
+            AGENT_RELAY_LOG_TIMEOUT,
+            |_: &str| {},
             || {
                 let n = {
                     let mut c = calls.borrow_mut();
@@ -10138,8 +10295,14 @@ At line:1 char:1
             message.contains("agent relay came up on both attempts"),
             "{message}"
         );
-        assert!(message.contains("attempt 1 output"), "{message}");
-        assert!(message.contains("attempt 2 output"), "{message}");
+        assert!(
+            message.contains("msb's system log for each attempt was written to stderr."),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("\nfirst attempt:\nattempt 1 output\nafter retry:\nattempt 2 output"),
+            "{message}"
+        );
         assert!(
             !message.to_lowercase().contains("already exists"),
             "the reuse flow reads that phrase as a name collision: {message}"
@@ -10154,6 +10317,8 @@ At line:1 char:1
             "rz-relay-other",
             "run",
             Duration::from_millis(1),
+            AGENT_RELAY_LOG_TIMEOUT,
+            |_: &str| {},
             || {
                 *calls.borrow_mut() += 1;
                 Err(PreRunningFailure::Other(RightsizeError::Backend("boom".to_string())).into())
@@ -10175,6 +10340,8 @@ At line:1 char:1
             "rz-relay-other",
             "run",
             Duration::from_millis(1),
+            AGENT_RELAY_LOG_TIMEOUT,
+            |_: &str| {},
             || {
                 *calls.borrow_mut() += 1;
                 if *calls.borrow() == 1 {
@@ -10195,6 +10362,577 @@ At line:1 char:1
             matches!(err, PreRunningFailure::StateDbError { .. }),
             "{err:?}"
         );
+    }
+
+    /// Writes a fake `msb` for the agent-relay retry's stderr notes. Dispatches on `$1`:
+    /// - `logs` -> appends its argv to `<dir>/calls`, then follows `<dir>/logs-mode`:
+    ///   `fail` writes a line to stderr and exits 3, `hang` execs `sleep 30`, anything
+    ///   else (the default) prints `<dir>/logs-output` and exits 0;
+    /// - `rm` -> appends its argv to `<dir>/calls` and exits with the code in
+    ///   `<dir>/rm-exit` (default 0).
+    ///
+    /// [`run_relay_retry`] appends `attempt N` to the same `calls` file, so the file
+    /// holds the order of everything the retry did.
+    #[cfg(unix)]
+    fn write_fake_msb_for_relay_notes(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-msb-relay-notes.sh");
+        let body = r#"#!/bin/sh
+dir="$(dirname "$0")"
+case "$1" in
+logs)
+echo "$*" >> "$dir/calls"
+case "$(cat "$dir/logs-mode" 2>/dev/null)" in
+fail) echo "error: sandbox not found" 1>&2; exit 3 ;;
+hang) exec sleep 30 ;;
+esac
+cat "$dir/logs-output" 2>/dev/null
+exit 0
+;;
+rm)
+echo "$*" >> "$dir/calls"
+exit "$(cat "$dir/rm-exit" 2>/dev/null || echo 0)"
+;;
+esac
+exit 0
+"#;
+        std::fs::write(&script, body).expect("write fake msb relay-notes script");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake msb relay-notes script");
+        script
+    }
+
+    #[cfg(unix)]
+    fn relay_exit(output: &str) -> AttemptFailure {
+        AttemptFailure::AgentRelayExit {
+            output: output.to_string(),
+        }
+    }
+
+    /// [`run_relay_retry_with_log_timeout`] with the production capture timeout.
+    #[cfg(unix)]
+    fn run_relay_retry(
+        dir: &Path,
+        msb: &Path,
+        name: &str,
+        attempts: impl Fn(u32) -> std::result::Result<&'static str, AttemptFailure>,
+    ) -> (
+        std::result::Result<&'static str, PreRunningFailure>,
+        Vec<String>,
+    ) {
+        run_relay_retry_with_log_timeout(dir, msb, name, AGENT_RELAY_LOG_TIMEOUT, attempts)
+    }
+
+    /// Runs [`retry_once_on_agent_relay_exit`] (150 ms delay, command `run`, system-log
+    /// capture limited to `log_timeout`) against the fake `msb` in `dir`, with `attempts`
+    /// deciding each attempt's outcome from its number. Returns the result and the text
+    /// blocks written through the note sink, one entry per write.
+    #[cfg(unix)]
+    fn run_relay_retry_with_log_timeout(
+        dir: &Path,
+        msb: &Path,
+        name: &str,
+        log_timeout: Duration,
+        attempts: impl Fn(u32) -> std::result::Result<&'static str, AttemptFailure>,
+    ) -> (
+        std::result::Result<&'static str, PreRunningFailure>,
+        Vec<String>,
+    ) {
+        use std::io::Write as _;
+        let notes = RefCell::new(Vec::<String>::new());
+        let count = RefCell::new(0u32);
+        let result = retry_once_on_agent_relay_exit(
+            msb,
+            name,
+            "run",
+            Duration::from_millis(150),
+            log_timeout,
+            |text: &str| notes.borrow_mut().push(text.to_string()),
+            || {
+                let n = {
+                    let mut c = count.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                let mut calls = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("calls"))
+                    .unwrap();
+                writeln!(calls, "attempt {n}").unwrap();
+                attempts(n)
+            },
+        );
+        (result, notes.into_inner())
+    }
+
+    #[test]
+    fn describe_retry_delay_prints_whole_seconds_and_otherwise_milliseconds() {
+        assert_eq!(describe_retry_delay(AGENT_RELAY_RETRY_DELAY), "2 s");
+        assert_eq!(describe_retry_delay(Duration::from_secs(1)), "1 s");
+        assert_eq!(describe_retry_delay(Duration::from_millis(150)), "150 ms");
+        assert_eq!(describe_retry_delay(Duration::from_millis(1500)), "1500 ms");
+        assert_eq!(describe_retry_delay(Duration::ZERO), "0 ms");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_captures_the_system_log_before_the_rm_and_reports_a_recovery() {
+        let dir = unique_test_dir("relay-notes-recovery");
+        let name = "rz-relay-notes-recovery";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+        std::fs::write(
+            dir.join("logs-output"),
+            "kernel: booting\nruntime: spawning vmm\nruntime: vmm exited 0\n",
+        )
+        .unwrap();
+
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |n| {
+            if n == 1 {
+                Err(relay_exit(AGENT_RELAY_ATTACHED_RUN_OUTPUT))
+            } else {
+                Ok("booted")
+            }
+        });
+
+        assert_eq!(result.expect("the retry's success is returned"), "booted");
+        assert_eq!(
+            agent_relay_calls(&dir),
+            vec![
+                "attempt 1".to_string(),
+                format!("logs {name} --source system --tail 1000"),
+                format!("rm -f {name}"),
+                "attempt 2".to_string(),
+            ],
+            "the log is read once, before the forced rm and the second boot"
+        );
+        assert_eq!(
+            notes,
+            vec![
+                format!(
+                    "rightsize: agent-relay retry: msb run for sandbox {name} exited before its \
+                     agent relay came up (attempt 1 of 2); 'msb rm -f {name}' exited 0; \
+                     retrying in 150 ms\n\
+                     rightsize: agent-relay retry: 'msb logs {name} --source system' after \
+                     attempt 1 (last 3 of 3 lines):\n  \
+                     kernel: booting\n  \
+                     runtime: spawning vmm\n  \
+                     runtime: vmm exited 0\n"
+                ),
+                format!(
+                    "rightsize: agent-relay retry: msb run for sandbox {name} booted on attempt 2\n"
+                ),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_that_fails_twice_captures_both_logs_and_keeps_the_log_out_of_the_error() {
+        let dir = unique_test_dir("relay-notes-twice");
+        let name = "rz-relay-notes-twice";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+        std::fs::write(
+            dir.join("logs-output"),
+            "runtime: address already in use (os error 98)\nruntime: vmm exited 0\n",
+        )
+        .unwrap();
+
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |n| {
+            if n == 2 {
+                std::fs::write(
+                    dir.join("logs-output"),
+                    "kernel: second boot\nruntime: container name already exists\n",
+                )
+                .unwrap();
+            }
+            Err(relay_exit(&format!("attempt {n} output")))
+        });
+
+        let err = result.expect_err("two relay exits must end in an error");
+        assert_eq!(
+            agent_relay_calls(&dir),
+            vec![
+                "attempt 1".to_string(),
+                format!("logs {name} --source system --tail 1000"),
+                format!("rm -f {name}"),
+                "attempt 2".to_string(),
+                format!("logs {name} --source system --tail 1000"),
+            ],
+            "one capture before the rm, one after attempt 2, and no third attempt"
+        );
+        assert_eq!(
+            notes,
+            vec![
+                format!(
+                    "rightsize: agent-relay retry: msb run for sandbox {name} exited before its \
+                     agent relay came up (attempt 1 of 2); 'msb rm -f {name}' exited 0; \
+                     retrying in 150 ms\n\
+                     rightsize: agent-relay retry: 'msb logs {name} --source system' after \
+                     attempt 1 (last 2 of 2 lines):\n  \
+                     runtime: address already in use (os error 98)\n  \
+                     runtime: vmm exited 0\n"
+                ),
+                format!(
+                    "rightsize: agent-relay retry: msb run for sandbox {name} exited before its \
+                     agent relay came up again (attempt 2 of 2); giving up\n\
+                     rightsize: agent-relay retry: 'msb logs {name} --source system' after \
+                     attempt 2 (last 2 of 2 lines):\n  \
+                     kernel: second boot\n  \
+                     runtime: container name already exists\n"
+                ),
+            ]
+        );
+
+        let rendered = format!("{err:?} {err:?}");
+        let PreRunningFailure::Other(RightsizeError::Backend(message)) = err else {
+            panic!("expected a plain backend error, got {err:?}");
+        };
+        assert!(
+            message.ends_with(
+                "msb's system log for each attempt was written to stderr.\n\
+                 first attempt:\nattempt 1 output\nafter retry:\nattempt 2 output"
+            ),
+            "{message}"
+        );
+        for text in [&message, &rendered] {
+            assert!(
+                !text.contains("address already in use") && !text.contains("already exists"),
+                "the container layer string-matches errors, so no system log text may be in one: {text}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_still_happens_when_the_log_capture_fails_or_is_empty() {
+        for (label, mode, output, header) in [
+            (
+                "fails",
+                "fail",
+                "",
+                "after attempt 1 could not be read (exit code 3: error: sandbox not found)",
+            ),
+            ("empty", "output", "", "after attempt 1 produced no output"),
+            (
+                "blank",
+                "output",
+                "\n  \n",
+                "after attempt 1 produced no output",
+            ),
+        ] {
+            let dir = unique_test_dir(&format!("relay-notes-capture-{label}"));
+            let name = format!("rz-relay-notes-capture-{label}");
+            let msb = write_fake_msb_for_relay_notes(&dir);
+            std::fs::write(dir.join("logs-mode"), mode).unwrap();
+            std::fs::write(dir.join("logs-output"), output).unwrap();
+
+            let (result, notes) = run_relay_retry(&dir, &msb, &name, |n| {
+                if n == 1 {
+                    Err(relay_exit(AGENT_RELAY_ATTACHED_RUN_OUTPUT))
+                } else {
+                    Ok("booted")
+                }
+            });
+
+            assert_eq!(
+                result.expect("the retry must still run"),
+                "booted",
+                "{label}"
+            );
+            assert_eq!(
+                notes,
+                vec![
+                    format!(
+                        "rightsize: agent-relay retry: msb run for sandbox {name} exited before \
+                         its agent relay came up (attempt 1 of 2); 'msb rm -f {name}' exited 0; \
+                         retrying in 150 ms\n\
+                         rightsize: agent-relay retry: 'msb logs {name} --source system' {header}\n"
+                    ),
+                    format!(
+                        "rightsize: agent-relay retry: msb run for sandbox {name} booted on \
+                         attempt 2\n"
+                    ),
+                ],
+                "{label}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn agent_relay_retry_survives_an_msb_that_cannot_be_spawned() {
+        let name = "rz-relay-notes-unspawnable";
+        let missing = Path::new("/definitely/not/a/real/msb");
+        let notes = RefCell::new(Vec::<String>::new());
+        let calls = RefCell::new(0u32);
+        let booted = retry_once_on_agent_relay_exit(
+            missing,
+            name,
+            "restore",
+            Duration::from_millis(1),
+            AGENT_RELAY_LOG_TIMEOUT,
+            |text: &str| notes.borrow_mut().push(text.to_string()),
+            || {
+                *calls.borrow_mut() += 1;
+                if *calls.borrow() == 1 {
+                    Err(AttemptFailure::AgentRelayExit {
+                        output: AGENT_RELAY_ATTACHED_RUN_OUTPUT.to_string(),
+                    })
+                } else {
+                    Ok("booted")
+                }
+            },
+        )
+        .expect("neither the capture nor the rm failing may stop the retry");
+        assert_eq!(booted, "booted");
+
+        let notes = notes.into_inner();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[0].contains(&format!(
+                "'msb rm -f {name}' exited without finishing (failed to spawn msb rm -f {name}: "
+            )),
+            "{}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains(&format!(
+                "'msb logs {name} --source system' after attempt 1 could not be read \
+                 (failed to spawn msb logs {name} --source system --tail 1000: "
+            )),
+            "{}",
+            notes[0]
+        );
+        assert!(notes[0].contains("retrying in 1 ms\n"), "{}", notes[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_log_capture_reports_a_timeout_instead_of_blocking() {
+        let dir = unique_test_dir("relay-notes-timeout");
+        let name = "rz-relay-notes-timeout";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+        std::fs::write(dir.join("logs-mode"), "hang").unwrap();
+
+        let started = Instant::now();
+        let capture = capture_agent_relay_system_log(&msb, name, Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hung msb logs must be killed at the timeout"
+        );
+        let reason = capture.expect_err("a hung msb logs is a failed capture");
+        assert_eq!(
+            reason,
+            format!(
+                "msb logs {name} --source system --tail 1000 timed out after 1s and was \
+                 force-killed"
+            )
+        );
+        assert_eq!(
+            agent_relay_log_block(name, 1, &Err(reason.clone())),
+            format!(
+                "rightsize: agent-relay retry: 'msb logs {name} --source system' after \
+                 attempt 1 could not be read ({reason})\n"
+            )
+        );
+        assert_eq!(AGENT_RELAY_LOG_TIMEOUT, Duration::from_secs(10));
+        assert!(AGENT_RELAY_LOG_TIMEOUT < LOGS_TIMEOUT);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The capture timeout is wired into BOTH captures of the retry (the one before the
+    /// `rm`, and the one after a second failure): a hung `msb logs` ends at the injected
+    /// timeout, is reported as unreadable, and the retry carries on to the final error.
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_bounds_both_log_captures_by_the_timeout_it_is_given() {
+        let dir = unique_test_dir("relay-notes-hung-logs");
+        let name = "rz-relay-notes-hung-logs";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+        std::fs::write(dir.join("logs-mode"), "hang").unwrap();
+
+        let started = Instant::now();
+        let (result, notes) =
+            run_relay_retry_with_log_timeout(&dir, &msb, name, Duration::from_secs(1), |n| {
+                Err(relay_exit(&format!("attempt {n} output")))
+            });
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a hung msb logs (30 s) must be cut off at the 1 s timeout, twice: {:?}",
+            started.elapsed()
+        );
+
+        let err = result.expect_err("two relay exits must end in an error");
+        assert!(
+            matches!(&err, PreRunningFailure::Other(RightsizeError::Backend(m))
+                if m.ends_with("\nfirst attempt:\nattempt 1 output\nafter retry:\nattempt 2 output")),
+            "{err:?}"
+        );
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        for (note, attempt) in notes.iter().zip(1..) {
+            assert!(
+                note.contains(&format!(
+                    "'msb logs {name} --source system' after attempt {attempt} could not be \
+                     read (msb logs {name} --source system --tail 1000 timed out after 1s and \
+                     was force-killed)\n"
+                )),
+                "capture {attempt}: {note}"
+            );
+        }
+        assert_eq!(
+            agent_relay_calls(&dir),
+            vec![
+                "attempt 1".to_string(),
+                format!("logs {name} --source system --tail 1000"),
+                format!("rm -f {name}"),
+                "attempt 2".to_string(),
+                format!("logs {name} --source system --tail 1000"),
+            ],
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_writes_only_the_last_200_lines_of_a_long_log() {
+        let dir = unique_test_dir("relay-notes-tail");
+        let name = "rz-relay-notes-tail";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+        let log: String = (1..=250).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("logs-output"), log).unwrap();
+
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |n| {
+            if n == 1 {
+                Err(relay_exit(AGENT_RELAY_ATTACHED_RUN_OUTPUT))
+            } else {
+                Ok("booted")
+            }
+        });
+        result.expect("the retry's success is returned");
+
+        let (head, block) = notes[0].split_once('\n').unwrap();
+        assert!(head.ends_with("retrying in 150 ms"), "{head}");
+        let mut expected = format!(
+            "rightsize: agent-relay retry: 'msb logs {name} --source system' after attempt 1 \
+             (last 200 of 250 lines):\n"
+        );
+        for n in 51..=250 {
+            expected.push_str(&format!("  line {n}\n"));
+        }
+        assert_eq!(block, expected);
+        assert_eq!(AGENT_RELAY_LOG_TAIL_LINES, 200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_reports_a_nonzero_rm_exit_code() {
+        let dir = unique_test_dir("relay-notes-rm-exit");
+        let name = "rz-relay-notes-rm-exit";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+        std::fs::write(dir.join("rm-exit"), "7").unwrap();
+
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |n| {
+            if n == 1 {
+                Err(relay_exit(AGENT_RELAY_ATTACHED_RUN_OUTPUT))
+            } else {
+                Ok("booted")
+            }
+        });
+
+        assert_eq!(
+            result.expect("a failed rm does not stop the retry"),
+            "booted"
+        );
+        assert!(
+            notes[0].starts_with(&format!(
+                "rightsize: agent-relay retry: msb run for sandbox {name} exited before its \
+                 agent relay came up (attempt 1 of 2); 'msb rm -f {name}' exited 7; \
+                 retrying in 150 ms\n"
+            )),
+            "{}",
+            notes[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_notes_a_different_error_on_attempt_2_and_returns_it_unchanged() {
+        let dir = unique_test_dir("relay-notes-different");
+        let name = "rz-relay-notes-different";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |n| {
+            if n == 1 {
+                Err(relay_exit(AGENT_RELAY_ATTACHED_RUN_OUTPUT))
+            } else {
+                Err(PreRunningFailure::Other(RightsizeError::Backend("boom".to_string())).into())
+            }
+        });
+
+        let err = result.expect_err("the second attempt's own failure comes back");
+        assert!(
+            matches!(&err, PreRunningFailure::Other(RightsizeError::Backend(m)) if m == "boom"),
+            "{err:?}"
+        );
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("(attempt 1 of 2)"), "{}", notes[0]);
+        assert_eq!(
+            notes[1],
+            format!(
+                "rightsize: agent-relay retry: msb run for sandbox {name} failed on attempt 2 \
+                 with a different error\n"
+            )
+        );
+        assert_eq!(
+            agent_relay_calls(&dir).len(),
+            4,
+            "attempt 1, logs, rm -f, attempt 2: no capture after a different error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_relay_retry_is_silent_and_runs_no_msb_when_the_relay_exit_is_not_what_happened() {
+        let dir = unique_test_dir("relay-notes-silent");
+        let name = "rz-relay-notes-silent";
+        let msb = write_fake_msb_for_relay_notes(&dir);
+
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |_| Ok("booted"));
+        assert_eq!(result.expect("a first-attempt success"), "booted");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(agent_relay_calls(&dir), vec!["attempt 1".to_string()]);
+
+        let _ = std::fs::remove_file(dir.join("calls"));
+        let (result, notes) = run_relay_retry(&dir, &msb, name, |_| {
+            Err(PreRunningFailure::Other(RightsizeError::Backend("boom".to_string())).into())
+        });
+        assert!(
+            matches!(result, Err(PreRunningFailure::Other(_))),
+            "{result:?}"
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(
+            agent_relay_calls(&dir),
+            vec!["attempt 1".to_string()],
+            "no msb logs, no msb rm"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10407,8 +11145,16 @@ exit 0
             "{message}"
         );
         assert!(
+            message.contains("msb's system log for each attempt was written to stderr."),
+            "{message}"
+        );
+        assert!(
+            message.contains("\nfirst attempt:\n") && message.contains("\nafter retry:\n"),
+            "both attempts' output must be included: {message}"
+        );
+        assert!(
             message.contains("before agent relay became available"),
-            "the last attempt's output must be included: {message}"
+            "the attempts' output must be included: {message}"
         );
 
         let calls = agent_relay_calls(&dir);
@@ -10509,6 +11255,10 @@ exit 0
         assert!(
             message.contains("agent relay came up on both attempts"),
             "{message}"
+        );
+        assert!(
+            message.contains("\nfirst attempt:\n") && message.contains("\nafter retry:\n"),
+            "both attempts' output must be included: {message}"
         );
 
         let calls = agent_relay_calls(&dir);
