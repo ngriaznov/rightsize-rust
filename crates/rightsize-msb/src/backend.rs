@@ -10807,7 +10807,12 @@ exit 0
         let dir = unique_test_dir("relay-notes-tail");
         let name = "rz-relay-notes-tail";
         let msb = write_fake_msb_for_relay_notes(&dir);
-        let log: String = (1..=250).map(|n| format!("line {n}\n")).collect();
+        // `fold`+`write!`, not `map(format!).collect()`: clippy's `format_collect` (1.85).
+        let log = (1..=250).fold(String::new(), |mut log, n| {
+            use std::fmt::Write as _;
+            let _ = writeln!(log, "line {n}");
+            log
+        });
         std::fs::write(dir.join("logs-output"), log).unwrap();
 
         let (result, notes) = run_relay_retry(&dir, &msb, name, |n| {
