@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.18] - 2026-11-10
+
 ### Added
 
 - **The msb agent-relay boot retry now leaves evidence.** When msb's sandbox process exits
@@ -1412,7 +1416,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.17...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.18...HEAD
+[0.7.18]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.17...v0.7.18
 [0.7.17]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.16...v0.7.17
 [0.7.16]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.14...v0.7.15
