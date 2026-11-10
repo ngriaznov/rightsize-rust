@@ -414,11 +414,17 @@ fn spawn_line_drain<T: Send + 'static>(
 /// output — so this is a best-effort message match, same idea as the core container
 /// builder's own fallback classifier, kept local to this backend since the wording is
 /// msb-specific.
+///
+/// Since 0.7.14 msb claims published ports before the VM boots and fails with "failed
+/// to publish tcp port <addr>: <OS error>". On Windows that OS error is WSAEADDRINUSE,
+/// which never says "in use" ("Only one usage of each socket address ... (os error
+/// 10048)"), hence its own clause.
 fn is_port_bind_conflict(output: &str) -> bool {
     let m = output.to_lowercase();
     m.contains("address already in use")
         || m.contains("port is already allocated")
         || (m.contains("already in use") && m.contains("port"))
+        || m.contains("os error 10048")
 }
 
 /// True if `output` (a `msb run` child's combined stdout/stderr) names msb's image
@@ -7861,10 +7867,28 @@ mod tests {
     }
 
     #[test]
+    fn is_port_bind_conflict_matches_the_pre_boot_port_claim_on_every_host() {
+        assert!(is_port_bind_conflict(
+            "failed to publish tcp port 127.0.0.1:49213: Address already in use (os error 98)"
+        ));
+        assert!(is_port_bind_conflict(
+            "failed to publish udp port 127.0.0.1:49214: Address already in use (os error 48)"
+        ));
+        assert!(is_port_bind_conflict(
+            "failed to publish tcp port 127.0.0.1:49213: Only one usage of each socket address \
+             (protocol/network address/port) is normally permitted. (os error 10048)"
+        ));
+    }
+
+    #[test]
     fn is_port_bind_conflict_negative_cases_do_not_match() {
         assert!(!is_port_bind_conflict("panic: index out of bounds"));
         assert!(!is_port_bind_conflict(""));
         assert!(!is_port_bind_conflict("connection refused"));
+        // Another socket error from the same pre-boot claim is not a conflict a new port fixes.
+        assert!(!is_port_bind_conflict(
+            "failed to publish tcp port 127.0.0.1:80: Permission denied (os error 13)"
+        ));
     }
 
     #[test]
