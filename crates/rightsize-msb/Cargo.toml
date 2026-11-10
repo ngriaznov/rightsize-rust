@@ -30,3 +30,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # so `cargo test -p rightsize-msb --features sandbox-it` is the whole invocation, no
 # `--ignored` flag to remember.
 sandbox-it = []
+# A live provisioning check (tests/provision_check.rs): downloads the pinned msb for this
+# host, verifies it against the release's checksums and runs `msb --version`. It needs
+# the network but no VM, so it is what the macOS workflow runs on GitHub's hosted Apple
+# Silicon runners, which cannot boot microVMs.
+msb-provision-check = []

@@ -38,6 +38,13 @@ names, which the first publish claims permanently.
    cargo publish -p rightsize-modules
    ```
 
+   Or run the same four publishes from CI: Actions → `release` → Run workflow
+   (`CARGO_REGISTRY_TOKEN` Actions secret). The workflow first runs the macOS
+   gate (`macos.yml`, on a hosted Apple Silicon runner): the workspace build,
+   the unit tests, and a real provisioning of the pinned msb, which must report
+   its version, ship an arm64 libkrunfw, and be signed with the hypervisor
+   entitlement. Nothing publishes unless it passes.
+
    crates.io usually indexes a new crate within seconds; if a dependent publish
    fails with "no matching package", wait a moment and retry that step.
    (`cargo publish --workspace` automates this ordering but is still
