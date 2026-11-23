@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.8.1] - 2026-11-23
+
 ### Changed
 
 - **The pinned msb is now 0.8.1** (was 0.7.14), and rightsize's version now follows the msb
@@ -1453,7 +1457,8 @@ Initial public release.
   never exercised a real download, which is why this only surfaced with the
   0.6.3 pin bump.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.18...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-rust/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.18...v0.8.1
 [0.7.18]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.17...v0.7.18
 [0.7.17]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.16...v0.7.17
 [0.7.16]: https://github.com/ngriaznov/rightsize-rust/compare/v0.7.15...v0.7.16
