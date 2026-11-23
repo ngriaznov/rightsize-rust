@@ -1999,6 +1999,10 @@ async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_
         .expect("exec must run");
     assert_eq!(read.exit_code, 0, "{}", read.stderr);
     assert!(read.stdout.contains("rz-destdir-marker"), "{}", read.stdout);
+    // Stop the restored container before removing its checkpoint, as the Kotlin and
+    // Node contract tests do: on Windows msb 0.8 cannot delete a checkpoint that a
+    // running restored sandbox still holds open (`Access is denied. (os error 5)`).
+    restored_guard.stop().await.unwrap();
 
     let raw_backend = raw_backend_for(&backend_name);
     raw_backend
@@ -2009,8 +2013,6 @@ async fn a_checkpoint_stores_its_artifact_under_the_cache_dir_and_restores_from_
         !ref_path.exists(),
         "remove_checkpoint must delete the dest-dir artifact directory"
     );
-
-    restored_guard.stop().await.unwrap();
 }
 
 // ============================ network links: UDP scenario 1 =========================
