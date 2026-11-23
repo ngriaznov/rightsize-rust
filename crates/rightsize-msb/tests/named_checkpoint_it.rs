@@ -81,19 +81,22 @@ fn nonce() -> &'static str {
 }
 
 /// Best-effort, SYNCHRONOUS cleanup for one named checkpoint: removes the disk
-/// snapshot via a direct `msb snapshot rm` (mirrors `checkpoint_it.rs`'s
+/// snapshot via a direct `msb snapshot rm <group> --all` (mirrors `checkpoint_it.rs`'s
 /// `remove_snapshot_blocking` — a `Drop` impl cannot `.await` the async
 /// `Checkpoint::remove`) and deletes the registry file directly. Wired through a
 /// `Drop` guard, not a bare trailing call, so both still run if an assertion
 /// partway through the test panics.
 fn remove_named_checkpoint_blocking(name: &str, checkpoint_ref: &str) {
     if let Ok(msb_path) = rightsize_msb::provisioner::ensure_installed() {
-        // `-f`: msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` by their
-        // own artifact path (verified live) — same spelling as
-        // `commands::snapshot_rm`, shelled out directly here since a `Drop` impl
-        // cannot `.await` the async SPI.
+        // msb 0.8 takes a group, never a member path: remove the ref's parent
+        // group with `commands::snapshot_rm_group`, shelled out directly here
+        // since a `Drop` impl cannot `.await` the async SPI.
+        let group = std::path::Path::new(checkpoint_ref)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let _ = Command::new(msb_path)
-            .args(["snapshot", "rm", checkpoint_ref, "-f"])
+            .args(rightsize_msb::commands::snapshot_rm_group(&group))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

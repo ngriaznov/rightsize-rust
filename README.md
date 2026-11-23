@@ -267,7 +267,8 @@ for the full picture.
   downloaded once, SHA-256-verified against the release manifest, and installed
   atomically under `~/.cache/rightsize/` - the binary lands last, so a crashed
   install is detected and repaired, never half-trusted. A cross-process lock
-  keeps parallel test binaries from racing.
+  keeps parallel test binaries from racing. rightsize's version is the version
+  of the msb release it pins: rightsize 0.8.1 runs msb 0.8.1.
 - **Attached-mode supervision.** Each container is a held child process
   supervising its microVM; the image's `ENTRYPOINT` runs exactly as it would
   under Docker.

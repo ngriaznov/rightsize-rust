@@ -724,17 +724,24 @@ fn is_agent_endpoint_not_ready(stderr: &str) -> bool {
     stderr.contains("agent client error") && stderr.contains("connect")
 }
 
-/// True if `output` (an `msb snapshot inspect` child's combined stdout/stderr) names
-/// a missing snapshot — msb's own "not found" wording, following the same `error:
-/// <noun> not found: <ref>` convention already confirmed for images (see the
-/// captured `"error: image not found: <ref>"` wording this backend's `image remove`
-/// heal path negatively tests against). This is the ONLY signal
+/// True if `output` (an `msb snapshot` child's combined stdout/stderr) names a
+/// missing snapshot group or member. msb 0.8.1 words that two ways: `error: snapshot
+/// not found: <ref>` (the `error: <noun> not found: <ref>` convention also confirmed
+/// for images — see the captured `"error: image not found: <ref>"` wording this
+/// backend's `image remove` heal path negatively tests against), and
+/// `error: io error: No such file or directory (os error 2)` when the group or member
+/// directory is simply absent (a missing bare name, or a missing group or member
+/// under a path ref). The io form is matched on the `io error` prefix and the
+/// numeric `(os error 2)` suffix, never on the message text between them, which is
+/// the machine's own language on Windows. These are the ONLY signals
 /// [`MsbCliBackend::has_checkpoint`] treats as "definitely absent" (`Ok(false)`) —
 /// every other nonzero exit (a transient daemon problem, a malformed ref, anything
 /// else) surfaces as an error, per `SandboxBackend::has_checkpoint`'s contract: a
 /// probe failure must never masquerade as "not there."
 fn is_snapshot_not_found(output: &str) -> bool {
-    output.to_lowercase().contains("snapshot not found")
+    let lower = output.to_lowercase();
+    lower.contains("snapshot not found")
+        || (lower.contains("io error") && lower.contains("(os error 2)"))
 }
 
 /// Refuses a checkpoint whose reboot could not mount a copied file again: every
@@ -757,7 +764,7 @@ fn ensure_mount_host_files_exist(spec: &ContainerSpec) -> Result<()> {
 }
 
 /// Mints an absolute checkpoint ref for `nonce_or_name`: a path under
-/// `<cache_dir>/checkpoints/`, whose basename is the actual snapshot name `msb`
+/// `<cache_dir>/checkpoints/`, whose basename is the snapshot GROUP name `msb`
 /// is given (`rz-ckpt-<nonce_or_name>`) — the same naming convention
 /// `rightsize::ContainerGuard` itself now applies when it mints this ref up
 /// front (see `MsbCliBackend::create_checkpoint`'s doc). Kept here as
@@ -782,21 +789,60 @@ fn path_ref_dir(checkpoint_ref: &str) -> Option<PathBuf> {
     path.is_absolute().then(|| path.to_path_buf())
 }
 
+/// Splits a path ref (`<checkpoints>/<group>/snap_<id>`, the member directory) into
+/// the pair msb 0.8's `snapshot save` and `snapshot rm` take: the group directory
+/// (the ref's parent) and the member name (its basename). `None` for a ref with no
+/// parent, no file name, or a file name that is not a `snap_*` member (a legacy
+/// `rz-ckpt-<hex>` artifact dir: its parent is the checkpoints root, never a group).
+fn split_path_ref(dir: &Path) -> Option<(String, String)> {
+    let group_dir = dir.parent()?;
+    let member = dir.file_name()?.to_str()?;
+    if !member.starts_with("snap_") {
+        return None;
+    }
+    Some((group_dir.display().to_string(), member.to_string()))
+}
+
+/// True if `group_dir` holds a `snap_*` entry other than `member`. An unreadable or
+/// missing group directory holds none. [`MsbCliBackend::remove_checkpoint`] removes
+/// the whole group only when this is false, so a group that carries checkpoints
+/// the caller did not name never loses them.
+fn group_has_other_members(group_dir: &Path, member: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(group_dir) else {
+        return false;
+    };
+    entries.filter_map(std::result::Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("snap_") && name != member
+    })
+}
+
+/// A fresh msb group name for one `snapshot load`: `rz-ckpt-import-` plus 12 random
+/// lowercase hex characters. Each import lands in a group of its own, so a repeated
+/// import never collides with an earlier one.
+fn fresh_import_group() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst) as u128;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u128::from(std::process::id()))
+        .wrapping_add(seq);
+    format!("rz-ckpt-import-{:012x}", mixed & 0xFFFF_FFFF_FFFF)
+}
+
 /// `dir` (a path ref's artifact directory) holds a real checkpoint iff it exists
 /// AND contains `snapshot.json` — [`MsbCliBackend::has_checkpoint`]'s filesystem
 /// check for a path ref, no `msb` call involved.
 fn path_ref_artifact_exists(dir: &Path) -> bool {
     dir.is_dir() && dir.join("snapshot.json").is_file()
-}
-
-/// True if `output` (an `msb snapshot load` child's combined stdout/stderr)
-/// names msb's "already imported" wording — `error: snapshot already exists:
-/// <path>`. For a content-addressed archive this IS success: the artifact is
-/// already sitting there under its digest-derived directory, so
-/// [`MsbCliBackend::import_checkpoint`] treats it as one, continuing straight to
-/// resolving the effective ref exactly like a fresh, successful import would.
-fn is_snapshot_already_exists(output: &str) -> bool {
-    output.to_lowercase().contains("snapshot already exists")
 }
 
 /// True if `stderr` (an `msb snapshot save` invocation's) carries Windows'
@@ -882,10 +928,9 @@ fn salvage_archive_staging_file(dest: &Path) -> bool {
     std::fs::rename(candidate, dest).is_ok()
 }
 
-/// The shared "last non-empty line, required to parse as an absolute path"
-/// contract both `msb snapshot create` ([`parse_snapshot_create_ref`]) and `msb
-/// snapshot load` ([`parse_snapshot_load_ref`]) print their artifact's own path
-/// through on msb 0.7.1: trims surrounding whitespace, takes the LAST non-empty
+/// The "last non-empty line, required to parse as an absolute path" contract
+/// `msb snapshot create` ([`parse_snapshot_create_ref`]) prints its artifact's own
+/// path through: trims surrounding whitespace, takes the LAST non-empty
 /// line, and requires it to parse as an absolute path (`Path::is_absolute()`) —
 /// empty output, a relative-looking last line, or anything else that isn't
 /// recognizably a path all return `None` rather than guess, so a caller can fail
@@ -898,35 +943,20 @@ fn parse_last_line_as_absolute_path(output: &str) -> Option<String> {
         .then(|| candidate.to_string())
 }
 
-/// Parses the loaded checkpoint artifact's own absolute path out of a successful
-/// `msb snapshot load <archive> --dest <dir>` invocation's stdout — verified
-/// contract against a real msb 0.7.1 binary: stdout carries a `group msb-<hex>:
-/// head snap_<digest> (Initialized)` line, a digest line, then the loaded
-/// artifact's absolute path as the LAST line. That full path — not a digest or a
-/// directory basename resolved separately via `snapshot list` — IS the effective
-/// ref [`MsbCliBackend::import_checkpoint`] returns, the same "the printed path
-/// itself is the ref" contract [`parse_snapshot_create_ref`] already uses for
-/// `snapshot create`. See [`parse_last_line_as_absolute_path`] for the shared
-/// parsing rule both apply.
-fn parse_snapshot_load_ref(stdout: &str) -> Option<String> {
-    parse_last_line_as_absolute_path(stdout)
-}
-
-/// Fallback for [`msb_import_checkpoint_cycle`]'s "already exists" outcome when
-/// [`parse_snapshot_load_ref`] finds nothing on stdout: pulls the artifact path
-/// out of msb's `error: snapshot already exists: <path>` stderr line (see
-/// [`is_snapshot_already_exists`]) the same way the pre-0.7.1 `import` verb's
-/// digest-dir parse did — the LAST whitespace-separated token on the last
-/// non-empty line, required to parse as an absolute path. Unlike
-/// [`parse_last_line_as_absolute_path`], the line itself does not have to be
-/// nothing but the path, since here it is always prefixed with msb's own
-/// `error: snapshot already exists:` wording.
-fn parse_already_exists_stderr_ref(stderr: &str) -> Option<String> {
-    let last_line = stderr.lines().rev().find(|line| !line.trim().is_empty())?;
-    let candidate = last_line.split_whitespace().last()?;
-    Path::new(candidate)
-        .is_absolute()
-        .then(|| candidate.to_string())
+/// Finds the member id in `msb snapshot load`'s output: the first line, stdout
+/// before stderr, that starts with `Added: ` (a member imported now) or `Reused: `
+/// (a member already in the group, exit 0). msb 0.8.1 prints one such line per
+/// archive member on stdout; its head-update line goes to stderr and is skipped here.
+/// The id is the first token after the prefix. `None` when no line matches, so the
+/// caller can fail quoting msb's raw output instead of building a ref from a guess.
+fn parse_snapshot_load_member(stdout: &str, stderr: &str) -> Option<String> {
+    stdout.lines().chain(stderr.lines()).find_map(|line| {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("Added: ")
+            .or_else(|| line.strip_prefix("Reused: "))?;
+        rest.split_whitespace().next().map(str::to_string)
+    })
 }
 
 /// Before retrying a boot that hit msb's state-database error — enough for a winning
@@ -1475,12 +1505,11 @@ impl SandboxBackend for MsbCliBackend {
     /// handle isn't `keep_alive`) moves from `id`'s key to that winner's — see
     /// the trait method's own doc for why the caller must adopt it.
     ///
-    /// **The returned ref is NOT `<dest_dir>/<name>`.** msb 0.7.1's dest-dir disk
-    /// snapshot store nests the artifact one level deeper than the name it was
-    /// given: `<dest_dir>/<source-sandbox-name>/snap_<32-hex-digest>` (verified
-    /// live) — `name`/`rz-ckpt-<nonce-or-name>` only ever reaches msb's own INDEX
-    /// (as `<source>:<name>` in `snapshot list`) and `snapshot inspect` output, not
-    /// the filesystem path. So this method never constructs the final ref itself:
+    /// **The returned ref is NOT `<dest_dir>/<name>`.** msb 0.8's dest-dir snapshot
+    /// store treats the name it is given (`rz-ckpt-<nonce-or-name>`) as a new snapshot
+    /// GROUP and names the member itself, so the artifact lives one level deeper:
+    /// `<dest_dir>/<group>/snap_<32-hex-id>` (verified live). So this method never
+    /// constructs the final ref itself:
     /// it CAPTURES it by parsing `snapshot create`'s own stdout (the LAST non-empty
     /// line, required to be an absolute path — see `parse_snapshot_create_ref`),
     /// and that captured path is what's passed to `restore`/`snapshot rm`/`snapshot
@@ -1790,46 +1819,78 @@ impl SandboxBackend for MsbCliBackend {
             .and_then(|state| state.captured_cmdline.clone())
     }
 
-    /// `msb snapshot rm <checkpoint_ref> -f` — best-effort, matching
-    /// [`Self::remove_by_name`]'s own "not found is fine" contract; verified live
-    /// to delete both msb's index entry and the dest-dir artifact directory for a
-    /// path ref. `checkpoint_ref` is passed UNCHANGED, never reduced to a
-    /// basename: msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` by their
-    /// own artifact path only (a bare name or `group:member` spelling does not
-    /// resolve at all, verified live — see [`commands::snapshot_rm`]'s doc), and a
-    /// path ref's own ref string already IS that artifact path; a legacy
-    /// bare-name ref predates dest-dir checkpoints and is a name either way, which
-    /// is exactly what this passes through unchanged for that case too.
+    /// `msb snapshot rm <group dir> --all` for a checkpoint that is the only
+    /// `snap_*` member of its group, `msb snapshot rm <group dir> --checkpoint
+    /// <member> -f` when the group holds others — best-effort, matching
+    /// [`Self::remove_by_name`]'s own "not found is fine" contract. `checkpoint_ref`
+    /// is the member path (`<checkpoints>/<group>/snap_<id>`); msb 0.8 takes the GROUP
+    /// (a member path is refused), so the group directory is the ref's parent and the
+    /// member its basename. The whole group goes when this member is its only one
+    /// because `rm --checkpoint` leaves the (then empty) group behind, and msb then
+    /// refuses to create a group of that name again. The listing is what keeps a
+    /// shared group from losing members the caller did not name. A bare-name ref is
+    /// left alone, with no msb call, as in the Node and Kotlin backends: this release
+    /// never mints one (checkpoints from earlier releases are not migrated), and
+    /// removing a group by a bare name could hit an unrelated msb snapshot group.
     ///
-    /// The filesystem sweep below (removing a path ref's artifact directory by
-    /// hand) only runs when msb's own removal is known to have left nothing
-    /// behind: either it actually succeeded, or it reports the ref as already
-    /// gone (see `is_snapshot_not_found`) — both cases where msb's index has no
-    /// remaining reference to the directory. Every OTHER nonzero exit leaves the
-    /// directory alone, most notably msb's HEAD-removal refusal (`invalid
-    /// config: cannot remove current head snap_...; first select another
-    /// snapshot with 'msb snapshot head src:<snapshot>'`, verified live for the
-    /// newest of several snapshots from the same source sandbox): deleting the
-    /// directory anyway would leave msb's own index pointing at files that no
-    /// longer exist, corrupting its snapshot store rather than cleaning it up.
-    /// This backend does not attempt automatic head rotation to work around that
-    /// refusal — the checkpoints docs' "Cleanup" section names it as a known
-    /// limitation instead. That refusal (and any other non-"not found" failure)
-    /// DOES surface as an `Err` here, though — "best-effort" above only means
-    /// "not found is success," matching the docker backend's own
-    /// `remove_checkpoint` (any real failure but a 404 is an `Err`); a caller
-    /// that needs to know whether the artifact is actually gone (without also
-    /// caring why a removal failed) has [`Self::has_checkpoint`] for that.
+    /// A missing group or member (`error: io error: No such file or directory (os
+    /// error 2)` or `snapshot not found`, see `is_snapshot_not_found`) means it is
+    /// already gone and counts as success.
+    ///
+    /// The filesystem sweep below (removing the group or member directory by hand)
+    /// only runs when msb's own removal is known to have left nothing behind: either
+    /// it actually succeeded, or it reports the ref as already gone. Every OTHER
+    /// nonzero exit leaves the directory alone: deleting it anyway would leave msb's
+    /// own index pointing at files that no longer exist. That failure DOES surface as
+    /// an `Err` here — "best-effort" above only means "not found is success,"
+    /// matching the docker backend's own `remove_checkpoint` (any real failure but a
+    /// 404 is an `Err`); a caller that needs to know whether the artifact is actually
+    /// gone (without also caring why a removal failed) has [`Self::has_checkpoint`]
+    /// for that.
     async fn remove_checkpoint(&self, checkpoint_ref: &str) -> Result<()> {
         let msb = self.msb.clone();
         let rm_target = checkpoint_ref.to_string();
         let artifact_dir = path_ref_dir(checkpoint_ref);
         tokio::task::spawn_blocking(move || {
-            let result = invoke_standalone(&msb, &commands::snapshot_rm(&rm_target), STOP_TIMEOUT)?;
+            // (argv, directory to sweep after a clean removal).
+            // A path ref that is not `<group>/snap_<id>` is a legacy artifact dir:
+            // msb never knew it and its parent is not a group, so no msb call and
+            // only the ref's own directory is swept (and only if it holds
+            // snapshot.json).
+            if let Some(dir) = artifact_dir.as_deref() {
+                if split_path_ref(dir).is_none() {
+                    if dir.join("snapshot.json").is_file() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                    return Ok(());
+                }
+            }
+            let (argv, sweep_dir) = match artifact_dir
+                .as_deref()
+                .and_then(|d| split_path_ref(d).map(|(group_dir, member)| (d, group_dir, member)))
+            {
+                Some((dir, group_dir, member)) => {
+                    if group_has_other_members(Path::new(&group_dir), &member)
+                        || !Path::new(&group_dir).join("group.json").is_file()
+                    {
+                        (
+                            commands::snapshot_rm_member(&group_dir, &member),
+                            Some(dir.to_path_buf()),
+                        )
+                    } else {
+                        (
+                            commands::snapshot_rm_group(&group_dir),
+                            Some(PathBuf::from(&group_dir)),
+                        )
+                    }
+                }
+                None => return Ok(()),
+            };
+            let result = invoke_standalone(&msb, &argv, STOP_TIMEOUT)?;
             let not_found = is_snapshot_not_found(&format!("{}\n{}", result.stdout, result.stderr));
             let safe_to_sweep = result.exit_code == 0 || not_found;
             if safe_to_sweep {
-                if let Some(dir) = &artifact_dir {
+                if let Some(dir) = &sweep_dir {
                     if dir.exists() {
                         let _ = std::fs::remove_dir_all(dir);
                     }
@@ -1892,7 +1953,8 @@ impl SandboxBackend for MsbCliBackend {
         )))
     }
 
-    /// `msb snapshot save <ref> <dest>` (never `--with-image` — see
+    /// `msb snapshot save <group dir> --checkpoint <member> <dest>` (the ref's parent
+    /// directory and basename; never `--with-image` — see
     /// `crate::commands::snapshot_export`'s own doc for why) — the
     /// checkpoint-archive feature's export primitive
     /// (`rightsize::Checkpoint::export_to`), with the Windows salvage described by
@@ -1907,11 +1969,19 @@ impl SandboxBackend for MsbCliBackend {
         let msb = self.msb.clone();
         let snapshot_ref = checkpoint_ref.to_string();
         let dest = dest.to_path_buf();
+        let (group_dir, member) = path_ref_dir(checkpoint_ref)
+            .and_then(|dir| split_path_ref(&dir))
+            .ok_or_else(|| {
+                RightsizeError::Backend(format!(
+                    "cannot export checkpoint '{checkpoint_ref}': it is not an absolute \
+                     <group>/snap_<id> path"
+                ))
+            })?;
         tokio::task::spawn_blocking(move || {
             let mut invoke_export = || {
                 invoke_standalone(
                     &msb,
-                    &commands::snapshot_export(&snapshot_ref, &dest),
+                    &commands::snapshot_export(&group_dir, &member, &dest),
                     ARCHIVE_TIMEOUT,
                 )
             };
@@ -1928,16 +1998,13 @@ impl SandboxBackend for MsbCliBackend {
         .map_err(|e| RightsizeError::Backend(format!("checkpoint export task panicked: {e}")))?
     }
 
-    /// `msb snapshot load <src_file> --dest <cache_dir>/checkpoints`, treating
-    /// "already exists" as success — the checkpoint-archive feature's import
-    /// primitive (`rightsize::Checkpoint::import_from`). `ref_hint` (the archive
-    /// manifest's original ref) plays no role here: msb's import is
-    /// content-addressed, so the effective ref is always the loaded artifact's own
-    /// absolute path, parsed from `load`'s stdout (see
-    /// `msb_import_checkpoint_cycle` for the orchestration this delegates to) —
-    /// never `ref_hint`, and never a `snapshot list`-resolved digest-dir name (msb
-    /// 0.7.1 no longer needs that extra round trip; `load` prints the artifact's
-    /// own path directly).
+    /// `msb snapshot load rz-ckpt-import-<12 hex> --file <src_file> --dest
+    /// <cache_dir>/checkpoints` — the checkpoint-archive feature's import primitive
+    /// (`rightsize::Checkpoint::import_from`). Each import gets a fresh group name, and
+    /// the effective ref is `<checkpoints>/<group>/<id>`, built from the id on msb's
+    /// `Added: <id>` or `Reused: <id>` line (see `msb_import_checkpoint_cycle`).
+    /// `ref_hint` (the archive manifest's original ref) plays no role here: the member
+    /// keeps the id it had in the source group, whatever the ref said.
     ///
     /// `--dest` is always this backend's own `<cache_dir>/checkpoints` — the same
     /// directory a created checkpoint's artifact lands under (see
@@ -1951,24 +2018,32 @@ impl SandboxBackend for MsbCliBackend {
         let archive_path = src_file.to_path_buf();
         let checkpoints_dir = rightsize::cache_dir::dir().join("checkpoints");
         tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&checkpoints_dir).map_err(|e| {
-                RightsizeError::Backend(format!(
-                    "could not create checkpoints directory {}: {e}",
-                    checkpoints_dir.display()
-                ))
-            })?;
-            let mut invoke_import = || {
-                invoke_standalone(
-                    &msb,
-                    &commands::snapshot_import(&archive_path, &checkpoints_dir),
-                    ARCHIVE_TIMEOUT,
-                )
-            };
-            msb_import_checkpoint_cycle(&mut invoke_import)
+            import_checkpoint_into(&msb, &archive_path, &checkpoints_dir)
         })
         .await
         .map_err(|e| RightsizeError::Backend(format!("checkpoint import task panicked: {e}")))?
     }
+}
+
+/// [`MsbCliBackend::import_checkpoint`]'s body with the checkpoints directory
+/// passed in, so a test can point it at a scratch directory instead of the real
+/// cache dir.
+fn import_checkpoint_into(
+    msb: &Path,
+    archive_path: &Path,
+    checkpoints_dir: &Path,
+) -> Result<String> {
+    std::fs::create_dir_all(checkpoints_dir).map_err(|e| {
+        RightsizeError::Backend(format!(
+            "could not create checkpoints directory {}: {e}",
+            checkpoints_dir.display()
+        ))
+    })?;
+    let group = fresh_import_group();
+    let argv = commands::snapshot_import(&group, archive_path, checkpoints_dir);
+    let command = format!("msb {}", argv.join(" "));
+    let mut invoke_import = || invoke_standalone(msb, &argv, ARCHIVE_TIMEOUT);
+    msb_import_checkpoint_cycle(&mut invoke_import, checkpoints_dir, &group, &command)
 }
 
 /// Builds the external, standalone-process kill command the reaping watchdog uses to
@@ -4041,10 +4116,9 @@ fn wait_for_checkpoint_name_release(
 ///
 /// **The snapshot's real ref is parsed from `snapshot create`'s own stdout**
 /// (see [`parse_snapshot_create_ref`]), never assembled as `dest_dir`/`basename`
-/// — msb 0.7.1's dest-dir disk snapshot store nests the artifact under
-/// `dest_dir/<name's-source-sandbox>/snap_<digest>`, a path `basename` (the name
-/// msb was GIVEN) never appears in (verified live; see
-/// `MsbCliBackend::create_checkpoint`'s own doc). `reboot` is handed that parsed
+/// — `basename` is the new snapshot GROUP's name, and msb 0.8 names the member
+/// inside it, so the artifact sits at `dest_dir/<basename>/snap_<id>` (verified
+/// live; see `MsbCliBackend::create_checkpoint`'s own doc). `reboot` is handed that parsed
 /// ref so it can set it as the spec's `checkpoint_ref` before actually rebooting
 /// — this function has no spec of its own to set it on. On success, the parsed
 /// ref is returned alongside `reboot`'s own result, since
@@ -4371,7 +4445,7 @@ fn reboot_with_already_exists_retry<T>(
 
 /// Parses the checkpoint artifact's own absolute path out of a successful `msb
 /// snapshot create --from-sandbox ... --dest-dir ...` invocation's stdout —
-/// [`msb_checkpoint_cycle`]'s only way to learn where msb 0.7.1 actually put the
+/// [`msb_checkpoint_cycle`]'s only way to learn where msb 0.8 actually put the
 /// artifact, since it no longer lands at `dest_dir/basename` (see that
 /// function's own doc for why). Verified live: msb prints the snapshot ID line,
 /// then the artifact's absolute path as the LAST stdout line.
@@ -4421,72 +4495,51 @@ fn msb_export_checkpoint_cycle(
 }
 
 /// Orchestrates the checkpoint-archive feature's import cycle: one `msb snapshot
-/// load <archive> --dest <dir>` via `invoke_import` (injected, mirroring
-/// [`msb_checkpoint_cycle`]'s own shape, so this orchestration is unit-testable
-/// without a real `msb` binary), treating msb's "already exists" wording as
-/// success (see [`is_snapshot_already_exists`]) the same as the pre-0.7.1 `import`
-/// verb did. Returns the loaded artifact's own absolute path as
-/// [`MsbCliBackend::import_checkpoint`]'s effective ref.
+/// load <group> --file <archive> --dest <dir>` via `invoke_import` (injected,
+/// mirroring [`msb_checkpoint_cycle`]'s own shape, so this orchestration is
+/// unit-testable without a real `msb` binary). Returns the loaded member's ref,
+/// `<checkpoints_dir>/<group>/<id>`, where `<id>` comes from the `Added: <id>` or
+/// `Reused: <id>` line (see [`parse_snapshot_load_member`]).
 ///
-/// **No `snapshot list` round trip any more.** Earlier msb releases' `import`
-/// unpacked under an opaque digest-derived directory name that had to be
-/// separately confirmed against `msb snapshot list --format json`'s output; msb
-/// 0.7.1's `load` prints the artifact's own full path directly (the same
-/// "parse the printed path" contract [`msb_checkpoint_cycle`]'s `snapshot create`
-/// step already uses) for a fresh, successful load, so nothing needs resolving
-/// via `list` in that case.
-///
-/// **Ref resolution, and the one thing that is NOT verified.** A fresh,
-/// successful `load` (exit 0) printing the group/digest/path lines to stdout,
-/// last line the artifact's own absolute path, is empirically verified against a
-/// real msb 0.7.1 binary — see [`parse_snapshot_load_ref`]. What `load` prints
-/// on an "already exists" outcome (nonzero exit, tolerated as success) is NOT
-/// verified: the pre-0.7.1 `import` verb it replaces put that path only in the
-/// `error: snapshot already exists: <path>` stderr line, with stdout empty, so
-/// this still tries `parse_snapshot_load_ref` on stdout first (covering the
-/// possibility that `load` prints its usual group/digest/path lines up front
-/// even when it then exits nonzero) and, only if that finds nothing, falls back
-/// to pulling the path out of the "already exists" stderr line the same way the
-/// pre-0.7.1 code did (see [`parse_already_exists_stderr_ref`]). Both shapes are
-/// covered by tests; a real msb 0.7.1 binary should confirm which one it
-/// actually uses before this ships.
-///
-/// Failure handling: an import failure that ISN'T "already exists" surfaces with
-/// its stderr, never touching stdout. A successful (or already-exists) import
-/// for which NEITHER stdout NOR (on "already exists") the stderr line yields a
-/// parseable absolute path surfaces its own actionable error quoting the raw
-/// output, rather than trusting garbage.
+/// A repeat import of the same archive into the same group is `Reused:` with exit 0,
+/// so there is no "already exists" outcome to tolerate. A nonzero exit surfaces msb's
+/// exit code and stderr. A zero exit with no `Added:` or `Reused:` line, or one whose
+/// member directory has no `snapshot.json`, is an error that carries msb's raw
+/// output rather than a ref built from a guess.
 fn msb_import_checkpoint_cycle(
     invoke_import: &mut dyn FnMut() -> Result<ExecResult>,
+    checkpoints_dir: &Path,
+    group: &str,
+    command: &str,
 ) -> Result<String> {
     let import_result = invoke_import()?;
-    let already_exists = is_snapshot_already_exists(&format!(
-        "{}\n{}",
-        import_result.stdout, import_result.stderr
-    ));
-    if import_result.exit_code != 0 && !already_exists {
+    if import_result.exit_code != 0 {
         return Err(RightsizeError::Backend(format!(
-            "msb snapshot load failed (exit {}): {}",
+            "{command} failed (exit {}): {}",
             import_result.exit_code,
             import_result.stderr.trim()
         )));
     }
 
-    if let Some(ref_path) = parse_snapshot_load_ref(&import_result.stdout) {
-        return Ok(ref_path);
-    }
-    if already_exists {
-        if let Some(ref_path) = parse_already_exists_stderr_ref(&import_result.stderr) {
-            return Ok(ref_path);
-        }
-    }
+    let Some(member) = parse_snapshot_load_member(&import_result.stdout, &import_result.stderr)
+    else {
+        return Err(RightsizeError::Backend(format!(
+            "{command} did not report an imported checkpoint (no 'Added:' or 'Reused:' line) \
+             — output:\n{}{}",
+            import_result.stdout, import_result.stderr,
+        )));
+    };
 
-    Err(RightsizeError::Backend(format!(
-        "msb snapshot load succeeded but its stdout did not end with a recognizable absolute \
-         artifact path, and no fallback path was found in stderr either\nraw stdout:\n{}\nraw \
-         stderr:\n{}",
-        import_result.stdout, import_result.stderr,
-    )))
+    let artifact = checkpoints_dir.join(group).join(&member);
+    if !path_ref_artifact_exists(&artifact) {
+        return Err(RightsizeError::Backend(format!(
+            "{command} reported {member}, but {} does not exist — output:\n{}{}",
+            artifact.join("snapshot.json").display(),
+            import_result.stdout,
+            import_result.stderr,
+        )));
+    }
+    Ok(artifact.display().to_string())
 }
 
 /// Waits (bounded by [`ATTACHED_STOP_TIMEOUT`]) for an already-signalled-to-stop
@@ -4946,8 +4999,10 @@ mod tests {
 
     /// The nested artifact path a fake `msb snapshot create --from-sandbox ...
     /// --dest-dir <dest_dir>` prints as its LAST stdout line, matching msb
-    /// 0.7.1's real, live-verified shape: `<dest_dir>/<source-sandbox>/
-    /// snap_<digest>`, never `<dest_dir>/<name-it-was-given>`. `dest_dir` must be
+    /// 0.8.1's real, live-verified shape: `<dest_dir>/<group>/snap_<id>`, where
+    /// `<group>` is the name `create` was given, never `<dest_dir>/<name>` itself.
+    /// The fake names the group after the source sandbox, which is enough for the
+    /// parser under test. `dest_dir` must be
     /// absolute on every platform this crate targets — [`parse_snapshot_create_ref`]
     /// requires it — so callers build it from `std::env::temp_dir()` rather than a
     /// hand-typed Unix literal such as `/cache/checkpoints`, which
@@ -7320,36 +7375,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A checkpoint ref as `snapshot create` prints it: `<checkpoints>/<group>/snap_<id>`.
+    #[cfg(unix)]
+    fn make_member_dir(group_dir: &Path, id: &str) -> PathBuf {
+        let member = group_dir.join(format!("snap_{id}"));
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("snapshot.json"), b"{}").unwrap();
+        member
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn remove_checkpoint_on_a_path_ref_invokes_snapshot_rm_with_the_full_path_and_clears_the_leftover_artifact_dir()
-     {
-        let dir = unique_test_dir("remove-checkpoint-path-ref");
+    async fn remove_checkpoint_on_a_non_snap_path_ref_never_touches_the_checkpoints_root() {
+        let dir = unique_test_dir("remove-checkpoint-legacy-ref");
         let script = write_argv_logging_stub(&dir);
         let backend = MsbCliBackend::new(script);
 
-        let artifact_dir = dir
-            .join("checkpoints")
-            .join("rz-abc-1")
-            .join("snap_deadbeefcafedeadbeefcafedeadbeef");
-        std::fs::create_dir_all(&artifact_dir).unwrap();
-        std::fs::write(artifact_dir.join("snapshot.json"), b"{}").unwrap();
+        let root = dir.join("checkpoints");
+        let legacy = root.join("rz-ckpt-deadbeefcafe");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("snapshot.json"), b"{}").unwrap();
+        let other = make_member_dir(
+            &root.join("rz-ckpt-other"),
+            "cafecafecafecafecafecafecafecafe",
+        );
 
         backend
-            .remove_checkpoint(&artifact_dir.display().to_string())
+            .remove_checkpoint(&legacy.display().to_string())
+            .await
+            .unwrap();
+
+        assert!(root.exists(), "the checkpoints root must survive");
+        assert!(other.exists(), "an unrelated group must survive");
+        assert!(!legacy.exists(), "the legacy ref dir itself is swept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_checkpoint_on_a_single_member_group_removes_the_whole_group() {
+        let dir = unique_test_dir("remove-checkpoint-single-member");
+        let script = write_argv_logging_stub(&dir);
+        let backend = MsbCliBackend::new(script);
+
+        let group_dir = dir.join("checkpoints").join("rz-ckpt-deadbeefcafe");
+        let member = make_member_dir(&group_dir, "deadbeefcafedeadbeefcafedeadbeef");
+        std::fs::write(group_dir.join("group.json"), b"{}").unwrap();
+
+        backend
+            .remove_checkpoint(&member.display().to_string())
             .await
             .unwrap();
 
         let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
         assert_eq!(
             log.trim(),
-            format!("snapshot rm {} -f", artifact_dir.display()),
-            "msb 0.7.1 only resolves a dest-dir snapshot by its own artifact path — \
-             never a bare basename"
+            format!("snapshot rm {} --all", group_dir.display()),
+            "msb 0.8 takes a group, never a member path, and `rm --checkpoint` would leave \
+             the empty group behind"
         );
         assert!(
-            !artifact_dir.exists(),
-            "a leftover path-ref artifact dir must be cleaned up after a successful snapshot rm"
+            !group_dir.exists(),
+            "a leftover group dir must be cleaned up after a successful snapshot rm"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7357,7 +7445,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn remove_checkpoint_on_a_bare_name_ref_invokes_snapshot_rm_with_the_ref_unchanged() {
+    async fn remove_checkpoint_on_a_group_with_another_member_removes_only_that_member() {
+        let dir = unique_test_dir("remove-checkpoint-shared-group");
+        let script = write_argv_logging_stub(&dir);
+        let backend = MsbCliBackend::new(script);
+
+        let group_dir = dir.join("checkpoints").join("rz-abc-1");
+        let member = make_member_dir(&group_dir, "deadbeefcafedeadbeefcafedeadbeef");
+        let other = make_member_dir(&group_dir, "0123456789abcdef0123456789abcdef");
+
+        backend
+            .remove_checkpoint(&member.display().to_string())
+            .await
+            .unwrap();
+
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(
+            log.trim(),
+            format!(
+                "snapshot rm {} --checkpoint snap_deadbeefcafedeadbeefcafedeadbeef -f",
+                group_dir.display()
+            )
+        );
+        assert!(!member.exists(), "the named member's leftover dir goes");
+        assert!(
+            other.join("snapshot.json").is_file(),
+            "a member the caller did not name must survive, group and all"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_checkpoint_on_a_bare_name_ref_makes_no_msb_call() {
         let dir = unique_test_dir("remove-checkpoint-bare-name");
         let script = write_argv_logging_stub(&dir);
         let backend = MsbCliBackend::new(script);
@@ -7367,75 +7488,110 @@ mod tests {
             .await
             .unwrap();
 
-        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap();
-        assert_eq!(log.trim(), "snapshot rm rz-ckpt-deadbeefcafe -f");
+        let log = std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default();
+        assert_eq!(
+            log.trim(),
+            "",
+            "a bare name could match an unrelated msb group, so no `snapshot rm` may run"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Writes a stub `msb` replacement whose `snapshot rm` invocation always
-    /// fails — with the live-verified head-removal refusal wording (see
-    /// `commands::snapshot_rm`'s doc) on stderr and a nonzero exit — while every
-    /// other subcommand still exits 0. For exercising
-    /// [`MsbCliBackend::remove_checkpoint`]'s refusal-propagating behavior (see
-    /// the next test).
+    /// Writes a stub `msb` replacement whose `snapshot rm` invocation always fails
+    /// with `stderr` and exit 1, while every other subcommand still exits 0.
     #[cfg(unix)]
-    fn write_snapshot_rm_head_refusing_stub(dir: &Path) -> PathBuf {
+    fn write_snapshot_rm_failing_stub(dir: &Path, stderr: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let script = dir.join("fake-msb-refuse-rm.sh");
-        let body = "#!/bin/sh\n\
+        let script = dir.join("fake-msb-fail-rm.sh");
+        let body = format!(
+            "#!/bin/sh\n\
              if [ \"$1\" = snapshot ] && [ \"$2\" = rm ]; then\n\
-             \x20\x20echo \"invalid config: cannot remove current head snap_deadbeef; first \
-             select another snapshot with msb snapshot head src:snap_deadbeef\" >&2\n\
+             \x20\x20echo '{stderr}' >&2\n\
              \x20\x20exit 1\n\
              fi\n\
-             exit 0\n";
-        std::fs::write(&script, body).expect("write rm-refusing stub msb script");
+             exit 0\n"
+        );
+        std::fs::write(&script, body).expect("write rm-failing stub msb script");
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod rm-refusing stub msb script");
+        std::fs::set_permissions(&script, perms).expect("chmod rm-failing stub msb script");
         script
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn remove_checkpoint_propagates_the_head_refusal_as_an_error_without_sweeping_the_artifact_dir()
-     {
-        // This backend does not attempt automatic head rotation to work around
-        // msb's head-removal refusal, and must not paper over it by deleting
-        // msb's own artifact out from under its still-live index entry either
-        // — but the refusal itself must reach the caller as an `Err`, not be
-        // swallowed as if the removal had succeeded.
-        let dir = unique_test_dir("remove-checkpoint-head-refused");
-        let script = write_snapshot_rm_head_refusing_stub(&dir);
+    async fn remove_checkpoint_on_a_missing_group_counts_as_gone() {
+        let dir = unique_test_dir("remove-checkpoint-missing-group");
+        let script = write_snapshot_rm_failing_stub(
+            &dir,
+            "error: io error: No such file or directory (os error 2)",
+        );
         let backend = MsbCliBackend::new(script);
 
-        let artifact_dir = dir
+        let ghost = dir
             .join("checkpoints")
-            .join("rz-abc-1")
+            .join("rz-ckpt-gone")
             .join("snap_deadbeefcafedeadbeefcafedeadbeef");
-        std::fs::create_dir_all(&artifact_dir).unwrap();
-        std::fs::write(artifact_dir.join("snapshot.json"), b"{}").unwrap();
+        backend
+            .remove_checkpoint(&ghost.display().to_string())
+            .await
+            .expect("a missing group is already gone, not a failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_checkpoint_propagates_a_real_failure_without_sweeping_the_artifact_dir() {
+        // msb's own index may still point at the files, so a failed removal must
+        // reach the caller as an `Err` and must not delete them out from under it.
+        let dir = unique_test_dir("remove-checkpoint-in-use");
+        let script =
+            write_snapshot_rm_failing_stub(&dir, "error: checkpoint is in use by an active reader");
+        let backend = MsbCliBackend::new(script);
+
+        let group_dir = dir.join("checkpoints").join("rz-ckpt-deadbeefcafe");
+        let member = make_member_dir(&group_dir, "deadbeefcafedeadbeefcafedeadbeef");
 
         let err = backend
-            .remove_checkpoint(&artifact_dir.display().to_string())
+            .remove_checkpoint(&member.display().to_string())
             .await
-            .expect_err("msb's head-removal refusal must surface as an Err, not Ok(())");
+            .expect_err("a refused removal must surface as an Err, not Ok(())");
         let message = err.to_string();
         assert!(
-            message.contains("cannot remove current head"),
-            "the propagated error must quote msb's own refusal wording, got: {message}"
+            message.contains("in use by an active reader"),
+            "the propagated error must quote msb's own wording, got: {message}"
+        );
+        assert!(
+            member.join("snapshot.json").is_file(),
+            "a refused removal must leave the artifact untouched"
         );
 
-        assert!(
-            artifact_dir.exists(),
-            "a refused removal must leave the artifact directory alone — msb's own index \
-             still points at it"
-        );
-        assert!(
-            artifact_dir.join("snapshot.json").is_file(),
-            "the artifact's own content must be untouched, not just the directory"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn has_checkpoint_on_a_missing_bare_name_ref_is_false() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("has-checkpoint-bare-name-missing");
+        let inspect_stub = dir.join("fake-msb-inspect-missing.sh");
+        std::fs::write(
+            &inspect_stub,
+            "#!/bin/sh\necho 'error: io error: No such file or directory (os error 2)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&inspect_stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&inspect_stub, perms).unwrap();
+        let backend = MsbCliBackend::new(inspect_stub);
+
+        let present = backend
+            .has_checkpoint("rz-ckpt-nope")
+            .await
+            .expect("msb's io not-found wording is a clean miss, not a probe failure");
+        assert!(!present);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7519,114 +7675,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- checkpoint-archive import: digest parsing + already-exists handling ----
+    // ---- checkpoint-archive import: member id parsing ----
 
     #[test]
-    fn is_snapshot_already_exists_matches_the_verified_wording() {
-        assert!(is_snapshot_already_exists(
-            "error: snapshot already exists: /home/u/.microsandbox/snapshots/sha256-b9c0448ee9d54e33"
-        ));
-        assert!(is_snapshot_already_exists(
-            "ERROR: Snapshot Already Exists: /path"
-        ));
-    }
-
-    #[test]
-    fn is_snapshot_already_exists_negative_cases_do_not_match() {
-        assert!(!is_snapshot_already_exists(""));
-        assert!(!is_snapshot_already_exists("error: snapshot not found: x"));
-        assert!(!is_snapshot_already_exists("imported successfully"));
-    }
-
-    // ---- parse_snapshot_load_ref: msb 0.7.1's loaded-artifact path, parsed off
-    // `snapshot load`'s own stdout the same defensive way `parse_snapshot_create_ref`
-    // parses `snapshot create`'s — see `parse_snapshot_create_ref`'s own tests just
-    // below for why every fixture is built from `std::env::temp_dir()`.
-
-    #[test]
-    fn parse_snapshot_load_ref_takes_the_last_line_when_it_is_an_absolute_path() {
-        let artifact = std::env::temp_dir()
-            .join("checkpoints")
-            .join("msb-deadbeef")
-            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
+    fn parse_snapshot_load_member_reads_the_added_line() {
         assert_eq!(
-            parse_snapshot_load_ref(&format!(
-                "group msb-deadbeef: head snap_b9c0448ee9d54e33b9c0448ee9d54e33 (Initialized)\n\
-                 digest: sha256:fulldigesthere\n{}\n",
-                artifact.display()
-            )),
-            Some(artifact.display().to_string())
+            parse_snapshot_load_member(
+                "Added: snap_b9c0448ee9d54e33b9c0448ee9d54e33\n",
+                "head: snap_b9c0448ee9d54e33b9c0448ee9d54e33\n"
+            ),
+            Some("snap_b9c0448ee9d54e33b9c0448ee9d54e33".to_string())
         );
     }
 
     #[test]
-    fn parse_snapshot_load_ref_skips_trailing_blank_lines() {
-        let artifact = std::env::temp_dir()
-            .join("checkpoints")
-            .join("msb-deadbeef")
-            .join("snap_abcdef");
+    fn parse_snapshot_load_member_reads_the_reused_line() {
         assert_eq!(
-            parse_snapshot_load_ref(&format!("{}\n\n\n", artifact.display())),
-            Some(artifact.display().to_string())
+            parse_snapshot_load_member("Reused: snap_b9c0448ee9d54e33b9c0448ee9d54e33\n", ""),
+            Some("snap_b9c0448ee9d54e33b9c0448ee9d54e33".to_string())
         );
     }
 
     #[test]
-    fn parse_snapshot_load_ref_none_when_the_last_line_is_not_an_absolute_path() {
-        // Unlike the pre-0.7.1 parse (which pulled the last whitespace-separated
-        // token out of any last line, even a full prose sentence), the whole last
-        // line must itself be the path — a garbage or relative-looking line is
-        // `None`, never a guess.
+    fn parse_snapshot_load_member_searches_every_line_and_prefers_stdout() {
         assert_eq!(
-            parse_snapshot_load_ref("Importing snapshot...\nImported to relative/looking/path\n"),
-            None
+            parse_snapshot_load_member(
+                "loading archive\n  Added: snap_1111111111111111111111111111111a\n",
+                "Added: snap_2222222222222222222222222222222b\n"
+            ),
+            Some("snap_1111111111111111111111111111111a".to_string())
         );
-        assert_eq!(parse_snapshot_load_ref("just some prose, no path"), None);
-    }
-
-    #[test]
-    fn parse_snapshot_load_ref_none_on_entirely_blank_output() {
-        assert_eq!(parse_snapshot_load_ref("\n\n"), None);
-        assert_eq!(parse_snapshot_load_ref(""), None);
-    }
-
-    // ---- parse_already_exists_stderr_ref: the untested "already exists"
-    // fallback, restoring the pre-0.7.1-verified stderr-only shape ----
-
-    #[test]
-    fn parse_already_exists_stderr_ref_takes_the_trailing_path_on_the_error_line() {
-        let artifact = std::env::temp_dir()
-            .join("checkpoints")
-            .join("msb-deadbeef")
-            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
         assert_eq!(
-            parse_already_exists_stderr_ref(&format!(
-                "error: snapshot already exists: {}",
-                artifact.display()
-            )),
-            Some(artifact.display().to_string())
+            parse_snapshot_load_member(
+                "",
+                "warning: x\nReused: snap_2222222222222222222222222222222b"
+            ),
+            Some("snap_2222222222222222222222222222222b".to_string())
         );
     }
 
     #[test]
-    fn parse_already_exists_stderr_ref_none_when_the_trailing_token_is_not_absolute() {
+    fn parse_snapshot_load_member_none_without_an_added_or_reused_line() {
+        assert_eq!(parse_snapshot_load_member("", ""), None);
         assert_eq!(
-            parse_already_exists_stderr_ref("error: snapshot already exists: relative/path"),
+            parse_snapshot_load_member("just some prose\n", "Added:\n"),
             None
         );
         assert_eq!(
-            parse_already_exists_stderr_ref("just some prose, no path"),
-            None
+            parse_snapshot_load_member("/home/u/checkpoints/g/snap_abc\n", ""),
+            None,
+            "a printed path is no longer how msb reports a loaded member"
         );
     }
 
     #[test]
-    fn parse_already_exists_stderr_ref_none_on_entirely_blank_output() {
-        assert_eq!(parse_already_exists_stderr_ref(""), None);
-        assert_eq!(parse_already_exists_stderr_ref("\n\n"), None);
+    fn fresh_import_group_is_a_valid_msb_group_name_and_differs_between_calls() {
+        let a = fresh_import_group();
+        let b = fresh_import_group();
+        let suffix = a.strip_prefix("rz-ckpt-import-").expect("prefix");
+        assert_eq!(suffix.len(), 12, "{a}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{a}"
+        );
+        assert_ne!(a, b, "two imports must never share a group");
     }
 
-    // ---- parse_snapshot_create_ref: msb 0.7.1's dest-dir artifact path, parsed
+    // ---- parse_snapshot_create_ref: msb's dest-dir artifact path, parsed
     // back out of `snapshot create`'s own stdout ----
     //
     // Every absolute-path fixture below is built from `std::env::temp_dir()`
@@ -7682,121 +7799,70 @@ mod tests {
     // tests for why: `Path::is_absolute()` is false for a bare leading-slash path
     // on Windows.
 
+    /// A checkpoints dir whose `<group>/<id>` member holds a `snapshot.json`, as
+    /// msb leaves it after a successful `load`.
+    fn loaded_member(label: &str, group: &str, id: &str) -> (PathBuf, PathBuf) {
+        let checkpoints = unique_test_dir(label).join("checkpoints");
+        let member = checkpoints.join(group).join(id);
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("snapshot.json"), b"{}").unwrap();
+        (checkpoints, member)
+    }
+
     #[test]
-    fn msb_import_checkpoint_cycle_happy_path_returns_the_loaded_artifact_path() {
-        let artifact = std::env::temp_dir()
-            .join("checkpoints")
-            .join("msb-deadbeef")
-            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
+    fn msb_import_checkpoint_cycle_added_returns_the_member_path_under_the_group() {
+        let group = "rz-ckpt-import-0123456789ab";
+        let id = "snap_b9c0448ee9d54e33b9c0448ee9d54e33";
+        let (checkpoints, member) = loaded_member("import-added", group, id);
         let mut import_calls = 0;
         let result = {
             let mut invoke_import = || {
                 import_calls += 1;
                 Ok(ExecResult {
                     exit_code: 0,
-                    stdout: format!(
-                        "group msb-deadbeef: head snap_b9c0448ee9d54e33b9c0448ee9d54e33 \
-                         (Initialized)\ndigest: sha256:fulldigesthere\n{}\n",
-                        artifact.display()
-                    ),
+                    stdout: format!("Added: {id}\n"),
+                    stderr: format!("head: {id}\n"),
+                })
+            };
+            msb_import_checkpoint_cycle(
+                &mut invoke_import,
+                &checkpoints,
+                group,
+                "msb snapshot load",
+            )
+        };
+        assert_eq!(result.unwrap(), member.display().to_string());
+        assert_eq!(import_calls, 1);
+        let _ = std::fs::remove_dir_all(checkpoints.parent().unwrap());
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_reused_resolves_like_added() {
+        let group = "rz-ckpt-import-0123456789ab";
+        let id = "snap_b9c0448ee9d54e33b9c0448ee9d54e33";
+        let (checkpoints, member) = loaded_member("import-reused", group, id);
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: format!("Reused: {id}\n"),
                     stderr: String::new(),
                 })
             };
-            msb_import_checkpoint_cycle(&mut invoke_import)
+            msb_import_checkpoint_cycle(
+                &mut invoke_import,
+                &checkpoints,
+                group,
+                "msb snapshot load",
+            )
         };
-        assert_eq!(
-            result.unwrap(),
-            artifact.display().to_string(),
-            "the effective ref must be the loaded artifact's own absolute path — msb 0.7.1 \
-             prints it directly, never a digest-dir name resolved separately via `snapshot list`"
-        );
-        assert_eq!(import_calls, 1);
-    }
-
-    #[test]
-    fn msb_import_checkpoint_cycle_treats_already_exists_as_success_when_stdout_has_the_path() {
-        let artifact = std::env::temp_dir()
-            .join("checkpoints")
-            .join("msb-deadbeef")
-            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
-        let result = {
-            let mut invoke_import = || {
-                Ok(ExecResult {
-                    exit_code: 1,
-                    stdout: format!(
-                        "group msb-deadbeef: head snap_b9c0448ee9d54e33b9c0448ee9d54e33 \
-                         (Initialized)\n{}\n",
-                        artifact.display()
-                    ),
-                    stderr: format!("error: snapshot already exists: {}", artifact.display()),
-                })
-            };
-            msb_import_checkpoint_cycle(&mut invoke_import)
-        };
-        assert_eq!(
-            result.unwrap(),
-            artifact.display().to_string(),
-            "an already-exists import is success for a content-addressed archive, resolving to \
-             the same artifact path a fresh import would"
-        );
-    }
-
-    /// The UNVERIFIED branch: if `load` on an "already exists" outcome turns out
-    /// to behave the way the pre-0.7.1 `import` verb did — nothing usable on
-    /// stdout, the path only in the `error: snapshot already exists: <path>`
-    /// stderr line — the cycle must still resolve the ref via
-    /// [`parse_already_exists_stderr_ref`] rather than failing outright. This is
-    /// the previously-established shape this branch restores coverage for; see
-    /// [`msb_import_checkpoint_cycle`]'s own doc.
-    #[test]
-    fn msb_import_checkpoint_cycle_already_exists_falls_back_to_stderr_when_stdout_has_no_path() {
-        let artifact = std::env::temp_dir()
-            .join("checkpoints")
-            .join("msb-deadbeef")
-            .join("snap_b9c0448ee9d54e33b9c0448ee9d54e33");
-        let result = {
-            let mut invoke_import = || {
-                Ok(ExecResult {
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: format!("error: snapshot already exists: {}", artifact.display()),
-                })
-            };
-            msb_import_checkpoint_cycle(&mut invoke_import)
-        };
-        assert_eq!(
-            result.unwrap(),
-            artifact.display().to_string(),
-            "an already-exists import with an empty stdout must still resolve the ref, parsed \
-             off the \"already exists\" stderr line the same way the pre-0.7.1 `import` verb did"
-        );
-    }
-
-    #[test]
-    fn msb_import_checkpoint_cycle_already_exists_with_no_path_anywhere_fails_with_a_clear_error() {
-        let result = {
-            let mut invoke_import = || {
-                Ok(ExecResult {
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: "error: snapshot already exists: relative/looking/path".to_string(),
-                })
-            };
-            msb_import_checkpoint_cycle(&mut invoke_import)
-        };
-        let err = result.expect_err(
-            "an already-exists outcome with no parseable absolute path on either stream must \
-             never resolve to a bogus ref",
-        );
-        let message = err.to_string();
-        assert!(
-            message.contains("did not end with a recognizable"),
-            "{message}"
-        );
+        assert_eq!(result.unwrap(), member.display().to_string());
+        let _ = std::fs::remove_dir_all(checkpoints.parent().unwrap());
     }
 
     #[test]
     fn msb_import_checkpoint_cycle_a_genuine_failure_surfaces_stderr() {
+        let checkpoints = std::env::temp_dir().join("rz-never-created-checkpoints");
         let result = {
             let mut invoke_import = || {
                 Ok(ExecResult {
@@ -7805,41 +7871,54 @@ mod tests {
                     stderr: "error: corrupt archive: bad checksum".to_string(),
                 })
             };
-            msb_import_checkpoint_cycle(&mut invoke_import)
+            msb_import_checkpoint_cycle(
+                &mut invoke_import,
+                &checkpoints,
+                "rz-ckpt-import-x",
+                "msb snapshot load",
+            )
         };
         let err = result.expect_err("a genuine import failure must surface");
         assert!(err.to_string().contains("bad checksum"), "{err}");
     }
 
-    /// Red-proof for the last-line-must-be-absolute contract: `load` exiting 0
-    /// with stdout that never ends in a recognizable path (msb printing nothing
-    /// usable, an unexpected wording change, a stub gone wrong) must never be
-    /// silently trusted as a ref.
+    /// `load` exiting 0 without an `Added:`/`Reused:` line (msb printing nothing
+    /// usable, a wording change) must never be turned into a ref.
     #[test]
-    fn msb_import_checkpoint_cycle_garbage_stdout_fails_with_a_clear_error() {
+    fn msb_import_checkpoint_cycle_without_an_added_or_reused_line_fails_with_msbs_output() {
+        let checkpoints = std::env::temp_dir().join("rz-never-created-checkpoints");
         let result = {
             let mut invoke_import = || {
                 Ok(ExecResult {
                     exit_code: 0,
-                    stdout: "not a path, just some prose\n".to_string(),
-                    stderr: String::new(),
+                    stdout: "not a member line, just some prose\n".to_string(),
+                    stderr: "stderr-marker".to_string(),
                 })
             };
-            msb_import_checkpoint_cycle(&mut invoke_import)
+            msb_import_checkpoint_cycle(
+                &mut invoke_import,
+                &checkpoints,
+                "rz-ckpt-import-x",
+                "msb snapshot load",
+            )
         };
-        let err = result.expect_err(
-            "stdout whose last line isn't an absolute path must never resolve to a ref",
-        );
-        let message = err.to_string();
+        let message = result
+            .expect_err("output with no member line must never resolve to a ref")
+            .to_string();
         assert!(
-            message.contains("did not end with a recognizable"),
+            message.contains("no 'Added:' or 'Reused:' line"),
             "{message}"
         );
-        assert!(message.contains("not a path, just some prose"), "{message}");
+        assert!(
+            message.contains("not a member line, just some prose"),
+            "{message}"
+        );
+        assert!(message.contains("stderr-marker"), "{message}");
     }
 
     #[test]
-    fn msb_import_checkpoint_cycle_blank_stdout_fails_with_a_clear_error() {
+    fn msb_import_checkpoint_cycle_blank_output_fails_with_a_clear_error() {
+        let checkpoints = std::env::temp_dir().join("rz-never-created-checkpoints");
         let result = {
             let mut invoke_import = || {
                 Ok(ExecResult {
@@ -7848,10 +7927,39 @@ mod tests {
                     stderr: String::new(),
                 })
             };
-            msb_import_checkpoint_cycle(&mut invoke_import)
+            msb_import_checkpoint_cycle(
+                &mut invoke_import,
+                &checkpoints,
+                "rz-ckpt-import-x",
+                "msb snapshot load",
+            )
         };
-        result
-            .expect_err("entirely blank stdout on a reported success must never resolve to a ref");
+        result.expect_err("entirely blank output on a reported success must never resolve");
+    }
+
+    #[test]
+    fn msb_import_checkpoint_cycle_fails_when_the_reported_member_is_not_on_disk() {
+        let checkpoints = unique_test_dir("import-missing-member").join("checkpoints");
+        let result = {
+            let mut invoke_import = || {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "Added: snap_b9c0448ee9d54e33b9c0448ee9d54e33\n".to_string(),
+                    stderr: String::new(),
+                })
+            };
+            msb_import_checkpoint_cycle(
+                &mut invoke_import,
+                &checkpoints,
+                "rz-ckpt-import-x",
+                "msb snapshot load",
+            )
+        };
+        let message = result
+            .expect_err("a member with no snapshot.json must not become a ref")
+            .to_string();
+        assert!(message.contains("snapshot.json"), "{message}");
+        let _ = std::fs::remove_dir_all(checkpoints.parent().unwrap());
     }
 
     #[test]
@@ -8262,12 +8370,25 @@ mod tests {
             "error: snapshot not found: rz-ckpt-deadbeefcafe"
         ));
         assert!(is_snapshot_not_found("Snapshot Not Found"));
+        // msb 0.8.1's wording for a missing group or member directory.
+        assert!(is_snapshot_not_found(
+            "error: io error: No such file or directory (os error 2)"
+        ));
+        assert!(is_snapshot_not_found(
+            "error: io error: Das System kann die angegebene Datei nicht finden. (os error 2)"
+        ));
     }
 
     #[test]
     fn is_snapshot_not_found_negative_cases_do_not_match() {
         assert!(!is_snapshot_not_found(""));
         assert!(!is_snapshot_not_found("connection refused"));
+        assert!(!is_snapshot_not_found(
+            "error: io error: Access is denied. (os error 5)"
+        ));
+        assert!(!is_snapshot_not_found(
+            "error: io error: Permission denied (os error 20)"
+        ));
         // A generic sandbox/image not-found must not false-positive on the
         // snapshot-specific classifier — each backend-noun gets its own signal.
         assert!(!is_snapshot_not_found(
@@ -8870,57 +8991,35 @@ mod tests {
 
     // ---- checkpoint-archive export/import against a fake msb binary ----
 
-    /// The loaded artifact path a fake `snapshot load` prints, when it prints one
-    /// at all — see [`fake_load_stdout_with_path`] and
-    /// [`write_fake_msb_for_archives`]'s own doc for why an "already exists" run
-    /// does NOT always get this on stdout the way a fresh one does.
-    #[cfg(unix)]
-    const FAKE_LOADED_ARTIFACT_PATH: &str =
-        "/home/u/.microsandbox/checkpoints/msb-fakegroup1234/snap_fakedigest1234fakedigest1234";
-
-    /// The stdout a fresh, successful `snapshot load` empirically prints against
-    /// a real msb 0.7.1 binary: a `group ...: head ... (Initialized)` line, a
-    /// digest line, then the loaded artifact's absolute path as the LAST line.
-    #[cfg(unix)]
-    fn fake_load_stdout_with_path() -> String {
-        format!(
-            "group msb-fakegroup1234: head snap_fakedigest1234fakedigest1234 (Initialized)\n\
-             digest: sha256:fakedigest1234fakedigest1234fulldigesthere\n{FAKE_LOADED_ARTIFACT_PATH}\n"
-        )
-    }
-
     /// Writes a stub `msb` replacement that answers `snapshot save` and `snapshot
-    /// load` — the two subcommands `export_checkpoint`/`import_checkpoint` drive
-    /// on msb 0.7.1 (no more `snapshot list` round trip — see
-    /// `msb_import_checkpoint_cycle`'s doc for why). `import_exit_code` lets a
-    /// test choose between a fresh-import success (exit 0) and an already-exists
-    /// "success" (nonzero exit, msb's own wording on `import_stderr`) — both of
-    /// which [`MsbCliBackend::import_checkpoint`] must resolve to an effective
-    /// ref. `import_stdout` is passed through verbatim (typically
-    /// [`fake_load_stdout_with_path`] for a case known to print the artifact
-    /// path, or `""` for the UNVERIFIED already-exists case where msb might
-    /// print nothing useful on stdout — see [`msb_import_checkpoint_cycle`]'s own
-    /// doc on why that branch is not assumed away).
+    /// load` — the two subcommands `export_checkpoint`/`import_checkpoint` drive on
+    /// msb 0.8.1. `save` records its argv beside the script (`save.argv`) and writes
+    /// a payload to its last argument. `load` records its argv (`load.argv`),
+    /// materialises `<--dest>/<group>/<id>/snapshot.json` the way msb does, and
+    /// prints `<verb>: <id>` on stdout (`verb` is `Added` or `Reused`), so a test can
+    /// check the ref `import_checkpoint` returns against what is on disk.
     #[cfg(unix)]
-    fn write_fake_msb_for_archives(
-        dir: &Path,
-        import_exit_code: u8,
-        import_stdout: &str,
-        import_stderr: &str,
-    ) -> PathBuf {
+    fn write_fake_msb_for_archives(dir: &Path, verb: &str, id: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let script = dir.join("fake-msb-archive.sh");
         let body = format!(
             "#!/bin/sh\n\
              case \"$1 $2\" in\n\
              \"snapshot save\")\n\
-             printf 'fake-export-payload:%s' \"$3\" > \"$4\"\n\
+             echo \"$@\" > \"$(dirname \"$0\")/save.argv\"\n\
+             for last; do :; done\n\
+             printf 'fake-export-payload:%s:%s' \"$3\" \"$5\" > \"$last\"\n\
              exit 0\n\
              ;;\n\
              \"snapshot load\")\n\
-             echo '{import_stderr}' 1>&2\n\
-             printf '%s' '{import_stdout}'\n\
-             exit {import_exit_code}\n\
+             echo \"$@\" > \"$(dirname \"$0\")/load.argv\"\n\
+             group=\"$3\"\n\
+             dest=\"$7\"\n\
+             mkdir -p \"$dest/$group/{id}\"\n\
+             echo '{{}}' > \"$dest/$group/{id}/snapshot.json\"\n\
+             echo 'head: {id}' 1>&2\n\
+             echo '{verb}: {id}'\n\
+             exit 0\n\
              ;;\n\
              esac\n\
              exit 1\n"
@@ -8934,86 +9033,88 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn export_checkpoint_and_import_checkpoint_round_trip_via_a_fake_msb_binary() {
-        let dir = unique_test_dir("archive-fake-binary-fresh");
-        let script = write_fake_msb_for_archives(&dir, 0, &fake_load_stdout_with_path(), "");
+    async fn export_checkpoint_passes_the_group_dir_and_member_to_snapshot_save() {
+        let dir = unique_test_dir("archive-fake-binary-export");
+        let script = write_fake_msb_for_archives(&dir, "Added", "snap_fakeid");
         let backend = MsbCliBackend::new(script);
 
+        let group_dir = dir.join("checkpoints").join("rz-ckpt-deadbeefcafe");
+        let member = group_dir.join("snap_deadbeefcafedeadbeefcafedeadbeef");
         let dest = dir.join("cp.archive-payload");
         backend
-            .export_checkpoint("rz-ckpt-deadbeefcafe", &dest)
+            .export_checkpoint(&member.display().to_string(), &dest)
             .await
             .expect("export_checkpoint must succeed against the fake binary");
-        assert_eq!(
-            std::fs::read_to_string(&dest).unwrap(),
-            "fake-export-payload:rz-ckpt-deadbeefcafe"
-        );
 
-        let effective_ref = backend
-            .import_checkpoint(&dest, "rz-ckpt-deadbeefcafe")
-            .await
-            .expect("import_checkpoint must succeed against the fake binary");
+        let argv = std::fs::read_to_string(dir.join("save.argv")).unwrap();
         assert_eq!(
-            effective_ref, FAKE_LOADED_ARTIFACT_PATH,
-            "the effective ref must be the loaded artifact's own absolute path, printed \
-             directly by `snapshot load` — never a digest-dir name resolved separately via \
-             `snapshot list`, which msb 0.7.1's `load` has no need for"
+            argv.trim(),
+            format!(
+                "snapshot save {} --checkpoint snap_deadbeefcafedeadbeefcafedeadbeef {}",
+                group_dir.display(),
+                dest.display()
+            )
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn import_checkpoint_treats_already_exists_as_success_via_the_fake_msb_binary() {
-        let dir = unique_test_dir("archive-fake-binary-exists");
-        let script = write_fake_msb_for_archives(
-            &dir,
-            1,
-            &fake_load_stdout_with_path(),
-            &format!("error: snapshot already exists: {FAKE_LOADED_ARTIFACT_PATH}"),
-        );
-        let backend = MsbCliBackend::new(script);
+    #[test]
+    fn import_checkpoint_loads_into_a_fresh_group_and_returns_the_member_path() {
+        let dir = unique_test_dir("archive-fake-binary-import");
+        let id = "snap_fakedigest1234fakedigest1234abcd";
+        let script = write_fake_msb_for_archives(&dir, "Added", id);
+        let checkpoints = dir.join("checkpoints");
 
-        let effective_ref = backend
-            .import_checkpoint(Path::new("/does/not/matter/for/this/stub"), "whatever-ref")
-            .await
-            .expect(
-                "an already-exists import must resolve exactly like a fresh one, not surface \
-                 as an error",
-            );
-        assert_eq!(effective_ref, FAKE_LOADED_ARTIFACT_PATH);
+        let archive = dir.join("cp.archive-payload");
+        let first = import_checkpoint_into(&script, &archive, &checkpoints)
+            .expect("import must succeed against the fake binary");
+
+        let first_path = PathBuf::from(&first);
+        assert_eq!(first_path.file_name().unwrap().to_str().unwrap(), id);
+        let group = first_path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(group.starts_with("rz-ckpt-import-"), "{group}");
+        assert_eq!(first_path.parent().unwrap().parent().unwrap(), checkpoints);
+        assert!(first_path.join("snapshot.json").is_file());
+
+        let argv = std::fs::read_to_string(dir.join("load.argv")).unwrap();
+        assert_eq!(
+            argv.trim(),
+            format!(
+                "snapshot load {group} --file {} --dest {}",
+                archive.display(),
+                checkpoints.display()
+            )
+        );
+
+        let second = import_checkpoint_into(&script, &archive, &checkpoints).unwrap();
+        assert_ne!(first, second, "each import lands in a group of its own");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The UNVERIFIED-against-a-real-binary branch, exercised end to end: an
-    /// "already exists" `load` that (like the pre-0.7.1 `import` verb it
-    /// replaces) prints nothing usable on stdout, with the artifact path only in
-    /// the `error: snapshot already exists: <path>` stderr line. Must still
-    /// resolve to the same ref a fresh import would — see
-    /// `parse_already_exists_stderr_ref` and `msb_import_checkpoint_cycle`'s own
-    /// doc for why this fallback exists.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn import_checkpoint_already_exists_with_empty_stdout_falls_back_to_stderr() {
-        let dir = unique_test_dir("archive-fake-binary-exists-stderr-only");
-        let script = write_fake_msb_for_archives(
-            &dir,
-            1,
-            "",
-            &format!("error: snapshot already exists: {FAKE_LOADED_ARTIFACT_PATH}"),
-        );
-        let backend = MsbCliBackend::new(script);
+    #[test]
+    fn import_checkpoint_treats_reused_as_success_via_the_fake_msb_binary() {
+        let dir = unique_test_dir("archive-fake-binary-reused");
+        let id = "snap_fakedigest1234fakedigest1234abcd";
+        let script = write_fake_msb_for_archives(&dir, "Reused", id);
 
-        let effective_ref = backend
-            .import_checkpoint(Path::new("/does/not/matter/for/this/stub"), "whatever-ref")
-            .await
-            .expect(
-                "an already-exists import with nothing useful on stdout must still resolve via \
-                 the stderr fallback, not surface as an error",
-            );
-        assert_eq!(effective_ref, FAKE_LOADED_ARTIFACT_PATH);
+        let effective_ref = import_checkpoint_into(
+            &script,
+            Path::new("/does/not/matter/for/this/stub"),
+            &dir.join("checkpoints"),
+        )
+        .expect("a `Reused:` import resolves exactly like an `Added:` one");
+        assert!(effective_ref.ends_with(id), "{effective_ref}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

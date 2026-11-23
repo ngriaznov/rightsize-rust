@@ -111,12 +111,15 @@ impl Drop for ArchiveCleanup {
         let _ = std::fs::remove_file(&self.archive_path);
         if let Some(effective_ref) = self.imported_ref.borrow().clone() {
             if let Ok(msb_path) = rightsize_msb::provisioner::ensure_installed() {
-                // `-f`: msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` by
-                // their own artifact path (verified live) — same spelling as
-                // `commands::snapshot_rm`, shelled out directly here since a
-                // `Drop` impl cannot `.await` the async SPI.
+                // msb 0.8 takes a group, never a member path: remove the ref's
+                // parent group with `commands::snapshot_rm_group`, shelled out
+                // directly here since a `Drop` impl cannot `.await` the async SPI.
+                let group = std::path::Path::new(&effective_ref)
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 let _ = Command::new(msb_path)
-                    .args(["snapshot", "rm", &effective_ref, "-f"])
+                    .args(rightsize_msb::commands::snapshot_rm_group(&group))
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -227,9 +230,9 @@ async fn checkpoint_archive_survives_removal_of_the_original_and_restores_the_ma
          or the original checkpoint's own artifact path"
     );
     // An absolute path under this library's own checkpoints dir, not merely different:
-    // `msb snapshot load ... --dest <cache_dir>/checkpoints` prints the loaded artifact's
-    // own path as the last line of its stdout (verified live against msb 0.7.1), and
-    // `import_checkpoint` returns that path unchanged as the effective ref — the same
+    // `msb snapshot load ... --dest <cache_dir>/checkpoints` reports the loaded member by
+    // id (`Added: <id>` / `Reused: <id>`); `import_checkpoint` resolves that id to the
+    // member's path under the fresh group and returns it as the effective ref — the same
     // "the printed path itself is the ref" shape `checkpoint_named`'s own ref already has
     // (asserted above). Asserting only "differs from the original" would accept any
     // renaming msb ever adopts, including a return to the pre-0.7.1 digest-name shape.

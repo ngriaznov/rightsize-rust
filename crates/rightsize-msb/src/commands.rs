@@ -21,15 +21,15 @@ use rightsize::model::{ContainerSpec, FileMount, Protocol};
 ///
 /// A spec with `checkpoint_ref` set (built from
 /// [`rightsize::Container::from_checkpoint`]) must never reach this function —
-/// msb 0.7.1 removed `run --from-snapshot` entirely (clap now rejects it outright);
-/// the restore path is [`restore`], a dedicated command with its own, narrower
-/// flag surface. The `debug_assert!` below exists to catch a caller that forgets
+/// This backend restores through [`restore`], a dedicated command with its own,
+/// narrower flag surface, rather than `run --from-snapshot` (msb 0.7.1 removed that
+/// flag, and 0.8.1 accepts it again, but rightsize still uses `restore`). The `debug_assert!` below exists to catch a caller that forgets
 /// this and routes a restore-shaped spec through `run` by mistake.
 pub fn run(spec: &ContainerSpec) -> Vec<String> {
     debug_assert!(
         spec.checkpoint_ref.is_none(),
-        "commands::run must never be called for a spec with checkpoint_ref set — msb 0.7.1 \
-         removed `run --from-snapshot`; use commands::restore instead"
+        "commands::run must never be called for a spec with checkpoint_ref set — a restore \
+         goes through `msb restore`; use commands::restore instead"
     );
     let mut argv = vec!["run".to_string(), "--name".to_string(), spec.name.clone()];
 
@@ -100,9 +100,9 @@ pub fn run(spec: &ContainerSpec) -> Vec<String> {
 }
 
 /// Builds the argv for `msb restore <path> --name <name> ...` — the checkpoint
-/// restore path on msb 0.7.1+, which replaced `msb run --from-snapshot <ref>`
-/// with a dedicated `restore` subcommand (upstream removed `--from-snapshot`
-/// outright; see the crate `CHANGELOG`). Used for both re-boot paths that resume a
+/// restore path. msb 0.7.1 replaced `msb run --from-snapshot <ref>` with a
+/// dedicated `restore` subcommand (0.8.1 accepts `--from-snapshot` again, but
+/// rightsize keeps using `restore`; see the crate `CHANGELOG`). Used for both re-boot paths that resume a
 /// disk snapshot under the same name: the checkpoint feature's own stop → snapshot
 /// → rm → re-boot cycle (`MsbCliBackend::create_checkpoint`), and an ordinary
 /// [`rightsize::Container::from_checkpoint`] restore — both funnel through the same
@@ -294,17 +294,19 @@ pub fn copy_out(sandbox_name: &str, container_path: &str, host_path: &Path) -> V
     ]
 }
 
-/// Builds the argv for `msb snapshot create --from-sandbox <sandbox> <snapshot>` — requires
+/// Builds the argv for `msb snapshot create --from-sandbox <sandbox> <group>` — requires
 /// the sandbox to be STOPPED first (the checkpoint feature's own responsibility;
-/// this function only builds the argv). The plain 2-arg form msb's own default
-/// snapshot store uses; see [`snapshot_create_in`] for the dest-dir variant.
-pub fn snapshot_create(sandbox_name: &str, snapshot_name: &str) -> Vec<String> {
+/// this function only builds the argv). The positional is the NEW snapshot group's
+/// name (msb 0.8 refuses a group that already exists) and msb names the member
+/// inside it (`snap_<id>`). The plain 2-arg form msb's own default snapshot store
+/// uses; see [`snapshot_create_in`] for the dest-dir variant.
+pub fn snapshot_create(sandbox_name: &str, group_name: &str) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "create".to_string(),
         "--from-sandbox".to_string(),
         sandbox_name.to_string(),
-        snapshot_name.to_string(),
+        group_name.to_string(),
     ]
 }
 
@@ -312,35 +314,44 @@ pub fn snapshot_create(sandbox_name: &str, snapshot_name: &str) -> Vec<String> {
 /// storing the snapshot artifact under that directory instead of msb's own
 /// default snapshot store — the checkpoint feature's dest-dir mechanics
 /// (`MsbCliBackend::create_checkpoint`).
-pub fn snapshot_create_in(sandbox_name: &str, snapshot_name: &str, dest_dir: &Path) -> Vec<String> {
-    let mut argv = snapshot_create(sandbox_name, snapshot_name);
+pub fn snapshot_create_in(sandbox_name: &str, group_name: &str, dest_dir: &Path) -> Vec<String> {
+    let mut argv = snapshot_create(sandbox_name, group_name);
     argv.push("--dest-dir".to_string());
     argv.push(dest_dir.display().to_string());
     argv
 }
 
-/// Builds the argv for `msb snapshot rm <snapshot> -f` — the checkpoint feature's
-/// cleanup primitive (`SandboxBackend::remove_checkpoint`).
+/// Builds the argv for `msb snapshot rm <group_dir> --all` — removes a whole snapshot
+/// group (its directory, `group.json` and the member inside). Used for a checkpoint
+/// that is the only member of its group, which is every checkpoint this backend
+/// creates: msb 0.8 keeps the group directory (and refuses to create a group of the
+/// same name again) after the last member is removed with `--checkpoint`, so the
+/// group has to go with it.
 ///
-/// `-f` is verified live as part of the working invocation, not carried over
-/// from an older spelling — pass it. Separately (and `-f` does NOT change
-/// this): msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` (and
-/// `inspect`) by their own ARTIFACT PATH only — a bare name or a
-/// `group:member` spelling does not resolve at all (verified live) — so
-/// `snapshot_name` here is expected to be that path for any ref this backend
-/// minted after the dest-dir migration, a bare legacy name otherwise (see
-/// `crate::backend::path_ref_dir`'s doc). msb also refuses to remove the
-/// current HEAD of a group with older siblings from the same source sandbox
-/// even with `-f` (`invalid config: cannot remove current head snap_...; first
-/// select another snapshot with 'msb snapshot head src:<snapshot>'`, verified
-/// live) — this backend does not attempt automatic head rotation to work
-/// around that (see `MsbCliBackend::remove_checkpoint`'s doc and the
-/// checkpoints docs' "Cleanup" section for the resulting limitation).
-pub fn snapshot_rm(snapshot_name: &str) -> Vec<String> {
+/// `group_dir` is the checkpoint ref's parent directory (a ref is the member path,
+/// `<checkpoints>/<group>/snap_<id>`). msb takes a group, never a member path.
+/// `--all` conflicts with `-f`, so `-f` is not passed. See
+/// [`snapshot_rm_member`] for the group that holds other members.
+pub fn snapshot_rm_group(group_dir: &str) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "rm".to_string(),
-        snapshot_name.to_string(),
+        group_dir.to_string(),
+        "--all".to_string(),
+    ]
+}
+
+/// Builds the argv for `msb snapshot rm <group_dir> --checkpoint <member> -f` —
+/// removes one member and leaves its group, for a group that still holds other
+/// `snap_*` members (a group this backend did not create, so removing the whole
+/// group could delete checkpoints the caller never named).
+pub fn snapshot_rm_member(group_dir: &str, member: &str) -> Vec<String> {
+    vec![
+        "snapshot".to_string(),
+        "rm".to_string(),
+        group_dir.to_string(),
+        "--checkpoint".to_string(),
+        member.to_string(),
         "-f".to_string(),
     ]
 }
@@ -349,10 +360,9 @@ pub fn snapshot_rm(snapshot_name: &str) -> Vec<String> {
 /// existence probe (`SandboxBackend::has_checkpoint`): exit 0 means the snapshot
 /// still exists. Only reached for a bare legacy ref (a path ref is probed on the
 /// filesystem instead, never via this command — see
-/// `crate::backend::MsbCliBackend::has_checkpoint`'s doc) — worth calling out
-/// because, same as [`snapshot_rm`], msb 0.7.1 resolves a dest-dir disk-scope
-/// snapshot by its own artifact path only; a name or `group:member` spelling
-/// does not resolve (verified live).
+/// `crate::backend::MsbCliBackend::has_checkpoint`'s doc). msb 0.8 takes a GROUP
+/// here, so a member path is not accepted, and a missing bare name answers
+/// `error: io error: No such file or directory (os error 2)`.
 pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
     vec![
         "snapshot".to_string(),
@@ -361,40 +371,45 @@ pub fn snapshot_inspect(snapshot_name: &str) -> Vec<String> {
     ]
 }
 
-/// Builds the argv for `msb snapshot save <ref> <dest>` — the checkpoint-archive
-/// feature's export primitive (`SandboxBackend::export_checkpoint`). Never passes
-/// `--with-image` — msb's own flag for bundling the OCI image into the archive —
-/// so archives never bundle it; the destination machine pulls the image fresh on
-/// the restored sandbox's first boot instead. Not an upstream limitation: wiring
-/// `--with-image` through is on the roadmap (see the checkpoints docs' "The image
-/// is not bundled" section).
-pub fn snapshot_export(snapshot_ref: &str, dest: &Path) -> Vec<String> {
+/// Builds the argv for `msb snapshot save <group_dir> --checkpoint <member> <dest>` —
+/// the checkpoint-archive feature's export primitive
+/// (`SandboxBackend::export_checkpoint`). `group_dir` and `member` are the checkpoint
+/// ref's parent directory and basename: msb 0.8 takes the group, with the member
+/// chosen by `--checkpoint`. Never passes `--with-image` — msb's own flag for bundling
+/// the OCI image into the archive — so archives never bundle it; the destination
+/// machine pulls the image fresh on the restored sandbox's first boot instead. Not an
+/// upstream limitation: wiring `--with-image` through is on the roadmap (see the
+/// checkpoints docs' "The image is not bundled" section). Never passes
+/// `--compatibility` either (the default, `current`, applies).
+pub fn snapshot_export(group_dir: &str, member: &str, dest: &Path) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "save".to_string(),
-        snapshot_ref.to_string(),
+        group_dir.to_string(),
+        "--checkpoint".to_string(),
+        member.to_string(),
         dest.display().to_string(),
     ]
 }
 
-/// Builds the argv for `msb snapshot load <archive> --dest <dest_dir>` — the
-/// checkpoint-archive feature's import primitive (`SandboxBackend::import_checkpoint`).
-/// `--dest` is ALWAYS passed, pointed at this backend's own checkpoints directory
+/// Builds the argv for `msb snapshot load <group> --file <archive> --dest <dest_dir>` —
+/// the checkpoint-archive feature's import primitive
+/// (`SandboxBackend::import_checkpoint`). `group` is a fresh name per import
+/// (`rz-ckpt-import-<12 hex>`, see `crate::backend`), so an import never collides
+/// with, or lands inside, a group that already exists. `--dest` is ALWAYS passed,
+/// pointed at this backend's own checkpoints directory
 /// (`MsbCliBackend::import_checkpoint`'s own `<cache_dir>/checkpoints` — the same
 /// tree [`snapshot_create_in`] writes a created checkpoint under) rather than left
-/// to msb's own default (global) snapshot store, so an imported artifact's ref
-/// lands under the same tree a created one's does. msb's import is
-/// content-addressed — the archive's own original ref plays no role in where the
-/// artifact lands, only in what msb prints back on success: a `group msb-<hex>:
-/// head snap_<digest> (Initialized)` line, a digest line, then the loaded
-/// artifact's own absolute path as the LAST line (verified live against msb
-/// 0.7.1) — see `MsbCliBackend::import_checkpoint`'s doc for how that printed path
-/// becomes the returned ref, the same "parse the last line, require it absolute"
-/// contract [`snapshot_create`]'s own ref already uses.
-pub fn snapshot_import(archive_path: &Path, dest_dir: &Path) -> Vec<String> {
+/// to msb's own default (global) snapshot store. The member keeps the id it had in
+/// the source group and lands at `<dest_dir>/<group>/<id>`; `load` prints
+/// `Added: <id>` (or `Reused: <id>` for one already there) on stdout, and nothing
+/// that is a path — see `crate::backend`'s `parse_snapshot_load_member`.
+pub fn snapshot_import(group: &str, archive_path: &Path, dest_dir: &Path) -> Vec<String> {
     vec![
         "snapshot".to_string(),
         "load".to_string(),
+        group.to_string(),
+        "--file".to_string(),
         archive_path.display().to_string(),
         "--dest".to_string(),
         dest_dir.display().to_string(),
@@ -1235,19 +1250,28 @@ mod tests {
             ]
         );
         assert_eq!(
-            snapshot_rm("rz-ckpt-deadbeefcafe"),
-            vec!["snapshot", "rm", "rz-ckpt-deadbeefcafe", "-f"]
-        );
-        assert_eq!(
-            snapshot_rm("/cache/checkpoints/rz-abc-1/snap_deadbeefcafedeadbeefcafedeadbeef"),
+            snapshot_rm_group("/cache/checkpoints/rz-ckpt-deadbeefcafe"),
             vec![
                 "snapshot",
                 "rm",
-                "/cache/checkpoints/rz-abc-1/snap_deadbeefcafedeadbeefcafedeadbeef",
-                "-f"
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "--all"
             ],
-            "an artifact-path ref must pass through unchanged — msb 0.7.1 resolves a \
-             dest-dir disk-scope snapshot by its own path only"
+            "a single-member group goes whole, and --all conflicts with -f"
+        );
+        assert_eq!(
+            snapshot_rm_member(
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "snap_deadbeefcafedeadbeefcafedeadbeef"
+            ),
+            vec![
+                "snapshot",
+                "rm",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "--checkpoint",
+                "snap_deadbeefcafedeadbeefcafedeadbeef",
+                "-f"
+            ]
         );
         assert_eq!(
             snapshot_inspect("rz-ckpt-deadbeefcafe"),
@@ -1461,19 +1485,23 @@ mod tests {
     fn snapshot_save_load_spellings() {
         assert_eq!(
             snapshot_export(
-                "rz-ckpt-deadbeefcafe",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "snap_deadbeefcafedeadbeefcafedeadbeef",
                 std::path::Path::new("/tmp/cp.archive")
             ),
             vec![
                 "snapshot",
                 "save",
-                "rz-ckpt-deadbeefcafe",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "--checkpoint",
+                "snap_deadbeefcafedeadbeefcafedeadbeef",
                 "/tmp/cp.archive"
             ]
         );
         assert!(
             !snapshot_export(
-                "rz-ckpt-deadbeefcafe",
+                "/cache/checkpoints/rz-ckpt-deadbeefcafe",
+                "snap_deadbeefcafedeadbeefcafedeadbeef",
                 std::path::Path::new("/tmp/cp.archive")
             )
             .contains(&"--with-image".to_string()),
@@ -1482,12 +1510,15 @@ mod tests {
         );
         assert_eq!(
             snapshot_import(
+                "rz-ckpt-import-0123456789ab",
                 std::path::Path::new("/tmp/cp.archive"),
                 std::path::Path::new("/cache/checkpoints")
             ),
             vec![
                 "snapshot",
                 "load",
+                "rz-ckpt-import-0123456789ab",
+                "--file",
                 "/tmp/cp.archive",
                 "--dest",
                 "/cache/checkpoints"

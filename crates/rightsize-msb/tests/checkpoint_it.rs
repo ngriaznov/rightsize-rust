@@ -69,19 +69,22 @@ macro_rules! require_msb {
     };
 }
 
-/// Best-effort, SYNCHRONOUS `msb snapshot rm <ref>` — shells the `msb` CLI directly
+/// Best-effort, SYNCHRONOUS `msb snapshot rm <group> --all` — shells the `msb` CLI directly
 /// rather than the async `SandboxBackend::remove_checkpoint` SPI, since this is
 /// called from a `Drop` impl, which cannot `.await`. Mirrors the shared contract
 /// suite's own `docker_rmi` helper (same rationale: a synchronous cleanup path
 /// needs a synchronous tool invocation).
 fn remove_snapshot_blocking(snapshot_ref: &str) {
     if let Ok(msb_path) = rightsize_msb::provisioner::ensure_installed() {
-        // `-f`: msb 0.7.1's dest-dir disk-scope snapshots resolve `rm` by their
-        // own artifact path (verified live) — same spelling as
-        // `commands::snapshot_rm`, shelled out directly here since a `Drop` impl
-        // cannot `.await` the async SPI.
+        // msb 0.8 takes a group, never a member path: remove the ref's parent
+        // group with `commands::snapshot_rm_group`, shelled out directly here
+        // since a `Drop` impl cannot `.await` the async SPI.
+        let group = std::path::Path::new(snapshot_ref)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let _ = Command::new(msb_path)
-            .args(["snapshot", "rm", snapshot_ref, "-f"])
+            .args(rightsize_msb::commands::snapshot_rm_group(&group))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
