@@ -937,10 +937,24 @@ fn salvage_archive_staging_file(dest: &Path) -> bool {
 /// loudly quoting the raw output instead of minting a bogus ref.
 fn parse_last_line_as_absolute_path(output: &str) -> Option<String> {
     let last_line = output.lines().rev().find(|line| !line.trim().is_empty())?;
-    let candidate = last_line.trim();
-    Path::new(candidate)
-        .is_absolute()
-        .then(|| candidate.to_string())
+    let candidate = strip_windows_verbatim_prefix(last_line.trim());
+    Path::new(&candidate).is_absolute().then_some(candidate)
+}
+
+/// `path` without Windows' extended-length prefix: `\\?\C:\...` becomes `C:\...` and
+/// `\\?\UNC\server\share\...` becomes `\\server\share\...`; any other path comes
+/// back unchanged. On Windows msb 0.8 prints the artifact path of `msb snapshot
+/// create` in the prefixed form, which never compares as being under the plain-form
+/// checkpoints directory. msb accepts the plain form as input, and std handles long
+/// paths without the prefix. Same rule as the Node and Kotlin backends.
+fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 /// Finds the member id in `msb snapshot load`'s output: the first line, stdout
@@ -7751,6 +7765,26 @@ mod tests {
     // `Path::is_absolute()`, which this function relies on, is false for a bare
     // leading-slash path on Windows (no drive/prefix component), so a literal
     // like that would make these assertions fail there.
+
+    #[test]
+    fn strip_windows_verbatim_prefix_drops_the_extended_length_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\r\checkpoints\rz-ckpt-x\snap_ab"),
+            r"C:\Users\r\checkpoints\rz-ckpt-x\snap_ab"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\ck"),
+            r"\\server\share\ck"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/cache/checkpoints/rz-ckpt-x/snap_ab"),
+            "/cache/checkpoints/rz-ckpt-x/snap_ab"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\ck\snap_ab"),
+            r"C:\ck\snap_ab"
+        );
+    }
 
     #[test]
     fn parse_snapshot_create_ref_takes_the_last_line_when_it_is_an_absolute_path() {
